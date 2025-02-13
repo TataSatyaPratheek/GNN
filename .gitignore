@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+pm-venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data and Results
+*.csv
+results/
+*.pth
+*.png
+*.html
+
+# Logs
+*.log
+experiment_results.txt
+
+# OS
+.DS_Store
+.env
+.env.local 
