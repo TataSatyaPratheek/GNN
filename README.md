@@ -8,9 +8,9 @@ This research project implements a novel approach to process mining using Graph 
 
 ## 2. Authors
 
-- Somesh Misra x.com/mathprobro
-- Shashank Dixit x.com/protosphinx
-- Research Group: ERP.AI Research
+- Somesh Misra [@mathprobro](https://x.com/mathprobro)
+- Shashank Dixit [@sphinx](https://x.com/protosphinx)
+- Research Group: [ERP.AI](https://www.erp.ai) Research
 
 ## 3. Key Components
 
