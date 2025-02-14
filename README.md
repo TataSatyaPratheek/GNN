@@ -7,8 +7,9 @@ Overview
 This research project implements a novel approach to process mining using Graph Neural Networks (GNN) and deep learning techniques. The framework combines state-of-the-art machine learning models with traditional process mining methods to provide comprehensive process analysis and prediction capabilities.
 
 Authors
-- SD/SM
-- Research Group: ERP.ai
+- Somesh Misra
+- Shashank Dixit
+- Research Group: ERP.AI Research
 
 Key Components
 
