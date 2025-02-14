@@ -1,39 +1,39 @@
-Process Mining with Graph Neural Networks
+## Process Mining with Graph Neural Networks
 
 An advanced implementation combining Graph Neural Networks, Deep Learning, and Process Mining techniques for business process analysis and prediction.
 
-Overview
+**1. Overview**
 
 This research project implements a novel approach to process mining using Graph Neural Networks (GNN) and deep learning techniques. The framework combines state-of-the-art machine learning models with traditional process mining methods to provide comprehensive process analysis and prediction capabilities.
 
-Authors
+**2. Authors**
 - Somesh Misra
 - Shashank Dixit
 - Research Group: ERP.AI Research
 
-Key Components
+**3. Key Components**
 
-Process Analysis
+1. Process Analysis
 - Advanced bottleneck detection using temporal analysis
 - Conformance checking with inductive mining
 - Cycle time analysis and prediction
 - Transition pattern discovery
 - Spectral clustering for process segmentation
 
-Machine Learning Models
+2. Machine Learning Models
 - Graph Attention Networks (GAT) for structural learning
 - LSTM networks for temporal dependencies
 - Reinforcement Learning for process optimization
 - Custom neural architectures for process prediction
 
-Visualization Suite
+3. Visualization Suite
 - Interactive process flow visualization
 - Temporal pattern analysis
 - Performance bottleneck identification
 - Resource utilization patterns
 - Custom process metrics
 
-## Technical Architecture
+## 4. Technical Architecture
 
 ```
 src/
@@ -49,7 +49,7 @@ src/
 └── main.py                   # Main execution script
 ```
 
-Technical Requirements
+## 5. Technical Requirements
 
 - Python 3.8+
 - PyTorch 1.9+
@@ -58,7 +58,7 @@ Technical Requirements
 - NetworkX
 - Additional dependencies in requirements.txt
 
-Installation
+## 6. Installation
 
 1. Clone the repository:
 ```bash
@@ -71,7 +71,7 @@ cd GNN
 pip install -r requirements.txt
 ```
 
-## Data Requirements
+## 7. Data Requirements
 
 The system expects process event logs in CSV format with the following structure:
 - case_id: Process instance identifier
@@ -80,7 +80,7 @@ The system expects process event logs in CSV format with the following structure
 - resource: Resource identifier
 - amount: Numerical attribute (if applicable)
 
-## Usage
+## 8. Usage
 
 ```bash
 python main.py
@@ -96,7 +96,7 @@ results/run_timestamp/
 └── policies/        # Learned optimization policies
 ```
 
-## Technical Details
+## 9. Technical Details
 
 Graph Neural Network Architecture
 - Multi-head attention mechanisms
@@ -121,7 +121,7 @@ Reinforcement Learning
 - Policy gradient methods
 - Resource allocation optimization
 
-## Contributing
+## 10. Contributing
 
 We welcome contributions from the research community. Please follow these steps:
 
@@ -130,7 +130,7 @@ We welcome contributions from the research community. Please follow these steps:
 3. Implement your changes
 4. Submit a pull request with detailed documentation
 
-## Citation
+## 11. Citation
 
 If you use this code in your research, please cite:
 
@@ -138,8 +138,8 @@ If you use this code in your research, please cite:
 @software{GNN_ProcessMining,
   author = {Shashank Dixit/Somesh Misra},
   title = {Process Mining with Graph Neural Networks},
-  year = {2024},
-  publisher = {GitHub},
+  year = {2025},
+  publisher = {ERP.AI},
   url = {https://github.com/ERPdotAI/GNN}
 }
 ``` 
