@@ -14,20 +14,20 @@ This research project implements a novel approach to process mining using Graph 
 
 ## 3. Key Components
 
-1. Process Analysis
+1. **Process Analysis**
 - Advanced bottleneck detection using temporal analysis
 - Conformance checking with inductive mining
 - Cycle time analysis and prediction
 - Transition pattern discovery
 - Spectral clustering for process segmentation
 
-2. Machine Learning Models
+2. **Machine Learning Models**
 - Graph Attention Networks (GAT) for structural learning
 - LSTM networks for temporal dependencies
 - Reinforcement Learning for process optimization
 - Custom neural architectures for process prediction
 
-3. Visualization Suite
+3. **Visualization Suite**
 - Interactive process flow visualization
 - Temporal pattern analysis
 - Performance bottleneck identification
