@@ -2,16 +2,17 @@
 
 An advanced implementation combining Graph Neural Networks, Deep Learning, and Process Mining techniques for business process analysis and prediction.
 
-**1. Overview**
+## 1. Overview
 
 This research project implements a novel approach to process mining using Graph Neural Networks (GNN) and deep learning techniques. The framework combines state-of-the-art machine learning models with traditional process mining methods to provide comprehensive process analysis and prediction capabilities.
 
-**2. Authors**
-- Somesh Misra
-- Shashank Dixit
+## 2. Authors
+
+- Somesh Misra x.com/mathprobro
+- Shashank Dixit x.com/protosphinx
 - Research Group: ERP.AI Research
 
-**3. Key Components**
+## 3. Key Components
 
 1. Process Analysis
 - Advanced bottleneck detection using temporal analysis
