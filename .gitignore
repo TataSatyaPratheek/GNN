@@ -33,7 +33,6 @@ pm-venv/
 *.swo
 
 # Data and Results
-*.csv
 results/
 *.pth
 *.png

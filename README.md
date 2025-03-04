@@ -38,6 +38,7 @@ This research project implements a novel approach to process mining using Graph 
 
 ```
 src/
+├── input/                # input files
 ├── models/
 │   ├── gat_model.py      # Graph Attention Network implementation
 │   └── lstm_model.py     # LSTM sequence model
@@ -84,7 +85,7 @@ The system expects process event logs in CSV format with the following structure
 ## 8. Usage
 
 ```bash
-python main.py
+python main.py <input-file-path>
 ```
 
 Results are stored in timestamped directories under `results/` with the following structure:

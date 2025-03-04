@@ -12,6 +12,7 @@ import numpy as np
 from torch_geometric.loader import DataLoader
 from datetime import datetime
 import json
+import sys
 import shutil
 
 # Set random seeds
@@ -104,7 +105,9 @@ def main():
     print(f"Results will be saved in: {run_dir}")
     
     # 1. Load and preprocess data
-    data_path = "BPI2020_DomesticDeclarations.csv"
+    if len(sys.argv) < 2:
+        raise ValueError("Error: Missing dataset path. Please provide the path to the dataset as a command line argument.")
+    data_path = sys.argv[1]
     if not os.path.exists(data_path):
         print(f"Error: dataset not found at {data_path}")
         return
