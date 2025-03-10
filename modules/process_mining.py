@@ -211,7 +211,6 @@ def perform_conformance_checking(df):
     print("Discovering process model...")
     process_tree = inductive_miner.apply(event_log)
     from pm4py.objects.conversion.process_tree import converter as pt_converter
-    from pm4py.objects.conversion.process_tree import converter as pt_converter
     net, im, fm = pt_converter.apply(process_tree)
     
     print("Performing token replay...")
