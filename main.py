@@ -600,24 +600,7 @@ def load_and_preprocess_data_phase1(data_path, args):
     Returns:
         Tuple of (df, graphs, task_encoder, resource_encoder)
     """
-    # Import enhanced preprocessing utilities
-    try:
-        from data_preprocessing_enhancements import load_and_preprocess_data
-    except ImportError:
-        try:
-            from modules.data_preprocessing_enhancements import load_and_preprocess_data
-        except ImportError:
-            print(colored("Enhanced preprocessing not found. Falling back to standard implementation.", "yellow"))
-            from modules.data_preprocessing import load_and_preprocess_data
-            from modules.data_preprocessing import create_feature_representation
-            from modules.data_preprocessing import build_graph_data
-            
-            # Use standard preprocessing
-            print_section_header("Loading and Preprocessing Data")
-            df = load_and_preprocess_data(data_path)
-            df, task_encoder, resource_encoder = create_feature_representation(df, use_norm_features=args.norm_features)
-            graphs = build_graph_data(df)
-            return df, graphs, task_encoder, resource_encoder
+    from modules.data_preprocessing import load_and_preprocess_data
     
     print_section_header("Loading and Preprocessing Data with Phase 1 Enhancements")
     
