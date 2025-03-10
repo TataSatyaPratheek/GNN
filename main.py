@@ -440,6 +440,8 @@ def main():
             
             # Get embeddings and visualize
             try:
+                from visualization.process_viz import UMAP_AVAILABLE
+                
                 embeddings = get_embeddings(gat_model, sample_data)
                 plot_embeddings(
                     embeddings, 
@@ -751,7 +753,7 @@ def main():
             # Extract optimal policy
             print(colored("🔍 Extracting optimal policy...", "cyan"))
             all_actions = [(t, r) for t in env.all_tasks for r in env.resources]
-            policy_results = get_optimal_policy(rl_results['policy'], all_actions)
+            policy_results = get_optimal_policy(rl_results, all_actions)  # Pass Q_table directly
             
             # Save policy and results
             save_metrics(policy_results, run_dir, "rl_policy.json")

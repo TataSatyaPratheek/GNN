@@ -6,6 +6,7 @@ Visualization module for process mining analysis with enhanced visuals
 and better error handling for dependencies
 """
 
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import networkx as nx

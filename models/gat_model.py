@@ -141,7 +141,10 @@ def train_gat_model(model, train_loader, val_loader, criterion, optimizer,
                 val_loss += criterion(out, glabels).item()
                 
                 # Update validation progress bar
-                val_progress.set_postfix({"val_loss": f"{val_loss/val_progress.n:.4f}"})
+                if val_progress.n > 0:
+                    val_progress.set_postfix({"val_loss": f"{val_loss/val_progress.n:.4f}"})
+                else:
+                    val_progress.set_postfix({"val_loss": "N/A"})
         
         avg_val_loss = val_loss/len(val_loader)
         val_losses.append(avg_val_loss)

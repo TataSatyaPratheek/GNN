@@ -126,24 +126,6 @@ def analyze_cycle_times(df):
     
     print(f"Analysis completed in \033[96m{time.time() - start_time:.2f}s\033[0m")
     
-    # Plot histogram if matplotlib is available
-    try:
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 6))
-        plt.hist(case_merged["duration_h"], bins=50, alpha=0.7)
-        plt.axvline(p50, color='green', linestyle='--', label=f'Median: {p50:.2f}h')
-        plt.axvline(p95, color='orange', linestyle='--', label=f'95th %: {p95:.2f}h')
-        plt.axvline(p99, color='red', linestyle='--', label=f'99th %: {p99:.2f}h')
-        plt.xlabel('Duration (hours)')
-        plt.ylabel('Number of Cases')
-        plt.title('Case Duration Distribution')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig('cycle_time_distribution.png')
-        print("Saved cycle time distribution to cycle_time_distribution.png")
-    except:
-        pass
-    
     return case_merged, long_cases, p95
 
 def analyze_rare_transitions(bottleneck_stats, rare_threshold=2):
@@ -179,6 +161,7 @@ def perform_conformance_checking(df):
     
     print("Discovering process model...")
     process_tree = inductive_miner.apply(event_log)
+    from pm4py.objects.conversion.process_tree import converter as pt_converter
     net, im, fm = pt_converter.apply(process_tree)
     
     print("Performing token replay...")
