@@ -13,6 +13,8 @@ import random
 from tqdm import tqdm
 import time
 import gc
+import os
+import matplotlib.pyplot as plt
 
 class NextActivityLSTM(nn.Module):
     """
@@ -167,7 +169,7 @@ def make_padded_dataset(sample_list, num_cls):
 
 def train_lstm_model(model, X_train_pad, X_train_len, y_train, 
                     device, batch_size=64, epochs=5, 
-                    model_path="lstm_next_activity.pth"):
+                    model_path="lstm_next_activity.pth", viz_dir=None):
     """
     Train the LSTM model with enhanced progress tracking
     """
@@ -263,16 +265,25 @@ def train_lstm_model(model, X_train_pad, X_train_len, y_train,
     
     # Plot loss curve if matplotlib is available
     try:
-        import matplotlib.pyplot as plt
+        # Create figure
         plt.figure(figsize=(10, 5))
         plt.plot(train_losses)
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.title('LSTM Training Loss')
-        plt.savefig('lstm_training_loss.png')
-        print(f"Loss curve saved to lstm_training_loss.png")
-    except:
-        pass
+        
+        # Save to visualization directory if provided
+        if viz_dir:
+            loss_curve_path = os.path.join(viz_dir, 'lstm_training_loss.png')
+            plt.savefig(loss_curve_path)
+            print(f"Loss curve saved to {loss_curve_path}")
+        else:
+            plt.savefig('lstm_training_loss.png')
+            print(f"Loss curve saved to lstm_training_loss.png")
+        
+        plt.close()
+    except Exception as e:
+        print(f"Error saving loss curve: {e}")
     
     return model
 

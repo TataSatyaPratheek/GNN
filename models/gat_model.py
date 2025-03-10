@@ -11,6 +11,8 @@ from torch_geometric.nn import GATConv, global_mean_pool
 import time
 from tqdm import tqdm
 import numpy as np
+import os
+import matplotlib.pyplot as plt
 
 class NextTaskGAT(nn.Module):
     """
@@ -60,7 +62,7 @@ class NextTaskGAT(nn.Module):
         return self.fc(x)
 
 def train_gat_model(model, train_loader, val_loader, criterion, optimizer, 
-                   device, num_epochs=20, model_path="best_gnn_model.pth"):
+                   device, num_epochs=20, model_path="best_gnn_model.pth", viz_dir=None):
     """
     Train the GAT model with enhanced progress tracking
     """
@@ -141,7 +143,10 @@ def train_gat_model(model, train_loader, val_loader, criterion, optimizer,
                 val_loss += criterion(out, glabels).item()
                 
                 # Update validation progress bar
-                val_progress.set_postfix({"val_loss": f"{val_loss/val_progress.n:.4f}"})
+                if val_progress.n > 0:
+                    val_progress.set_postfix({"val_loss": f"{val_loss/val_progress.n:.4f}"})
+                else:
+                    val_progress.set_postfix({"val_loss": "N/A"})
         
         avg_val_loss = val_loss/len(val_loader)
         val_losses.append(avg_val_loss)
@@ -168,7 +173,7 @@ def train_gat_model(model, train_loader, val_loader, criterion, optimizer,
     
     # Plot loss curves if matplotlib is available
     try:
-        import matplotlib.pyplot as plt
+        # Create figure
         plt.figure(figsize=(10, 5))
         plt.plot(train_losses, label='Training Loss')
         plt.plot(val_losses, label='Validation Loss')
@@ -176,10 +181,19 @@ def train_gat_model(model, train_loader, val_loader, criterion, optimizer,
         plt.ylabel('Loss')
         plt.title('Training and Validation Loss')
         plt.legend()
-        plt.savefig('gat_training_loss.png')
-        print(f"Loss curve saved to gat_training_loss.png")
-    except:
-        pass
+        
+        # Save to visualization directory if provided
+        if viz_dir:
+            loss_curve_path = os.path.join(viz_dir, 'gat_training_loss.png')
+            plt.savefig(loss_curve_path)
+            print(f"Loss curve saved to {loss_curve_path}")
+        else:
+            plt.savefig('gat_training_loss.png')
+            print(f"Loss curve saved to gat_training_loss.png")
+        
+        plt.close()
+    except Exception as e:
+        print(f"Error saving loss curve: {e}")
         
     return model
 

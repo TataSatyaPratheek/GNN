@@ -11,6 +11,8 @@ import numpy as np
 from tqdm import tqdm
 import time
 import os
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Optional PM4Py import with fallback
 try:
@@ -70,7 +72,7 @@ def analyze_bottlenecks(df, freq_threshold=5):
     
     return bottleneck_stats, significant_bottlenecks
 
-def analyze_cycle_times(df):
+def analyze_cycle_times(df, viz_dir=None):
     """
     Analyze process cycle times with enhanced progress tracking
     """
@@ -124,25 +126,54 @@ def analyze_cycle_times(df):
     print(f"  Duration vs. Events: {corr_events:.2f}")
     print(f"  Duration vs. Amount: {corr_amount:.2f}")
     
-    print(f"Analysis completed in \033[96m{time.time() - start_time:.2f}s\033[0m")
+    # Create and save cycle time distribution visualization if directory provided
+    if viz_dir:
+        try:
+            # Plot cycle time distribution
+            plt.figure(figsize=(12, 7))
+            
+            # Plot histogram with KDE
+            sns.histplot(case_merged["duration_h"].values, 
+                        bins=min(50, len(case_merged) // 20), 
+                        kde=True, color="royalblue", edgecolor="white", alpha=0.7)
+            
+            # Add percentile lines
+            plt.axvline(p50, color="green", linestyle="--", 
+                       linewidth=2, label=f"Median: {p50:.1f}h")
+            plt.axvline(p95, color="orange", linestyle="-.", 
+                       linewidth=2, label=f"95th Percentile: {p95:.1f}h")
+            plt.axvline(p99, color="red", linestyle="-.", 
+                       linewidth=2, label=f"99th Percentile: {p99:.1f}h")
+            
+            # Enhanced styling
+            plt.title("Process Cycle Time Distribution", fontsize=16)
+            plt.xlabel("Duration (hours)", fontsize=14)
+            plt.ylabel("Number of Cases", fontsize=14)
+            plt.grid(True, linestyle='--', alpha=0.6)
+            plt.legend(fontsize=12, loc='upper right')
+            
+            # Add summary statistics as text
+            stats_text = f"Total Cases: {len(case_merged)}\n"
+            stats_text += f"Mean: {case_merged['duration_h'].mean():.2f}h\n"
+            stats_text += f"Median: {p50:.2f}h\n"
+            stats_text += f"Min: {case_merged['duration_h'].min():.2f}h\n"
+            stats_text += f"Max: {max_duration:.2f}h\n"
+            stats_text += f"Std Dev: {case_merged['duration_h'].std():.2f}h"
+            
+            plt.annotate(stats_text, xy=(0.02, 0.97), xycoords='axes fraction',
+                        fontsize=11, ha='left', va='top',
+                        bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="gray", alpha=0.8))
+            
+            plt.tight_layout()
+            
+            cycle_time_path = os.path.join(viz_dir, 'cycle_time_distribution.png')
+            plt.savefig(cycle_time_path)
+            print(f"Saved cycle time distribution to {cycle_time_path}")
+            plt.close()
+        except Exception as e:
+            print(f"Error creating cycle time visualization: {e}")
     
-    # Plot histogram if matplotlib is available
-    try:
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 6))
-        plt.hist(case_merged["duration_h"], bins=50, alpha=0.7)
-        plt.axvline(p50, color='green', linestyle='--', label=f'Median: {p50:.2f}h')
-        plt.axvline(p95, color='orange', linestyle='--', label=f'95th %: {p95:.2f}h')
-        plt.axvline(p99, color='red', linestyle='--', label=f'99th %: {p99:.2f}h')
-        plt.xlabel('Duration (hours)')
-        plt.ylabel('Number of Cases')
-        plt.title('Case Duration Distribution')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig('cycle_time_distribution.png')
-        print("Saved cycle time distribution to cycle_time_distribution.png")
-    except:
-        pass
+    print(f"Analysis completed in \033[96m{time.time() - start_time:.2f}s\033[0m")
     
     return case_merged, long_cases, p95
 
@@ -179,6 +210,7 @@ def perform_conformance_checking(df):
     
     print("Discovering process model...")
     process_tree = inductive_miner.apply(event_log)
+    from pm4py.objects.conversion.process_tree import converter as pt_converter
     net, im, fm = pt_converter.apply(process_tree)
     
     print("Performing token replay...")
@@ -209,7 +241,7 @@ def perform_conformance_checking(df):
     
     return replayed, n_deviant
 
-def analyze_transition_patterns(df):
+def analyze_transition_patterns(df, viz_dir=None):
     """
     Analyze transition patterns and compute transition matrix
     """
@@ -243,24 +275,33 @@ def analyze_transition_patterns(df):
     
     # Plot transition heatmap if matplotlib is available
     try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
+        # Create figure
+        plt.figure(figsize=(10, 8))
         
         # Limit to top activities for readability
         top_n = 10
         top_tasks = trans_count.sum(axis=1).nlargest(top_n).index
         top_matrix = prob_matrix.loc[top_tasks, top_tasks]
         
-        plt.figure(figsize=(10, 8))
+        # Create heatmap
         sns.heatmap(top_matrix, cmap="YlGnBu", annot=True, fmt=".2f")
         plt.title(f'Transition Probability Heatmap (Top {top_n} Activities)')
         plt.xlabel('Next Activity')
         plt.ylabel('Current Activity')
         plt.tight_layout()
-        plt.savefig('transition_heatmap.png')
-        print("Saved transition heatmap to transition_heatmap.png")
-    except:
-        pass
+        
+        # Save to visualization directory if provided
+        if viz_dir:
+            heatmap_path = os.path.join(viz_dir, 'transition_heatmap.png')
+            plt.savefig(heatmap_path)
+            print(f"Saved transition heatmap to {heatmap_path}")
+        else:
+            plt.savefig('transition_heatmap.png')
+            print("Saved transition heatmap to transition_heatmap.png")
+        
+        plt.close()
+    except Exception as e:
+        print(f"Error creating transition heatmap: {e}")
     
     return transitions, trans_count, prob_matrix
 

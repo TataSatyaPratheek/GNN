@@ -194,6 +194,13 @@ def main():
     run_dir = setup_results_dir(args.output_dir)
     print(colored(f"\n📊 Results will be saved in: {run_dir}", "magenta"))
     
+    # Define directory paths for different output types
+    viz_dir = os.path.join(run_dir, "visualizations")
+    models_dir = os.path.join(run_dir, "models")
+    analysis_dir = os.path.join(run_dir, "analysis")
+    metrics_dir = os.path.join(run_dir, "metrics")
+    policy_dir = os.path.join(run_dir, "policies")
+    
     # Import local modules
     try:
         print_section_header("Importing Modules")
@@ -273,7 +280,7 @@ def main():
         
         # Save a copy of raw data to the results directory
         raw_data_sample = df.head(1000)  # Just a sample to avoid large files
-        raw_data_sample.to_csv(os.path.join(run_dir, "analysis", "data_sample.csv"), index=False)
+        raw_data_sample.to_csv(os.path.join(analysis_dir, "data_sample.csv"), index=False)
         
         # Create feature representation
         print(colored(f"\n🔍 Creating feature representation (normalization={args.norm_features})", "cyan"))
@@ -359,25 +366,26 @@ def main():
         optimizer = torch.optim.AdamW(gat_model.parameters(), lr=0.0005, weight_decay=5e-4)
         
         # Set model save path
-        gat_model_path = os.path.join(run_dir, "models", "best_gnn_model.pth")
+        gat_model_path = os.path.join(models_dir, "best_gnn_model.pth")
         
         # Train model
         print(colored(f"🏋️ Training GAT model for {args.epochs} epochs...", "cyan"))
         gat_model = train_gat_model(
             gat_model, train_loader, val_loader,
             criterion, optimizer, device,
-            num_epochs=args.epochs, model_path=gat_model_path
+            num_epochs=args.epochs, model_path=gat_model_path,
+            viz_dir=viz_dir  # Pass visualization directory
         )
         
         # Save model architecture summary
         try:
             from torchsummary import summary
             model_summary = summary(gat_model, input_size=(5, 100))
-            with open(os.path.join(run_dir, "models", "gat_model_summary.txt"), 'w') as f:
+            with open(os.path.join(models_dir, "gat_model_summary.txt"), 'w') as f:
                 f.write(str(gat_model))
         except ImportError:
             # If torchsummary is not available, save basic model info
-            with open(os.path.join(run_dir, "models", "gat_model_summary.txt"), 'w') as f:
+            with open(os.path.join(models_dir, "gat_model_summary.txt"), 'w') as f:
                 f.write(str(gat_model))
         
     except Exception as e:
@@ -394,7 +402,6 @@ def main():
         y_true, y_pred, y_prob = evaluate_gat_model(gat_model, val_loader, device)
         
         # Create confusion matrix
-        viz_dir = os.path.join(run_dir, "visualizations")
         confusion_matrix_path = os.path.join(viz_dir, "gat_confusion_matrix.png")
         
         print(colored("📊 Creating confusion matrix visualization...", "cyan"))
@@ -440,6 +447,8 @@ def main():
             
             # Get embeddings and visualize
             try:
+                from visualization.process_viz import UMAP_AVAILABLE
+                
                 embeddings = get_embeddings(gat_model, sample_data)
                 plot_embeddings(
                     embeddings, 
@@ -493,7 +502,7 @@ def main():
             ).to(device)
             
             # Set model save path
-            lstm_model_path = os.path.join(run_dir, "models", "lstm_next_activity.pth")
+            lstm_model_path = os.path.join(models_dir, "lstm_next_activity.pth")
             
             # Train model
             print(colored(f"🏋️ Training LSTM model for {args.lstm_epochs} epochs...", "cyan"))
@@ -503,7 +512,8 @@ def main():
                 device, 
                 batch_size=args.batch_size, 
                 epochs=args.lstm_epochs, 
-                model_path=lstm_model_path
+                model_path=lstm_model_path,
+                viz_dir=viz_dir  # Pass visualization directory
             )
             
             # Evaluate LSTM model
@@ -553,21 +563,21 @@ def main():
         bottleneck_stats, significant_bottlenecks = analyze_bottlenecks(df)
         
         # Save bottleneck data
-        bottleneck_stats.to_csv(os.path.join(run_dir, "analysis", "bottleneck_stats.csv"), index=False)
-        significant_bottlenecks.to_csv(os.path.join(run_dir, "analysis", "significant_bottlenecks.csv"), index=False)
+        bottleneck_stats.to_csv(os.path.join(analysis_dir, "bottleneck_stats.csv"), index=False)
+        significant_bottlenecks.to_csv(os.path.join(analysis_dir, "significant_bottlenecks.csv"), index=False)
         
         # Analyze cycle times
         print(colored("🔍 Analyzing cycle times...", "cyan"))
         case_merged, long_cases, cut95 = analyze_cycle_times(df)
         
         # Save cycle time data
-        case_merged.to_csv(os.path.join(run_dir, "analysis", "case_cycle_times.csv"), index=False)
-        long_cases.to_csv(os.path.join(run_dir, "analysis", "long_running_cases.csv"), index=False)
+        case_merged.to_csv(os.path.join(analysis_dir, "case_cycle_times.csv"), index=False)
+        long_cases.to_csv(os.path.join(analysis_dir, "long_running_cases.csv"), index=False)
         
         # Analyze rare transitions
         print(colored("🔍 Identifying rare transitions...", "cyan"))
         rare_trans = analyze_rare_transitions(bottleneck_stats)
-        rare_trans.to_csv(os.path.join(run_dir, "analysis", "rare_transitions.csv"), index=False)
+        rare_trans.to_csv(os.path.join(analysis_dir, "rare_transitions.csv"), index=False)
         
         # Perform conformance checking
         print(colored("🔍 Performing conformance checking...", "cyan"))
@@ -617,8 +627,6 @@ def main():
     print_section_header("Creating Process Visualizations")
     
     try:
-        viz_dir = os.path.join(run_dir, "visualizations")
-        
         # Plot cycle time distribution
         print(colored("📊 Creating cycle time distribution...", "cyan"))
         plot_cycle_time_distribution(
@@ -635,10 +643,10 @@ def main():
         
         # Get transition patterns and create visualizations
         print(colored("📊 Analyzing transition patterns...", "cyan"))
-        transitions, trans_count, prob_matrix = analyze_transition_patterns(df)
+        transitions, trans_count, prob_matrix = analyze_transition_patterns(df, viz_dir=viz_dir)
         
         # Save transition data
-        transitions.to_csv(os.path.join(run_dir, "analysis", "transitions.csv"), index=False)
+        transitions.to_csv(os.path.join(analysis_dir, "transitions.csv"), index=False)
         
         # Plot transition heatmap
         print(colored("📊 Creating transition probability heatmap...", "cyan"))
@@ -746,12 +754,12 @@ def main():
             env = ProcessEnv(df, le_task, dummy_resources)
             
             print(colored("🏋️ Training reinforcement learning agent...", "cyan"))
-            rl_results = run_q_learning(env, episodes=30)
+            rl_results = run_q_learning(env, episodes=30, viz_dir=viz_dir, policy_dir=policy_dir)
             
             # Extract optimal policy
             print(colored("🔍 Extracting optimal policy...", "cyan"))
             all_actions = [(t, r) for t in env.all_tasks for r in env.resources]
-            policy_results = get_optimal_policy(rl_results['policy'], all_actions)
+            policy_results = get_optimal_policy(rl_results, all_actions, policy_dir=policy_dir)
             
             # Save policy and results
             save_metrics(policy_results, run_dir, "rl_policy.json")
@@ -841,6 +849,7 @@ def main():
             f.write(f"- **Models:** GAT, LSTM\n")
             f.write(f"- **Visualizations:** Confusion matrices, process flow, bottlenecks, transitions, Sankey diagram\n")
             f.write(f"- **Analysis:** Bottlenecks, cycle times, transitions, clusters\n")
+            f.write(f"- **Policies:** RL optimization policies\n")
         
         print(colored(f"\n✅ Execution summary saved to {report_path}", "green"))
         
@@ -853,6 +862,7 @@ def main():
     print(colored(f"Results saved to: {run_dir}", "green"))
     print(colored(f"To view visualizations, check the '{os.path.join(run_dir, 'visualizations')}' directory", "cyan"))
     print(colored(f"To see detailed metrics, check the '{os.path.join(run_dir, 'metrics')}' directory", "cyan"))
+    print(colored(f"To see learned policies, check the '{os.path.join(run_dir, 'policies')}' directory", "cyan"))
     print("=" * 80)
 
 if __name__ == "__main__":

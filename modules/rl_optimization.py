@@ -9,6 +9,8 @@ import numpy as np
 import random
 from tqdm import tqdm
 import time
+import os
+import pickle
 import matplotlib.pyplot as plt
 
 class ProcessEnv:
@@ -256,7 +258,7 @@ class ProcessEnv:
         
         return random.random() < min(0.5, base_prob)
 
-def run_q_learning(env, episodes=30, alpha=0.1, gamma=0.9, epsilon=0.1):
+def run_q_learning(env, episodes=30, alpha=0.1, gamma=0.9, epsilon=0.1, viz_dir=None, policy_dir=None):
     """
     Q-learning algorithm for process optimization with enhanced monitoring
     """
@@ -364,7 +366,7 @@ def run_q_learning(env, episodes=30, alpha=0.1, gamma=0.9, epsilon=0.1):
     
     # Plot learning curves if matplotlib is available
     try:
-        # Plot rewards
+        # Create figure
         plt.figure(figsize=(12, 4))
         plt.subplot(1, 3, 1)
         plt.plot(episode_rewards)
@@ -387,14 +389,78 @@ def run_q_learning(env, episodes=30, alpha=0.1, gamma=0.9, epsilon=0.1):
         plt.ylabel('Epsilon')
         
         plt.tight_layout()
-        plt.savefig('rl_training_curves.png')
-        print("Saved RL training curves to rl_training_curves.png")
-    except:
-        pass
+        
+        # Save to visualization directory if provided
+        if viz_dir:
+            curve_path = os.path.join(viz_dir, 'rl_training_curves.png')
+            plt.savefig(curve_path)
+            print(f"Saved RL training curves to {curve_path}")
+        else:
+            plt.savefig('rl_training_curves.png')
+            print("Saved RL training curves to rl_training_curves.png")
+        
+        plt.close()
+    except Exception as e:
+        print(f"Error saving RL curves: {e}")
+
+    # Save Q-table to policy directory if provided
+    if policy_dir:
+        try:
+            # Ensure policy directory exists
+            os.makedirs(policy_dir, exist_ok=True)
+            
+            # Save the Q-table
+            q_table_path = os.path.join(policy_dir, 'q_table.pkl')
+            with open(q_table_path, 'wb') as f:
+                pickle.dump(Q_table, f)
+            print(f"Saved Q-table to {q_table_path}")
+            
+            # Also save a readable version
+            q_table_readable_path = os.path.join(policy_dir, 'q_table_summary.txt')
+            with open(q_table_readable_path, 'w') as f:
+                f.write(f"Q-Table Summary\n")
+                f.write(f"==============\n")
+                f.write(f"States: {len(Q_table)}\n")
+                f.write(f"Actions: {num_actions}\n\n")
+                
+                # Sample a few states for readability
+                sample_size = min(5, len(Q_table))
+                f.write(f"Sample of {sample_size} states:\n")
+                for i, (state, qvals) in enumerate(list(Q_table.items())[:sample_size]):
+                    f.write(f"State {i+1}: {state}\n")
+                    best_action_idx = np.argmax(qvals)
+                    best_action = all_actions[best_action_idx]
+                    f.write(f"  Best Action: {best_action} (Q-value: {qvals[best_action_idx]:.4f})\n")
+                    f.write("\n")
+            
+            print(f"Saved Q-table summary to {q_table_readable_path}")
+            
+            # Save action space information
+            action_space_path = os.path.join(policy_dir, 'action_space.txt')
+            with open(action_space_path, 'w') as f:
+                f.write(f"Action Space Details\n")
+                f.write(f"==================\n")
+                f.write(f"Total actions: {num_actions}\n")
+                f.write(f"Tasks: {len(possible_tasks)}\n")
+                f.write(f"Resources: {len(possible_resources)}\n\n")
+                
+                f.write(f"Task IDs:\n")
+                for t in possible_tasks:
+                    task_name = env.le_task.inverse_transform([t])[0] if hasattr(env, 'le_task') else f"Task {t}"
+                    f.write(f"  {t}: {task_name}\n")
+                    
+                f.write(f"\nResource IDs:\n")
+                for r in possible_resources:
+                    f.write(f"  {r}\n")
+            
+            print(f"Saved action space details to {action_space_path}")
+            
+        except Exception as e:
+            print(f"Error saving Q-table: {e}")
     
     return Q_table
 
-def get_optimal_policy(Q_table, all_actions):
+def get_optimal_policy(Q_table, all_actions, policy_dir=None):
     """
     Extract optimal policy from Q-table with enhanced analysis
     """
@@ -447,10 +513,111 @@ def get_optimal_policy(Q_table, all_actions):
     
     print(f"Policy extraction completed in \033[96m{time.time() - start_time:.2f}s\033[0m")
     
+    # Save policy files to policy directory if provided
+    if policy_dir:
+        try:
+            # Ensure policy directory exists
+            os.makedirs(policy_dir, exist_ok=True)
+            
+            # Save policy details in readable format
+            policy_file_path = os.path.join(policy_dir, 'optimal_policy.txt')
+            with open(policy_file_path, 'w') as f:
+                f.write("Optimal Process Policy\n")
+                f.write("====================\n\n")
+                f.write(f"Total states with defined policy: {len(policy)}\n")
+                f.write(f"Total unique tasks in policy: {len(task_distribution)}\n\n")
+                
+                f.write("Resource Utilization:\n")
+                for resource, count in sorted(resource_distribution.items()):
+                    percentage = count / total_assignments * 100 if total_assignments > 0 else 0
+                    f.write(f"  Resource {resource}: {percentage:.1f}% ({count} assignments)\n")
+                
+                f.write("\nSample Policy Decisions:\n")
+                # Show a few sample policy decisions
+                sample_size = min(10, len(policy))
+                for i, (state, action) in enumerate(list(policy.items())[:sample_size]):
+                    state_desc = ", ".join([f"{v:.3f}" for v in state[:5]]) + "..."  # Truncate for readability
+                    task, resource = action
+                    confidence = q_values[state]['confidence']
+                    f.write(f"State {i+1} [{state_desc}] → Task: {task}, Resource: {resource} (Confidence: {confidence:.4f})\n")
+            
+            print(f"Saved optimal policy to {policy_file_path}")
+            
+            # Save policy in JSON format (for programmatic access)
+            try:
+                import json
+                
+                # Convert policy to serializable format
+                serializable_policy = {
+                    "metadata": {
+                        "states": len(policy),
+                        "unique_tasks": len(task_distribution),
+                        "resources": len(resource_distribution),
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    },
+                    "task_distribution": {str(k): v for k, v in task_distribution.items()},
+                    "resource_distribution": {str(k): v for k, v in resource_distribution.items()},
+                    "policies": {
+                        "sample": {
+                            str(i): {
+                                "state_description": ", ".join([f"{v:.3f}" for v in state[:5]]) + "...",
+                                "action": {"task": int(action[0]), "resource": int(action[1])},
+                                "confidence": float(q_values[state]['confidence'])
+                            }
+                            for i, (state, action) in enumerate(list(policy.items())[:sample_size])
+                        }
+                    }
+                }
+                
+                policy_json_path = os.path.join(policy_dir, 'policy_summary.json')
+                with open(policy_json_path, 'w') as f:
+                    json.dump(serializable_policy, f, indent=2)
+                
+                print(f"Saved policy summary JSON to {policy_json_path}")
+            except Exception as e:
+                print(f"Error saving policy JSON: {e}")
+            
+            # Also save visualizations if matplotlib is available
+            try:
+                # Plot task distribution
+                plt.figure(figsize=(10, 6))
+                tasks = list(task_distribution.keys())
+                counts = list(task_distribution.values())
+                plt.bar(tasks, counts)
+                plt.xlabel('Task ID')
+                plt.ylabel('Count in Policy')
+                plt.title('Task Distribution in Optimal Policy')
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                
+                task_dist_path = os.path.join(policy_dir, 'task_distribution.png')
+                plt.savefig(task_dist_path)
+                print(f"Saved task distribution plot to {task_dist_path}")
+                plt.close()
+                
+                # Plot resource distribution
+                plt.figure(figsize=(10, 6))
+                resources = list(resource_distribution.keys())
+                counts = list(resource_distribution.values())
+                plt.bar(resources, counts)
+                plt.xlabel('Resource ID')
+                plt.ylabel('Count in Policy')
+                plt.title('Resource Distribution in Optimal Policy')
+                plt.tight_layout()
+                
+                resource_dist_path = os.path.join(policy_dir, 'resource_distribution.png')
+                plt.savefig(resource_dist_path)
+                print(f"Saved resource distribution plot to {resource_dist_path}")
+                plt.close()
+            except Exception as e:
+                print(f"Error creating policy visualizations: {e}")
+        except Exception as e:
+            print(f"Error saving policy files: {e}")
+    
     # Enhanced return with quality metrics
     return {
-        'policy': policy,
-        'q_values': q_values,
-        'task_distribution': task_distribution,
-        'resource_distribution': resource_distribution
+        'policy': {str(k): v for k, v in policy.items()},  # Convert keys to strings for JSON compatibility
+        'q_values': {str(k): v for k, v in q_values.items()},
+        'task_distribution': {str(k): v for k, v in task_distribution.items()},
+        'resource_distribution': {str(k): v for k, v in resource_distribution.items()}
     }
