@@ -307,9 +307,12 @@ class EnhancedGNN(nn.Module):
         # Calculate position for each node
         start_idx = 0
         for b, count in zip(unique_batches, counts):
+            # Move count to CPU before using with numpy
+            count_cpu = count.item()  # This safely converts a single-element tensor to a Python number
+            
             # Create a grid-like positioning for nodes in each batch
-            grid_size = int(np.ceil(np.sqrt(count)))
-            for i in range(count):
+            grid_size = int(np.ceil(np.sqrt(count_cpu)))
+            for i in range(count_cpu):
                 row = i // grid_size
                 col = i % grid_size
                 
@@ -321,7 +324,7 @@ class EnhancedGNN(nn.Module):
                 pos[start_idx + i, 0] = norm_row
                 pos[start_idx + i, 1] = norm_col
             
-            start_idx += count
+            start_idx += count_cpu
         
         return pos
 

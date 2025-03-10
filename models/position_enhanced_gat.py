@@ -37,12 +37,22 @@ class PositionalEncoding(nn.Module):
         
     def _get_position_table(self, max_len, feature_dim):
         """Generate sinusoidal position encodings like in Transformer"""
+        # The issue: When feature_dim=8, div_term has shape [4], 
+        # but we need to fill 8 columns with sine values
         position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, feature_dim, 2) * (-math.log(10000.0) / feature_dim))
         
+        # Create position table with correct total dimensions
         pos_table = torch.zeros(max_len, feature_dim * 2)
-        pos_table[:, 0::2] = torch.sin(position * div_term)
-        pos_table[:, 1::2] = torch.cos(position * div_term)
+        
+        # Calculate divisor terms for each position dimension individually
+        # to avoid broadcasting issues
+        for i in range(feature_dim):
+            # Calculate angle rates based on position
+            angle_rate = 1.0 / (10000 ** (2 * i / float(feature_dim * 2)))
+            
+            # Apply sine to even indices and cosine to odd indices
+            pos_table[:, 2*i] = torch.sin(position[:, 0] * angle_rate)
+            pos_table[:, 2*i+1] = torch.cos(position[:, 0] * angle_rate)
         
         return pos_table
     
