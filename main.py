@@ -449,6 +449,8 @@ def main():
             try:
                 from visualization.process_viz import UMAP_AVAILABLE
                 
+                from visualization.process_viz import UMAP_AVAILABLE
+                
                 embeddings = get_embeddings(gat_model, sample_data)
                 plot_embeddings(
                     embeddings, 
