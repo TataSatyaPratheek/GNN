@@ -511,4 +511,5 @@ def compute_class_weights(df, num_classes):
     print(f"Class weight range: {min_weight:.4f} - {max_weight:.4f}")
     print(f"Class weights computed in \033[96m{time.time() - start_time:.2f}s\033[0m")
     
+    # Keep weights on CPU initially - will be moved to device in setup_optimizer_and_loss if needed
     return torch.tensor(class_weights, dtype=torch.float32)

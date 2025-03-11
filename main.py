@@ -587,6 +587,19 @@ def setup_optimizer_and_loss(model, args, class_weights=None, device=None):
     import torch.nn as nn
     import torch.optim as optim
     
+    # Check if we should use GPU for the model but CPU for class weights
+    use_cpu_for_weights = True
+    if device is not None and device.type == 'cuda':
+        try:
+            # Get available memory
+            free_memory = torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)
+            # If more than 1GB is available, we can try using GPU for weights
+            if free_memory > 1e9:  # 1GB in bytes
+                use_cpu_for_weights = False
+        except:
+            # If there's an error checking memory, use CPU for weights
+            use_cpu_for_weights = True
+    
     # Set up optimizer based on model type
     if args.model_type in ['mlp', 'lstm', 'basic_gat', 'positional_gat', 'diverse_gat', 'enhanced_gnn']:
         # For neural models
@@ -601,29 +614,51 @@ def setup_optimizer_and_loss(model, args, class_weights=None, device=None):
             # Multi-objective loss for dual task
             try:
                 from utils.losses import ProcessLoss
+                
+                # Keep class weights on CPU if needed
+                if use_cpu_for_weights and class_weights is not None and device is not None and device.type == 'cuda':
+                    class_weights_device = class_weights.cpu()
+                    print("Using class weights on CPU to save GPU memory")
+                else:
+                    class_weights_device = class_weights
+                    
                 criterion = ProcessLoss(
                     task_weight=0.7,
                     time_weight=0.3,
-                    class_weights=class_weights
-                ).to(device) if device else ProcessLoss(
-                    task_weight=0.7,
-                    time_weight=0.3,
-                    class_weights=class_weights
+                    class_weights=class_weights_device
                 )
+                
+                # Only move the loss function to GPU if we're not using CPU for weights
+                if device is not None and not use_cpu_for_weights:
+                    criterion = criterion.to(device)
+                
             except ImportError:
                 from multi_objective_loss import ProcessLoss
+                
+                # Keep class weights on CPU if needed
+                if use_cpu_for_weights and class_weights is not None and device is not None and device.type == 'cuda':
+                    class_weights_device = class_weights.cpu()
+                    print("Using class weights on CPU to save GPU memory")
+                else:
+                    class_weights_device = class_weights
+                    
                 criterion = ProcessLoss(
                     task_weight=0.7,
                     time_weight=0.3,
-                    class_weights=class_weights
-                ).to(device) if device else ProcessLoss(
-                    task_weight=0.7,
-                    time_weight=0.3,
-                    class_weights=class_weights
+                    class_weights=class_weights_device
                 )
+                
+                # Only move the loss function to GPU if we're not using CPU for weights
+                if device is not None and not use_cpu_for_weights:
+                    criterion = criterion.to(device)
         else:
             # Standard cross-entropy for classification
-            criterion = nn.CrossEntropyLoss(weight=class_weights)
+            if use_cpu_for_weights and class_weights is not None and device is not None and device.type == 'cuda':
+                # Keep class weights on CPU to save GPU memory
+                criterion = nn.CrossEntropyLoss(weight=class_weights.cpu())
+                print("Using class weights on CPU to save GPU memory")
+            else:
+                criterion = nn.CrossEntropyLoss(weight=class_weights)
             
     else:
         # For non-neural models (scikit-learn based models)
@@ -648,13 +683,25 @@ def load_and_preprocess_data_phase1(data_path, args):
     print_section_header("Loading and Preprocessing Data with Phase 1 Enhancements")
     
     # Load and preprocess data
-    df, graphs, task_encoder, resource_encoder = load_and_preprocess_data(
+    result = load_and_preprocess_data(
         data_path,
         use_adaptive_norm=args.adaptive_norm,
         enhanced_features=args.enhanced_features,
         enhanced_graphs=args.enhanced_graphs,
         batch_size=args.batch_size
     )
+    
+    # Ensure we're handling both return types properly
+    if isinstance(result, tuple) and len(result) == 4:
+        # Already returns a tuple with four elements
+        df, graphs, task_encoder, resource_encoder = result
+    else:
+        # Just returns a dataframe
+        df = result
+        # Create feature representation
+        from modules.data_preprocessing import create_feature_representation, build_graph_data
+        df, task_encoder, resource_encoder = create_feature_representation(df, use_norm_features=args.adaptive_norm)
+        graphs = build_graph_data(df)
     
     return df, graphs, task_encoder, resource_encoder
 
@@ -1027,7 +1074,7 @@ def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, d
             y_train.extend(graph.y.numpy())
         
         # Train the model
-        model.fit(np.array(X_train), np.array(y_train))
+        model.fit((np.array(X_train), np.array(y_train)))
         
         print(colored(f"Trained {args.model_type} model", "green"))
     
@@ -1574,8 +1621,9 @@ def evaluate_model_on_test(model, test_loader, criterion, device, args, metrics_
             X_test.extend(graph.x.numpy())
             y_test.extend(graph.y.numpy())
         
-        # Make predictions
-        y_pred = model.predict(np.array(X_test))
+        # Make predictions - directly pass the numpy array
+        X_test_np = np.array(X_test)
+        y_pred = model.predict(X_test_np)
         
         # Calculate metrics
         metrics = {}
@@ -1596,7 +1644,7 @@ def evaluate_model_on_test(model, test_loader, criterion, device, args, metrics_
             print(colored(f"  {name}: {value:.4f}", "green"))
         
         return metrics
-    
+
 # Main function
 def main():
     # Start timing for performance tracking
@@ -1699,9 +1747,11 @@ def main():
         # Compute class weights for imbalanced data
         print(colored("📊 Computing class weights for imbalanced data...", "cyan"))
         num_classes = len(task_encoder.classes_)
-        class_weights = compute_class_weights(df, num_classes).to(device)
         
-        # Setup optimizer and loss function
+        # Compute weights but keep them on CPU initially to avoid memory issues
+        class_weights = compute_class_weights(df, num_classes)
+        
+        # Setup optimizer and loss function - this handles placing class_weights appropriately
         optimizer, criterion = setup_optimizer_and_loss(model, args, class_weights, device)
         
         # Run ablation study if requested

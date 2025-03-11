@@ -75,16 +75,34 @@ class ProcessFeatureExtractor:
         if self.categorical_encoding == 'onehot':
             from sklearn.preprocessing import OneHotEncoder
             
-            # Fit task encoder
-            self.task_encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
-            self.task_encoder.fit(df[['task_id']])
-            self.num_tasks = len(self.task_encoder.categories_[0])
+            # Check scikit-learn version and use appropriate parameter
+            import sklearn
+            from packaging import version
             
-            # Fit resource encoder if used
-            if self.use_resources:
-                self.resource_encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
-                self.resource_encoder.fit(df[['resource_id']])
-                self.num_resources = len(self.resource_encoder.categories_[0])
+            if version.parse(sklearn.__version__) >= version.parse('1.2.0'):
+                # For newer scikit-learn versions
+                # Fit task encoder
+                self.task_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                self.task_encoder.fit(df[['task_id']])
+                self.num_tasks = len(self.task_encoder.categories_[0])
+                
+                # Fit resource encoder if used
+                if self.use_resources:
+                    self.resource_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                    self.resource_encoder.fit(df[['resource_id']])
+                    self.num_resources = len(self.resource_encoder.categories_[0])
+            else:
+                # For older scikit-learn versions
+                # Fit task encoder
+                self.task_encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
+                self.task_encoder.fit(df[['task_id']])
+                self.num_tasks = len(self.task_encoder.categories_[0])
+                
+                # Fit resource encoder if used
+                if self.use_resources:
+                    self.resource_encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
+                    self.resource_encoder.fit(df[['resource_id']])
+                    self.num_resources = len(self.resource_encoder.categories_[0])
         
         elif self.categorical_encoding == 'label':
             # Already encoded as labels
@@ -486,18 +504,29 @@ class DecisionTreeModel:
         self.feature_extractor = None
         self.is_fitted = False
     
-    def fit(self, df, max_seq_len=10, **kwargs):
+    def fit(self, data, max_seq_len=10, **kwargs):
         """
         Fit model to data
         
         Args:
-            df: Process data dataframe
+            data: Process data dataframe or NumPy arrays (X, y)
             max_seq_len: Maximum sequence length for feature extraction
             **kwargs: Additional parameters for fit
             
         Returns:
             self
         """
+        # Check if data is already in array format or is a dataframe
+        if isinstance(data, tuple) and len(data) == 2:
+            # Already extracted features and labels
+            X, y = data
+            self.is_fitted = True
+            self.model.fit(X, y, **kwargs)
+            return self
+            
+        # Assume it's a dataframe
+        df = data
+            
         # Create feature extractor
         self.feature_extractor = ProcessFeatureExtractor(
             max_seq_len=max_seq_len,
@@ -520,18 +549,26 @@ class DecisionTreeModel:
         self.is_fitted = True
         return self
     
-    def predict(self, df):
+    def predict(self, data):
         """
         Make predictions
         
         Args:
-            df: Process data dataframe
+            data: Process data dataframe or pre-processed feature array
             
         Returns:
             Predictions array
         """
         if not self.is_fitted:
             raise ValueError("Model must be fit before prediction")
+        
+        # Check if data is a NumPy array (already processed features)
+        if isinstance(data, np.ndarray):
+            # Direct prediction on processed features
+            return self.model.predict(data)
+        
+        # Otherwise, assume it's a dataframe needing feature extraction
+        df = data
         
         # Transform data
         X, y = self.feature_extractor.transform(df)
@@ -638,18 +675,29 @@ class RandomForestModel:
         self.feature_extractor = None
         self.is_fitted = False
     
-    def fit(self, df, max_seq_len=10, **kwargs):
+    def fit(self, data, max_seq_len=10, **kwargs):
         """
         Fit model to data
         
         Args:
-            df: Process data dataframe
+            data: Process data dataframe or NumPy arrays (X, y)
             max_seq_len: Maximum sequence length for feature extraction
             **kwargs: Additional parameters for fit
             
         Returns:
             self
         """
+        # Check if data is already in array format or is a dataframe
+        if isinstance(data, tuple) and len(data) == 2:
+            # Already extracted features and labels
+            X, y = data
+            self.is_fitted = True
+            self.model.fit(X, y, **kwargs)
+            return self
+            
+        # Assume it's a dataframe
+        df = data
+            
         # Create feature extractor
         self.feature_extractor = ProcessFeatureExtractor(
             max_seq_len=max_seq_len,
@@ -672,18 +720,26 @@ class RandomForestModel:
         self.is_fitted = True
         return self
     
-    def predict(self, df):
+    def predict(self, data):
         """
         Make predictions
         
         Args:
-            df: Process data dataframe
+            data: Process data dataframe or pre-processed feature array
             
         Returns:
             Predictions array
         """
         if not self.is_fitted:
             raise ValueError("Model must be fit before prediction")
+        
+        # Check if data is a NumPy array (already processed features)
+        if isinstance(data, np.ndarray):
+            # Direct prediction on processed features
+            return self.model.predict(data)
+        
+        # Otherwise, assume it's a dataframe needing feature extraction
+        df = data
         
         # Transform data
         X, y = self.feature_extractor.transform(df)
@@ -763,7 +819,7 @@ class XGBoostModel:
     XGBoost model for process mining
     """
     def __init__(self, n_estimators=100, max_depth=6, learning_rate=0.1,
-                 objective='multi:softmax', **kwargs):
+             objective='multi:softmax', **kwargs):
         """
         Initialize XGBoost model
         
@@ -782,23 +838,61 @@ class XGBoostModel:
             **kwargs
         }
         
-        self.model = None
+        # Create model immediately
+        import xgboost as xgb
+        self.model = xgb.XGBClassifier(**self.params)
+        
         self.feature_extractor = None
         self.is_fitted = False
         self.num_classes = 0
     
-    def fit(self, df, max_seq_len=10, **kwargs):
+    def fit(self, data, max_seq_len=10, **kwargs):
         """
         Fit model to data
         
         Args:
-            df: Process data dataframe
+            data: Process data dataframe or NumPy arrays (X, y)
             max_seq_len: Maximum sequence length for feature extraction
             **kwargs: Additional parameters for fit
             
         Returns:
             self
         """
+        import numpy as np
+        
+        # Check if data is already in array format or is a dataframe
+        if isinstance(data, tuple) and len(data) == 2:
+            # Already extracted features and labels
+            X, y = data
+            
+            # Find unique classes and create a class mapping to handle gaps
+            unique_classes = np.unique(y)
+            self.num_classes = len(unique_classes)
+            self.class_mapping = {old_cls: i for i, old_cls in enumerate(unique_classes)}
+            self.reverse_mapping = {i: old_cls for old_cls, i in self.class_mapping.items()}
+            
+            # Map classes to contiguous integers
+            y_mapped = np.array([self.class_mapping[cls_val] for cls_val in y])
+            
+            # Configure model
+            if 'multi' in self.params['objective']:
+                self.params['num_class'] = self.num_classes
+                # Update model parameters
+                self.model.set_params(**self.params)
+            
+            # Fit model with mapped classes
+            start_time = time.time()
+            self.model.fit(X, y_mapped, **kwargs)
+            fit_time = time.time() - start_time
+            
+            logger.info(f"Fit XGBoost in {fit_time:.2f} seconds")
+            
+            self.is_fitted = True
+            return self
+            
+        # Otherwise, assume it's a dataframe
+        df = data
+            
         # Create feature extractor
         self.feature_extractor = ProcessFeatureExtractor(
             max_seq_len=max_seq_len,
@@ -815,12 +909,10 @@ class XGBoostModel:
         self.num_classes = len(np.unique(y))
         
         # Configure model
-        params = self.params.copy()
-        if 'multi' in params['objective']:
-            params['num_class'] = self.num_classes
-        
-        # Create model
-        self.model = xgb.XGBClassifier(**params)
+        if 'multi' in self.params['objective']:
+            self.params['num_class'] = self.num_classes
+            # Update model parameters
+            self.model.set_params(**self.params)
         
         # Fit model
         start_time = time.time()
@@ -832,18 +924,31 @@ class XGBoostModel:
         self.is_fitted = True
         return self
     
-    def predict(self, df):
+    def predict(self, data):
         """
         Make predictions
         
         Args:
-            df: Process data dataframe
+            data: Process data dataframe or pre-processed feature array
             
         Returns:
             Predictions array
         """
         if not self.is_fitted:
             raise ValueError("Model must be fit before prediction")
+        
+        # Check if data is a NumPy array (already processed features)
+        if isinstance(data, np.ndarray):
+            # Direct prediction on processed features with mapped classes
+            raw_predictions = self.model.predict(data)
+            
+            # Map predictions back to original class labels
+            if hasattr(self, 'reverse_mapping'):
+                return np.array([self.reverse_mapping[p] for p in raw_predictions])
+            return raw_predictions
+        
+        # Otherwise, assume it's a dataframe needing feature extraction
+        df = data
         
         # Transform data
         X, y = self.feature_extractor.transform(df)
