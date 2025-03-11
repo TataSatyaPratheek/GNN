@@ -57,6 +57,17 @@ logging.getLogger("sklearn").setLevel(logging.ERROR)
 # Initialize colorama for cross-platform colored terminal output
 colorama_init()
 
+
+# Memory optimization imports
+import gc
+from memory_optimizer import MemoryOptimizer
+from optimized_models import create_optimized_model
+from optimized_trainer import (
+    setup_optimized_device,
+    setup_optimized_model,
+    setup_optimized_optimizer,
+    train_and_evaluate_optimized_model
+)
 # Set random seeds for reproducibility
 RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
@@ -69,7 +80,7 @@ def parse_arguments():
     parser.add_argument('data_path', type=str, help='Path to the dataset CSV file')
     parser.add_argument('--epochs', type=int, default=20, help='Number of epochs for GNN training')
     parser.add_argument('--lstm-epochs', type=int, default=5, help='Number of epochs for LSTM training')
-    parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
+    parser.add_argument('--batch-size', type=int, default=32, help='Maximum batch size for training (will be automatically optimized)')
     parser.add_argument('--norm-features', action='store_true', help='Use L2 normalization for features')
     parser.add_argument('--skip-rl', action='store_true', help='Skip reinforcement learning step')
     parser.add_argument('--skip-lstm', action='store_true', help='Skip LSTM modeling step')
@@ -159,40 +170,10 @@ def add_phase1_arguments(parser):
     )
 
 # Setup device with enhanced detection
+
 def setup_device():
-    print(colored("\n🔍 Detecting optimal device for computation...", "cyan"))
     
-    if torch.cuda.is_available():
-        device_name = torch.cuda.get_device_name(0)
-        device = torch.device("cuda")
-        print(colored(f"✅ Using GPU: {device_name}", "green"))
-        
-        # Print CUDA details
-        cuda_version = torch.version.cuda
-        print(colored(f"   CUDA Version: {cuda_version}", "green"))
-        print(colored(f"   Available GPUs: {torch.cuda.device_count()}", "green"))
-        
-        # Check memory
-        memory_allocated = torch.cuda.memory_allocated(0)
-        memory_reserved = torch.cuda.memory_reserved(0)
-        memory_total = torch.cuda.get_device_properties(0).total_memory
-        memory_free = memory_total - memory_reserved
-        
-        # Display in GB for better readability
-        print(colored(f"   GPU Memory: {memory_total/1e9:.2f} GB total, {memory_free/1e9:.2f} GB free", "green"))
-        
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print(colored("✅ Using Apple Silicon GPU (MPS)", "green"))
-    else:
-        device = torch.device("cpu")
-        print(colored("⚠️ GPU not available. Using CPU for computation.", "yellow"))
-        # Print CPU details
-        import platform
-        print(colored(f"   CPU: {platform.processor()}", "yellow"))
-        print(colored(f"   Available cores: {os.cpu_count()}", "yellow"))
-    
-    return device
+    return setup_optimized_device()
 
 # Function to setup results directory
 def setup_results_dir(custom_dir=None):
@@ -308,376 +289,18 @@ def print_section_header(title, width=80):
 
 # New Phase 1 functions from main_script_updates.py
 
+
 def setup_phase1_model(args, df, task_encoder, resource_encoder, device):
-    """
-    Set up Phase 1 model based on command-line arguments
-    
-    Args:
-        args: Command-line arguments
-        df: Process data dataframe
-        task_encoder: Task label encoder
-        resource_encoder: Resource label encoder
-        device: Torch device
-        
-    Returns:
-        Configured model
-    """
-    # Import appropriate modules based on model type
-    if args.model_type == 'decision_tree':
-        # Import baseline decision tree model
-        try:
-            from models.baseline_models import DecisionTreeModel
-            model = DecisionTreeModel(
-                max_depth=10,
-                min_samples_split=5,
-                criterion='gini',
-                class_weight='balanced'
-            )
-        except ImportError:
-            from baseline_models import DecisionTreeModel
-            model = DecisionTreeModel(
-                max_depth=10,
-                min_samples_split=5,
-                criterion='gini',
-                class_weight='balanced'
-            )
-    
-    elif args.model_type == 'random_forest':
-        # Import baseline random forest model
-        try:
-            from models.baseline_models import RandomForestModel
-            model = RandomForestModel(
-                n_estimators=100,
-                max_depth=6,
-                min_samples_split=5,
-                criterion='gini',
-                class_weight='balanced',
-                n_jobs=-1
-            )
-        except ImportError:
-            from baseline_models import RandomForestModel
-            model = RandomForestModel(
-                n_estimators=100,
-                max_depth=6,
-                min_samples_split=5,
-                criterion='gini',
-                class_weight='balanced',
-                n_jobs=-1
-            )
-    
-    elif args.model_type == 'xgboost':
-        # Import baseline XGBoost model
-        try:
-            from models.baseline_models import XGBoostModel
-            model = XGBoostModel(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                objective='multi:softmax'
-            )
-        except ImportError:
-            from baseline_models import XGBoostModel
-            model = XGBoostModel(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                objective='multi:softmax'
-            )
-    
-    elif args.model_type == 'mlp':
-        # Import baseline MLP model
-        import torch.nn as nn
-        try:
-            from models.baseline_models import BasicMLP
-            
-            num_classes = len(task_encoder.classes_)
-            
-            # Calculate input dimension
-            num_features = len([col for col in df.columns if col.startswith('feat_')])
-            
-            model = BasicMLP(
-                input_dim=num_features,
-                hidden_dims=[args.hidden_dim, args.hidden_dim // 2],
-                output_dim=num_classes,
-                dropout=args.dropout
-            ).to(device)
-        except ImportError:
-            from baseline_models import BasicMLP
-            
-            num_classes = len(task_encoder.classes_)
-            
-            # Calculate input dimension
-            num_features = len([col for col in df.columns if col.startswith('feat_')])
-            
-            model = BasicMLP(
-                input_dim=num_features,
-                hidden_dims=[args.hidden_dim, args.hidden_dim // 2],
-                output_dim=num_classes,
-                dropout=args.dropout
-            ).to(device)
-    
-    elif args.model_type == 'lstm':
-        # Import baseline LSTM model
-        try:
-            from models.baseline_models import BasicLSTM
-            
-            num_classes = len(task_encoder.classes_)
-            num_resources = len(resource_encoder.classes_)
-            
-            model = BasicLSTM(
-                num_tasks=num_classes,
-                num_resources=num_resources,
-                embedding_dim=args.hidden_dim,
-                hidden_dim=args.hidden_dim,
-                num_layers=args.num_layers,
-                dropout=args.dropout
-            ).to(device)
-        except ImportError:
-            from baseline_models import BasicLSTM
-            
-            num_classes = len(task_encoder.classes_)
-            num_resources = len(resource_encoder.classes_)
-            
-            model = BasicLSTM(
-                num_tasks=num_classes,
-                num_resources=num_resources,
-                embedding_dim=args.hidden_dim,
-                hidden_dim=args.hidden_dim,
-                num_layers=args.num_layers,
-                dropout=args.dropout
-            ).to(device)
-    
-    elif args.model_type == 'basic_gat':
-        # Import basic GAT model (existing implementation)
-        from models.gat_model import NextTaskGAT
-        
-        num_classes = len(task_encoder.classes_)
-        
-        model = NextTaskGAT(
-            input_dim=5,  # Basic features
-            hidden_dim=args.hidden_dim,
-            output_dim=num_classes,
-            num_layers=args.num_layers,
-            heads=args.num_heads,
-            dropout=args.dropout
-        ).to(device)
-    
-    elif args.model_type == 'positional_gat':
-        # Import positional GAT model (Phase 1 improvement)
-        try:
-            from models.position_enhanced_gat import PositionalGATModel
-            
-            num_classes = len(task_encoder.classes_)
-            
-            model = PositionalGATModel(
-                input_dim=5,  # Basic features
-                hidden_dim=args.hidden_dim,
-                output_dim=num_classes,
-                pos_dim=args.pos_dim,
-                num_layers=args.num_layers,
-                heads=args.num_heads,
-                dropout=args.dropout
-            ).to(device)
-        except ImportError:
-            from position_enhanced_gat import PositionalGATModel
-            
-            num_classes = len(task_encoder.classes_)
-            
-            model = PositionalGATModel(
-                input_dim=5,  # Basic features
-                hidden_dim=args.hidden_dim,
-                output_dim=num_classes,
-                pos_dim=args.pos_dim,
-                num_layers=args.num_layers,
-                heads=args.num_heads,
-                dropout=args.dropout
-            ).to(device)
-    
-    elif args.model_type == 'diverse_gat':
-        # Import diverse GAT model (Phase 1 improvement)
-        try:
-            from models.diverse_attention import DiverseGATModel
-            
-            num_classes = len(task_encoder.classes_)
-            
-            model = DiverseGATModel(
-                input_dim=5,  # Basic features
-                hidden_dim=args.hidden_dim,
-                output_dim=num_classes,
-                num_layers=args.num_layers,
-                heads=args.num_heads,
-                dropout=args.dropout,
-                diversity_weight=args.diversity_weight
-            ).to(device)
-        except ImportError:
-            from diverse_attention import DiverseGATModel
-            
-            num_classes = len(task_encoder.classes_)
-            
-            model = DiverseGATModel(
-                input_dim=5,  # Basic features
-                hidden_dim=args.hidden_dim,
-                output_dim=num_classes,
-                num_layers=args.num_layers,
-                heads=args.num_heads,
-                dropout=args.dropout,
-                diversity_weight=args.diversity_weight
-            ).to(device)
-    
-    elif args.model_type == 'enhanced_gnn':
-        # Import enhanced GNN model (complete Phase 1 implementation)
-        try:
-            from models.enhanced_gnn import create_enhanced_gnn
-            
-            num_classes = len(task_encoder.classes_)
-            
-            # Calculate input dimension based on enhanced features
-            num_features = len([col for col in df.columns if col.startswith('feat_')])
-            
-            model = create_enhanced_gnn(
-                input_dim=num_features,
-                num_classes=num_classes,
-                hidden_dim=args.hidden_dim,
-                num_layers=args.num_layers,
-                heads=args.num_heads,
-                dropout=args.dropout,
-                pos_dim=args.pos_dim,
-                diversity_weight=args.diversity_weight,
-                predict_time=args.predict_time
-            ).to(device)
-        except ImportError:
-            from enhanced_gnn import create_enhanced_gnn
-            
-            num_classes = len(task_encoder.classes_)
-            
-            # Calculate input dimension based on enhanced features
-            num_features = len([col for col in df.columns if col.startswith('feat_')])
-            
-            model = create_enhanced_gnn(
-                input_dim=num_features,
-                num_classes=num_classes,
-                hidden_dim=args.hidden_dim,
-                num_layers=args.num_layers,
-                heads=args.num_heads,
-                dropout=args.dropout,
-                pos_dim=args.pos_dim,
-                diversity_weight=args.diversity_weight,
-                predict_time=args.predict_time
-            ).to(device)
-    
-    else:
-        raise ValueError(f"Unknown model type: {args.model_type}")
-    
-    return model
+
+    return setup_optimized_model(args, df, task_encoder, resource_encoder, device)
+
 
 def setup_optimizer_and_loss(model, args, class_weights=None, device=None):
-    """
-    Set up optimizer and loss function for the model
-    
-    Args:
-        model: The model
-        args: Command-line arguments
-        class_weights: Optional class weights tensor
-        device: Torch device
-        
-    Returns:
-        Tuple of (optimizer, criterion)
-    """
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    
-    # Check if we should use GPU for the model but CPU for class weights
-    use_cpu_for_weights = True
-    if device is not None and device.type == 'cuda':
-        try:
-            # Get available memory
-            free_memory = torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)
-            # If more than 1GB is available, we can try using GPU for weights
-            if free_memory > 1e9:  # 1GB in bytes
-                use_cpu_for_weights = False
-        except:
-            # If there's an error checking memory, use CPU for weights
-            use_cpu_for_weights = True
-    
-    # Set up optimizer based on model type
-    if args.model_type in ['mlp', 'lstm', 'basic_gat', 'positional_gat', 'diverse_gat', 'enhanced_gnn']:
-        # For neural models
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=args.lr if hasattr(args, 'lr') else 0.001,
-            weight_decay=args.weight_decay if hasattr(args, 'weight_decay') else 5e-4
-        )
-        
-        # Set up criterion
-        if args.model_type == 'enhanced_gnn' and args.predict_time:
-            # Multi-objective loss for dual task
-            try:
-                from utils.losses import ProcessLoss
-                
-                # Keep class weights on CPU if needed
-                if use_cpu_for_weights and class_weights is not None and device is not None and device.type == 'cuda':
-                    class_weights_device = class_weights.cpu()
-                    print("Using class weights on CPU to save GPU memory")
-                else:
-                    class_weights_device = class_weights
-                    
-                criterion = ProcessLoss(
-                    task_weight=0.7,
-                    time_weight=0.3,
-                    class_weights=class_weights_device
-                )
-                
-                # Only move the loss function to GPU if we're not using CPU for weights
-                if device is not None and not use_cpu_for_weights:
-                    criterion = criterion.to(device)
-                
-            except ImportError:
-                from multi_objective_loss import ProcessLoss
-                
-                # Keep class weights on CPU if needed
-                if use_cpu_for_weights and class_weights is not None and device is not None and device.type == 'cuda':
-                    class_weights_device = class_weights.cpu()
-                    print("Using class weights on CPU to save GPU memory")
-                else:
-                    class_weights_device = class_weights
-                    
-                criterion = ProcessLoss(
-                    task_weight=0.7,
-                    time_weight=0.3,
-                    class_weights=class_weights_device
-                )
-                
-                # Only move the loss function to GPU if we're not using CPU for weights
-                if device is not None and not use_cpu_for_weights:
-                    criterion = criterion.to(device)
-        else:
-            # Standard cross-entropy for classification
-            if use_cpu_for_weights and class_weights is not None and device is not None and device.type == 'cuda':
-                # Keep class weights on CPU to save GPU memory
-                criterion = nn.CrossEntropyLoss(weight=class_weights.cpu())
-                print("Using class weights on CPU to save GPU memory")
-            else:
-                criterion = nn.CrossEntropyLoss(weight=class_weights)
-            
-    else:
-        # For non-neural models (scikit-learn based models)
-        optimizer = None
-        criterion = None
-    
-    return optimizer, criterion
+
+    return setup_optimized_optimizer(model, args, class_weights, device)
 
 def load_and_preprocess_data_phase1(data_path, args):
-    """
-    Load and preprocess data with Phase 1 enhancements
     
-    Args:
-        data_path: Path to data file
-        args: Command-line arguments
-        
-    Returns:
-        Tuple of (df, graphs, task_encoder, resource_encoder)
-    """
     from modules.data_preprocessing import load_and_preprocess_data
     
     print_section_header("Loading and Preprocessing Data with Phase 1 Enhancements")
@@ -694,7 +317,7 @@ def load_and_preprocess_data_phase1(data_path, args):
     # Ensure we're handling both return types properly
     if isinstance(result, tuple) and len(result) == 4:
         # Already returns a tuple with four elements
-        df, graphs, task_encoder, resource_encoder = result
+        return result
     else:
         # Just returns a dataframe
         df = result
@@ -702,403 +325,11 @@ def load_and_preprocess_data_phase1(data_path, args):
         from modules.data_preprocessing import create_feature_representation, build_graph_data
         df, task_encoder, resource_encoder = create_feature_representation(df, use_norm_features=args.adaptive_norm)
         graphs = build_graph_data(df)
-    
-    return df, graphs, task_encoder, resource_encoder
+        return df, graphs, task_encoder, resource_encoder
 
 def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, device, run_dir):
-    """
-    Train and evaluate model with Phase 1 enhancements
-    
-    Args:
-        model: The model to train
-        graphs: List of graph data objects
-        args: Command-line arguments
-        criterion: Loss function
-        optimizer: Optimizer
-        device: Torch device
-        run_dir: Run directory path
-        
-    Returns:
-        Trained model and evaluation metrics
-    """
-    from torch_geometric.loader import DataLoader
-    import torch
-    import numpy as np
-    import time
-    
-    # Import metrics tracking utilities
-    try:
-        from utils.ablation import MetricsTracker
-    except ImportError:
-        try:
-            from ablation_utils import MetricsTracker
-        except ImportError:
-            print(colored("Metrics tracking utilities not found. Will continue without detailed tracking.", "yellow"))
-            MetricsTracker = None
-    
-    print_section_header("Training and Evaluating Model with Phase 1 Enhancements")
-    
-    # Split data into train/val/test
-    from sklearn.model_selection import train_test_split
-    
-    train_val_graphs, test_graphs = train_test_split(graphs, test_size=0.2, random_state=42)
-    train_graphs, val_graphs = train_test_split(train_val_graphs, test_size=0.25, random_state=42)
-    
-    print(colored(f"Training set: {len(train_graphs)} graphs", "green"))
-    print(colored(f"Validation set: {len(val_graphs)} graphs", "green"))
-    print(colored(f"Testing set: {len(test_graphs)} graphs", "green"))
-    
-    # Create data loaders
-    train_loader = DataLoader(train_graphs, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_graphs, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_graphs, batch_size=args.batch_size, shuffle=False)
-    
-    # Setup metrics tracker if available
-    metrics_tracker = None
-    if MetricsTracker is not None:
-        metrics_tracker = MetricsTracker(run_dir, f"{args.model_type}_training")
-        metrics_tracker.register_model(
-            "model",
-            args.model_type,
-            {
-                "hidden_dim": args.hidden_dim,
-                "num_layers": args.num_layers,
-                "num_heads": args.num_heads,
-                "dropout": args.dropout,
-                "pos_dim": args.pos_dim if hasattr(args, 'pos_dim') else None,
-                "diversity_weight": args.diversity_weight if hasattr(args, 'diversity_weight') else None,
-                "predict_time": args.predict_time if hasattr(args, 'predict_time') else False
-            },
-            f"{args.model_type} model with Phase 1 enhancements"
-        )
-        metrics_tracker.start_training()
-    
-    # Update the training loop in train_and_evaluate_model_phase1 function
-# Replace the epoch loop with:
 
-    # Training setup
-    epochs = args.epochs
-    best_val_loss = float('inf')
-    best_model_path = os.path.join(run_dir, 'models', 'best_model.pth')
-    patience = 5
-    patience_counter = 0
-
-    # Use mixed precision for faster training if available
-    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
-    use_amp = scaler is not None
-
-    # Check if model is torch.nn.Module (neural model)
-    is_neural = isinstance(model, torch.nn.Module)
-
-    # Helper function to get graph-level targets from node-level targets
-    def get_graph_targets(node_targets, batch):
-        unique_graphs = torch.unique(batch)
-        graph_targets = []
-        
-        for g in unique_graphs:
-            # Get targets for this graph
-            graph_mask = (batch == g)
-            graph_node_targets = node_targets[graph_mask]
-            
-            # Find most common target (mode)
-            if len(graph_node_targets) > 0:
-                values, counts = torch.unique(graph_node_targets, return_counts=True)
-                mode_idx = torch.argmax(counts)
-                graph_targets.append(values[mode_idx])
-            else:
-                # Fallback if no targets (should not happen)
-                graph_targets.append(0)
-        
-        return torch.tensor(graph_targets, dtype=torch.long, device=node_targets.device)
-
-    if is_neural:
-        # Train neural model
-        print(colored(f"Training {args.model_type} model for {epochs} epochs...", "cyan"))
-        
-        # Create progress bar for epochs
-        epoch_progress = tqdm(
-            range(1, epochs+1),
-            desc=f"Training {args.model_type}",
-            bar_format="{l_bar}{bar:30}{r_bar}",
-            ncols=100
-        )
-        
-        for epoch in epoch_progress:
-            # Training
-            model.train()
-            train_loss = 0.0
-            train_diversity_loss = 0.0
-            start_time = time.time()
-            
-            # Create progress bar for training batches
-            batch_progress = tqdm(
-                train_loader,
-                desc=f"Epoch {epoch}/{epochs} [Train]",
-                leave=False,
-                bar_format="{l_bar}{bar:20}{r_bar}",
-                ncols=80
-            )
-            
-            for batch_data in batch_progress:
-                # Move data to device
-                batch_data = batch_data.to(device)
-                optimizer.zero_grad()
-                
-                # Handle different model output formats
-                if args.model_type == 'enhanced_gnn':
-                    # Enhanced GNN with dictionary output
-                    if use_amp:
-                        with torch.cuda.amp.autocast():
-                            outputs = model(batch_data)
-                            
-                            # Get graph-level targets
-                            graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
-                            
-                            if args.predict_time:
-                                loss, loss_dict = criterion(
-                                    outputs["task_pred"], 
-                                    graph_targets,
-                                    time_pred=outputs.get("time_pred"), 
-                                    time_target=None  # No time target in synthetic data
-                                )
-                            else:
-                                loss = criterion(outputs["task_pred"], graph_targets)
-                                
-                            # Add diversity loss if available
-                            if "diversity_loss" in outputs and hasattr(args, 'diversity_weight') and args.diversity_weight > 0:
-                                diversity_loss = outputs["diversity_loss"]
-                                train_diversity_loss += diversity_loss.item()
-                                loss = loss + diversity_loss
-                        
-                        # Scale gradients
-                        scaler.scale(loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        outputs = model(batch_data)
-                        
-                        # Get graph-level targets
-                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
-                        
-                        if args.predict_time:
-                            loss, loss_dict = criterion(
-                                outputs["task_pred"], 
-                                graph_targets,
-                                time_pred=outputs.get("time_pred"), 
-                                time_target=None  # No time target in synthetic data
-                            )
-                        else:
-                            loss = criterion(outputs["task_pred"], graph_targets)
-                            
-                        # Add diversity loss if available
-                        if "diversity_loss" in outputs and hasattr(args, 'diversity_weight') and args.diversity_weight > 0:
-                            diversity_loss = outputs["diversity_loss"]
-                            train_diversity_loss += diversity_loss.item()
-                            loss = loss + diversity_loss
-                        
-                        loss.backward()
-                        optimizer.step()
-                
-                elif args.model_type in ['diverse_gat']:
-                    # DiverseGAT with tuple output (logits, diversity_loss)
-                    if use_amp:
-                        with torch.cuda.amp.autocast():
-                            logits, diversity_loss = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                            # Get graph-level targets
-                            graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
-                            loss = criterion(logits, graph_targets)
-                            
-                            if hasattr(args, 'diversity_weight') and args.diversity_weight > 0:
-                                train_diversity_loss += diversity_loss.item()
-                                loss = loss + diversity_loss
-                        
-                        scaler.scale(loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        logits, diversity_loss = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                        # Get graph-level targets
-                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
-                        loss = criterion(logits, graph_targets)
-                        
-                        if hasattr(args, 'diversity_weight') and args.diversity_weight > 0:
-                            train_diversity_loss += diversity_loss.item()
-                            loss = loss + diversity_loss
-                        
-                        loss.backward()
-                        optimizer.step()
-                
-                else:
-                    # Standard model with logits output
-                    if use_amp:
-                        with torch.cuda.amp.autocast():
-                            logits = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                            # Get graph-level targets
-                            graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
-                            loss = criterion(logits, graph_targets)
-                        
-                        scaler.scale(loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        logits = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                        # Get graph-level targets
-                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
-                        loss = criterion(logits, graph_targets)
-                        
-                        loss.backward()
-                        optimizer.step()
-                
-                train_loss += loss.item()
-                
-                # Update batch progress bar
-                batch_progress.set_postfix({"loss": f"{loss.item():.4f}"})
-            
-            avg_train_loss = train_loss / len(train_loader)
-            avg_diversity_loss = train_diversity_loss / len(train_loader) if train_diversity_loss > 0 else 0
-            
-            # Validation
-            model.eval()
-            val_loss = 0.0
-            correct = 0
-            total = 0
-            
-            # Create progress bar for validation batches
-            val_progress = tqdm(
-                val_loader,
-                desc=f"Epoch {epoch}/{epochs} [Valid]",
-                leave=False,
-                bar_format="{l_bar}{bar:20}{r_bar}",
-                ncols=80
-            )
-            
-            with torch.no_grad():
-                for batch_data in val_progress:
-                    batch_data = batch_data.to(device)
-                    
-                    # Handle different model output formats
-                    if args.model_type == 'enhanced_gnn':
-                        outputs = model(batch_data)
-                        
-                        # Get graph-level targets
-                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
-                        
-                        if args.predict_time:
-                            loss, _ = criterion(
-                                outputs["task_pred"], 
-                                graph_targets,
-                                time_pred=outputs.get("time_pred"), 
-                                time_target=None
-                            )
-                            logits = outputs["task_pred"]
-                        else:
-                            loss = criterion(outputs["task_pred"], graph_targets)
-                            logits = outputs["task_pred"]
-                    
-                    elif args.model_type in ['diverse_gat']:
-                        logits, _ = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                        # Get graph-level targets
-                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
-                        loss = criterion(logits, graph_targets)
-                    
-                    else:
-                        logits = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                        # Get graph-level targets
-                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
-                        loss = criterion(logits, graph_targets)
-                    
-                    val_loss += loss.item()
-                    
-                    # Calculate accuracy
-                    _, predicted = torch.max(logits, 1)
-                    total += graph_targets.size(0)
-                    correct += (predicted == graph_targets).sum().item()
-                    
-                    # Update validation progress bar
-                    val_progress.set_postfix({"loss": f"{loss.item():.4f}"})
-            
-            avg_val_loss = val_loss / len(val_loader)
-            val_accuracy = correct / total if total > 0 else 0
-            
-            # Log epoch metrics
-            if metrics_tracker is not None:
-                metrics_tracker.log_epoch(epoch, {
-                    "train_loss": avg_train_loss,
-                    "val_loss": avg_val_loss,
-                    "val_accuracy": val_accuracy,
-                    "diversity_loss": avg_diversity_loss
-                })
-            
-            # Print epoch summary (on a new line since we used progress bars)
-            epoch_time = time.time() - start_time
-            
-            # Update epoch progress bar
-            epoch_progress.set_postfix({
-                "train_loss": f"{avg_train_loss:.4f}",
-                "val_loss": f"{avg_val_loss:.4f}",
-                "val_acc": f"{val_accuracy:.4f}",
-                "time": f"{epoch_time:.2f}s"
-            })
-            
-            # Check for improvement
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                patience_counter = 0
-                
-                # Save best model
-                torch.save(model.state_dict(), best_model_path)
-                print(colored(f"  Saved best model (val_loss={best_val_loss:.4f})", "green"))
-            else:
-                patience_counter += 1
-                print(colored(f"  No improvement for {patience_counter}/{patience} epochs", "yellow"))
-                
-                if patience_counter >= patience:
-                    print(colored(f"Early stopping triggered after {epoch} epochs", "yellow"))
-                    break
-        
-        # Load best model for evaluation
-        model.load_state_dict(torch.load(best_model_path))
-        print(colored(f"Loaded best model from {best_model_path}", "green"))
-    
-    else:
-        # Train sklearn-based model
-        print(colored(f"Training {args.model_type} model...", "cyan"))
-        
-        # Convert graph data to tabular format for sklearn models
-        X_train = []
-        y_train = []
-        
-        for graph in train_graphs:
-            # Extract node features and labels
-            X_train.extend(graph.x.numpy())
-            y_train.extend(graph.y.numpy())
-        
-        # Train the model
-        model.fit((np.array(X_train), np.array(y_train)))
-        
-        print(colored(f"Trained {args.model_type} model", "green"))
-    
-    # End training tracking
-    if metrics_tracker is not None:
-        metrics_tracker.end_training()
-        # Plot learning curves
-        metrics_tracker.plot_learning_curves()
-    
-    # Evaluate on test set
-    print_section_header("Evaluating Model on Test Set")
-
-    test_metrics = evaluate_model_on_test(model, test_loader, criterion, device, args, metrics_tracker, run_dir)
-    
-    # Save metrics
-    if metrics_tracker is not None:
-        metrics_tracker.save()
-    
-    # Save test metrics to file
-    save_metrics(test_metrics, run_dir, f"{args.model_type}_test_metrics.json")
-    
-    print(colored(f"Model training and evaluation completed", "green"))
-    
-    return model, test_metrics
+    return train_and_evaluate_optimized_model(model, graphs, args, criterion, optimizer, device, run_dir)
 
 def run_ablation_study(args, df, graphs, task_encoder, resource_encoder, run_dir, device):
     """
@@ -1646,14 +877,27 @@ def evaluate_model_on_test(model, test_loader, criterion, device, args, metrics_
         return metrics
 
 # Main function
+
 def main():
     # Start timing for performance tracking
     total_start_time = time.time()
     
+    # Clear memory before starting
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+
+    
     # Parse arguments
     args = parse_arguments()
     
-    # Setup computing device
+    
+    # Track memory usage
+    if torch.cuda.is_available():
+        print(f"Initial GPU memory: {torch.cuda.memory_allocated()/1024**2:.1f} MB allocated")
+    
+# Setup computing device
     device = setup_device()
     
     # Create results directory
