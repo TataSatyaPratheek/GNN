@@ -1066,6 +1066,15 @@ def run_ablation_study(args, df, graphs, task_encoder, resource_encoder, run_dir
     
     # Define evaluation function
     def evaluate_model_config(config):
+        """
+        Evaluate a model configuration during ablation study
+        
+        Args:
+            config: Model configuration dictionary
+            
+        Returns:
+            Metrics dictionary or error information
+        """
         try:
             # Import based on model type
             from models.enhanced_gnn import create_enhanced_gnn
@@ -1117,21 +1126,33 @@ def run_ablation_study(args, df, graphs, task_encoder, resource_encoder, run_dir
                     if isinstance(outputs, dict):
                         # Handle enhanced model outputs
                         if config.get("predict_time", False):
+                            # Get graph-level predictions and targets
+                            task_pred = outputs["task_pred"]
+                            # For PyG batches, we need to use batch to extract graph-level targets
+                            graph_targets = get_graph_targets(data.y, data.batch)
+                            
                             loss, _ = criterion(
-                                outputs["task_pred"], 
-                                data.y,
+                                task_pred, 
+                                graph_targets,
                                 time_pred=outputs.get("time_pred"), 
                                 time_target=None  # No time target in synthetic data
                             )
                         else:
-                            loss = criterion(outputs["task_pred"], data.y)
+                            # Get graph-level predictions and targets
+                            task_pred = outputs["task_pred"]
+                            # For PyG batches, we need to use batch to extract graph-level targets
+                            graph_targets = get_graph_targets(data.y, data.batch)
+                            
+                            loss = criterion(task_pred, graph_targets)
                             
                         # Add diversity loss if available
                         if "diversity_loss" in outputs and config.get("diversity_weight", 0.0) > 0:
                             loss = loss + outputs["diversity_loss"]
                     else:
                         # Simple output (just logits)
-                        loss = criterion(outputs, data.y)
+                        # Get graph-level targets
+                        graph_targets = get_graph_targets(data.y, data.batch)
+                        loss = criterion(outputs, graph_targets)
                     
                     loss.backward()
                     optimizer.step()
@@ -1155,20 +1176,29 @@ def run_ablation_study(args, df, graphs, task_encoder, resource_encoder, run_dir
                     if isinstance(outputs, dict):
                         # Handle enhanced model outputs
                         if config.get("predict_time", False):
+                            # Get graph-level predictions and targets
+                            task_pred = outputs["task_pred"]
+                            graph_targets = get_graph_targets(data.y, data.batch)
+                            
                             loss, _ = criterion(
-                                outputs["task_pred"], 
-                                data.y,
+                                task_pred, 
+                                graph_targets,
                                 time_pred=outputs.get("time_pred"), 
                                 time_target=None
                             )
-                            logits = outputs["task_pred"]
+                            logits = task_pred
                         else:
-                            loss = criterion(outputs["task_pred"], data.y)
-                            logits = outputs["task_pred"]
+                            # Get graph-level predictions and targets
+                            task_pred = outputs["task_pred"]
+                            graph_targets = get_graph_targets(data.y, data.batch)
+                            
+                            loss = criterion(task_pred, graph_targets)
+                            logits = task_pred
                     else:
                         # Simple output (just logits)
                         logits = outputs
-                        loss = criterion(logits, data.y)
+                        graph_targets = get_graph_targets(data.y, data.batch)
+                        loss = criterion(logits, graph_targets)
                     
                     test_loss += loss.item()
                     
@@ -1176,22 +1206,25 @@ def run_ablation_study(args, df, graphs, task_encoder, resource_encoder, run_dir
                     _, predicted = torch.max(logits, 1)
                     
                     # Track true and predicted labels
-                    y_true.extend(data.y.cpu().numpy())
+                    y_true.extend(graph_targets.cpu().numpy())
                     y_pred.extend(predicted.cpu().numpy())
                     
                     # Track accuracy
-                    total += data.y.size(0)
-                    correct += (predicted == data.y).sum().item()
+                    total += graph_targets.size(0)
+                    correct += (predicted == graph_targets).sum().item()
             
             # Calculate metrics
-            accuracy = correct / total
+            accuracy = correct / total if total > 0 else 0.0
             
             # Calculate F1 score
             from sklearn.metrics import f1_score, precision_score, recall_score
-            f1_macro = f1_score(y_true, y_pred, average='macro')
-            f1_weighted = f1_score(y_true, y_pred, average='weighted')
-            precision = precision_score(y_true, y_pred, average='macro')
-            recall = recall_score(y_true, y_pred, average='macro')
+            if len(np.unique(y_true)) > 1:  # Make sure there are at least 2 classes
+                f1_macro = f1_score(y_true, y_pred, average='macro')
+                f1_weighted = f1_score(y_true, y_pred, average='weighted')
+                precision = precision_score(y_true, y_pred, average='macro')
+                recall = recall_score(y_true, y_pred, average='macro')
+            else:
+                f1_macro = f1_weighted = precision = recall = 0.0
             
             # Return metrics
             return {
@@ -1200,7 +1233,7 @@ def run_ablation_study(args, df, graphs, task_encoder, resource_encoder, run_dir
                 "f1_weighted": f1_weighted,
                 "precision": precision,
                 "recall": recall,
-                "test_loss": test_loss / len(test_loader)
+                "test_loss": test_loss / len(test_loader) if len(test_loader) > 0 else 0.0
             }
             
         except Exception as e:
@@ -1208,6 +1241,38 @@ def run_ablation_study(args, df, graphs, task_encoder, resource_encoder, run_dir
             import traceback
             traceback.print_exc()
             return {"error": str(e)}
+
+
+def get_graph_targets(node_targets, batch):
+    """
+    Convert node-level targets to graph-level targets
+    
+    Args:
+        node_targets: Node-level target tensor
+        batch: Batch assignment tensor
+        
+    Returns:
+        Graph-level target tensor
+    """
+    # Use the most common target for each graph
+    unique_graphs = torch.unique(batch)
+    graph_targets = []
+    
+    for g in unique_graphs:
+        # Get targets for this graph
+        graph_mask = (batch == g)
+        graph_node_targets = node_targets[graph_mask]
+        
+        # Find most common target (mode)
+        if len(graph_node_targets) > 0:
+            values, counts = torch.unique(graph_node_targets, return_counts=True)
+            mode_idx = torch.argmax(counts)
+            graph_targets.append(values[mode_idx])
+        else:
+            # Fallback if no targets (should not happen)
+            graph_targets.append(0)
+    
+    return torch.tensor(graph_targets, dtype=torch.long, device=node_targets.device)
     
     # Set evaluation function
     ablation.set_evaluation_function(evaluate_model_config)
