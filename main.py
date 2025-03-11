@@ -21,6 +21,38 @@ import argparse
 import warnings
 from colorama import init as colorama_init
 from termcolor import colored
+from tqdm import tqdm
+
+# Suppress annoying warnings
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message="Precision is ill-defined")
+warnings.filterwarnings("ignore", message="invalid value encountered")
+
+# For PyTorch warnings
+import torch
+torch.set_printoptions(precision=8)  # Prevent scientific notation warnings
+
+# For NumPy
+import numpy as np
+np.set_printoptions(precision=8, suppress=True)  # Prevent scientific notation warnings
+
+# For Tensorflow (if used)
+try:
+    import tensorflow as tf
+    tf.get_logger().setLevel('ERROR')
+except ImportError:
+    pass
+
+# Set lower verbosity for common libraries
+import logging
+logging.getLogger("matplotlib").setLevel(logging.ERROR)
+logging.getLogger("PIL").setLevel(logging.ERROR)
+logging.getLogger("torch").setLevel(logging.ERROR)
+logging.getLogger("sklearn").setLevel(logging.ERROR)
+
+
 
 # Initialize colorama for cross-platform colored terminal output
 colorama_init()
@@ -238,7 +270,18 @@ def setup_results_dir(custom_dir=None):
     
     return run_dir
 
-# Function to save metrics
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that can handle NumPy types"""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+# Update the save_metrics function to use the NumpyEncoder
 def save_metrics(metrics_dict, run_dir, filename, pretty=True):
     """Save metrics to JSON file with improved formatting"""
     filepath = os.path.join(run_dir, "metrics", filename)
@@ -246,9 +289,9 @@ def save_metrics(metrics_dict, run_dir, filename, pretty=True):
     try:
         with open(filepath, 'w') as f:
             if pretty:
-                json.dump(metrics_dict, f, indent=4, sort_keys=True)
+                json.dump(metrics_dict, f, indent=4, sort_keys=True, cls=NumpyEncoder)
             else:
-                json.dump(metrics_dict, f)
+                json.dump(metrics_dict, f, cls=NumpyEncoder)
         
         file_size = os.path.getsize(filepath)
         print(colored(f"✅ Saved metrics to {filename} ({file_size/1024:.1f} KB)", "green"))
@@ -683,32 +726,74 @@ def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, d
         )
         metrics_tracker.start_training()
     
+    # Update the training loop in train_and_evaluate_model_phase1 function
+# Replace the epoch loop with:
+
     # Training setup
     epochs = args.epochs
     best_val_loss = float('inf')
     best_model_path = os.path.join(run_dir, 'models', 'best_model.pth')
     patience = 5
     patience_counter = 0
-    
+
     # Use mixed precision for faster training if available
     scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
     use_amp = scaler is not None
-    
+
     # Check if model is torch.nn.Module (neural model)
     is_neural = isinstance(model, torch.nn.Module)
-    
+
+    # Helper function to get graph-level targets from node-level targets
+    def get_graph_targets(node_targets, batch):
+        unique_graphs = torch.unique(batch)
+        graph_targets = []
+        
+        for g in unique_graphs:
+            # Get targets for this graph
+            graph_mask = (batch == g)
+            graph_node_targets = node_targets[graph_mask]
+            
+            # Find most common target (mode)
+            if len(graph_node_targets) > 0:
+                values, counts = torch.unique(graph_node_targets, return_counts=True)
+                mode_idx = torch.argmax(counts)
+                graph_targets.append(values[mode_idx])
+            else:
+                # Fallback if no targets (should not happen)
+                graph_targets.append(0)
+        
+        return torch.tensor(graph_targets, dtype=torch.long, device=node_targets.device)
+
     if is_neural:
         # Train neural model
         print(colored(f"Training {args.model_type} model for {epochs} epochs...", "cyan"))
         
-        for epoch in range(1, epochs+1):
+        # Create progress bar for epochs
+        epoch_progress = tqdm(
+            range(1, epochs+1),
+            desc=f"Training {args.model_type}",
+            bar_format="{l_bar}{bar:30}{r_bar}",
+            ncols=100
+        )
+        
+        for epoch in epoch_progress:
             # Training
             model.train()
             train_loss = 0.0
             train_diversity_loss = 0.0
             start_time = time.time()
             
-            for batch_data in train_loader:
+            # Create progress bar for training batches
+            batch_progress = tqdm(
+                train_loader,
+                desc=f"Epoch {epoch}/{epochs} [Train]",
+                leave=False,
+                bar_format="{l_bar}{bar:20}{r_bar}",
+                ncols=80
+            )
+            
+            for batch_data in batch_progress:
+                # Move data to device
                 batch_data = batch_data.to(device)
                 optimizer.zero_grad()
                 
@@ -719,15 +804,18 @@ def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, d
                         with torch.cuda.amp.autocast():
                             outputs = model(batch_data)
                             
+                            # Get graph-level targets
+                            graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                            
                             if args.predict_time:
                                 loss, loss_dict = criterion(
                                     outputs["task_pred"], 
-                                    batch_data.y,
+                                    graph_targets,
                                     time_pred=outputs.get("time_pred"), 
                                     time_target=None  # No time target in synthetic data
                                 )
                             else:
-                                loss = criterion(outputs["task_pred"], batch_data.y)
+                                loss = criterion(outputs["task_pred"], graph_targets)
                                 
                             # Add diversity loss if available
                             if "diversity_loss" in outputs and hasattr(args, 'diversity_weight') and args.diversity_weight > 0:
@@ -742,15 +830,18 @@ def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, d
                     else:
                         outputs = model(batch_data)
                         
+                        # Get graph-level targets
+                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                        
                         if args.predict_time:
                             loss, loss_dict = criterion(
                                 outputs["task_pred"], 
-                                batch_data.y,
+                                graph_targets,
                                 time_pred=outputs.get("time_pred"), 
                                 time_target=None  # No time target in synthetic data
                             )
                         else:
-                            loss = criterion(outputs["task_pred"], batch_data.y)
+                            loss = criterion(outputs["task_pred"], graph_targets)
                             
                         # Add diversity loss if available
                         if "diversity_loss" in outputs and hasattr(args, 'diversity_weight') and args.diversity_weight > 0:
@@ -766,7 +857,9 @@ def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, d
                     if use_amp:
                         with torch.cuda.amp.autocast():
                             logits, diversity_loss = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                            loss = criterion(logits, batch_data.y)
+                            # Get graph-level targets
+                            graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                            loss = criterion(logits, graph_targets)
                             
                             if hasattr(args, 'diversity_weight') and args.diversity_weight > 0:
                                 train_diversity_loss += diversity_loss.item()
@@ -777,7 +870,9 @@ def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, d
                         scaler.update()
                     else:
                         logits, diversity_loss = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                        loss = criterion(logits, batch_data.y)
+                        # Get graph-level targets
+                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                        loss = criterion(logits, graph_targets)
                         
                         if hasattr(args, 'diversity_weight') and args.diversity_weight > 0:
                             train_diversity_loss += diversity_loss.item()
@@ -791,19 +886,26 @@ def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, d
                     if use_amp:
                         with torch.cuda.amp.autocast():
                             logits = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                            loss = criterion(logits, batch_data.y)
+                            # Get graph-level targets
+                            graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                            loss = criterion(logits, graph_targets)
                         
                         scaler.scale(loss).backward()
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         logits = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                        loss = criterion(logits, batch_data.y)
+                        # Get graph-level targets
+                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                        loss = criterion(logits, graph_targets)
                         
                         loss.backward()
                         optimizer.step()
                 
                 train_loss += loss.item()
+                
+                # Update batch progress bar
+                batch_progress.set_postfix({"loss": f"{loss.item():.4f}"})
             
             avg_train_loss = train_loss / len(train_loader)
             avg_diversity_loss = train_diversity_loss / len(train_loader) if train_diversity_loss > 0 else 0
@@ -814,40 +916,59 @@ def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, d
             correct = 0
             total = 0
             
+            # Create progress bar for validation batches
+            val_progress = tqdm(
+                val_loader,
+                desc=f"Epoch {epoch}/{epochs} [Valid]",
+                leave=False,
+                bar_format="{l_bar}{bar:20}{r_bar}",
+                ncols=80
+            )
+            
             with torch.no_grad():
-                for batch_data in val_loader:
+                for batch_data in val_progress:
                     batch_data = batch_data.to(device)
                     
                     # Handle different model output formats
                     if args.model_type == 'enhanced_gnn':
                         outputs = model(batch_data)
                         
+                        # Get graph-level targets
+                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                        
                         if args.predict_time:
                             loss, _ = criterion(
                                 outputs["task_pred"], 
-                                batch_data.y,
+                                graph_targets,
                                 time_pred=outputs.get("time_pred"), 
                                 time_target=None
                             )
                             logits = outputs["task_pred"]
                         else:
-                            loss = criterion(outputs["task_pred"], batch_data.y)
+                            loss = criterion(outputs["task_pred"], graph_targets)
                             logits = outputs["task_pred"]
                     
                     elif args.model_type in ['diverse_gat']:
                         logits, _ = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                        loss = criterion(logits, batch_data.y)
+                        # Get graph-level targets
+                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                        loss = criterion(logits, graph_targets)
                     
                     else:
                         logits = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                        loss = criterion(logits, batch_data.y)
+                        # Get graph-level targets
+                        graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                        loss = criterion(logits, graph_targets)
                     
                     val_loss += loss.item()
                     
                     # Calculate accuracy
                     _, predicted = torch.max(logits, 1)
-                    total += batch_data.y.size(0)
-                    correct += (predicted == batch_data.y).sum().item()
+                    total += graph_targets.size(0)
+                    correct += (predicted == graph_targets).sum().item()
+                    
+                    # Update validation progress bar
+                    val_progress.set_postfix({"loss": f"{loss.item():.4f}"})
             
             avg_val_loss = val_loss / len(val_loader)
             val_accuracy = correct / total if total > 0 else 0
@@ -861,13 +982,16 @@ def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, d
                     "diversity_loss": avg_diversity_loss
                 })
             
-            # Print epoch summary
+            # Print epoch summary (on a new line since we used progress bars)
             epoch_time = time.time() - start_time
-            print(colored(f"Epoch {epoch}/{epochs} - "
-                         f"Train Loss: {avg_train_loss:.4f}, "
-                         f"Val Loss: {avg_val_loss:.4f}, "
-                         f"Val Acc: {val_accuracy:.4f}, "
-                         f"Time: {epoch_time:.2f}s", "green"))
+            
+            # Update epoch progress bar
+            epoch_progress.set_postfix({
+                "train_loss": f"{avg_train_loss:.4f}",
+                "val_loss": f"{avg_val_loss:.4f}",
+                "val_acc": f"{val_accuracy:.4f}",
+                "time": f"{epoch_time:.2f}s"
+            })
             
             # Check for improvement
             if avg_val_loss < best_val_loss:
@@ -915,7 +1039,7 @@ def train_and_evaluate_model_phase1(model, graphs, args, criterion, optimizer, d
     
     # Evaluate on test set
     print_section_header("Evaluating Model on Test Set")
-    from evaluate_model_on_test import evaluate_model_on_test
+
     test_metrics = evaluate_model_on_test(model, test_loader, criterion, device, args, metrics_tracker, run_dir)
     
     # Save metrics
@@ -1219,10 +1343,10 @@ def run_ablation_study(args, df, graphs, task_encoder, resource_encoder, run_dir
             # Calculate F1 score
             from sklearn.metrics import f1_score, precision_score, recall_score
             if len(np.unique(y_true)) > 1:  # Make sure there are at least 2 classes
-                f1_macro = f1_score(y_true, y_pred, average='macro')
-                f1_weighted = f1_score(y_true, y_pred, average='weighted')
-                precision = precision_score(y_true, y_pred, average='macro')
-                recall = recall_score(y_true, y_pred, average='macro')
+                f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+                f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+                precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+                recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
             else:
                 f1_macro = f1_weighted = precision = recall = 0.0
             
@@ -1309,6 +1433,27 @@ def evaluate_model_on_test(model, test_loader, criterion, device, args, metrics_
     import time
     from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, matthews_corrcoef
     
+    # Helper function to get graph-level targets from node-level targets
+    def get_graph_targets(node_targets, batch):
+        unique_graphs = torch.unique(batch)
+        graph_targets = []
+        
+        for g in unique_graphs:
+            # Get targets for this graph
+            graph_mask = (batch == g)
+            graph_node_targets = node_targets[graph_mask]
+            
+            # Find most common target (mode)
+            if len(graph_node_targets) > 0:
+                values, counts = torch.unique(graph_node_targets, return_counts=True)
+                mode_idx = torch.argmax(counts)
+                graph_targets.append(values[mode_idx])
+            else:
+                # Fallback if no targets (should not happen)
+                graph_targets.append(0)
+        
+        return torch.tensor(graph_targets, dtype=torch.long, device=node_targets.device)
+    
     # Check if model is torch.nn.Module (neural model)
     is_neural = isinstance(model, torch.nn.Module)
     
@@ -1328,25 +1473,32 @@ def evaluate_model_on_test(model, test_loader, criterion, device, args, metrics_
                 if args.model_type == 'enhanced_gnn':
                     outputs = model(batch_data)
                     
+                    # Get graph-level targets
+                    graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                    
                     if args.predict_time:
                         loss, _ = criterion(
                             outputs["task_pred"], 
-                            batch_data.y,
+                            graph_targets,
                             time_pred=outputs.get("time_pred"), 
                             time_target=None
                         )
                         logits = outputs["task_pred"]
                     else:
-                        loss = criterion(outputs["task_pred"], batch_data.y)
+                        loss = criterion(outputs["task_pred"], graph_targets)
                         logits = outputs["task_pred"]
                 
                 elif args.model_type in ['diverse_gat']:
                     logits, _ = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                    loss = criterion(logits, batch_data.y)
+                    # Get graph-level targets
+                    graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                    loss = criterion(logits, graph_targets)
                 
                 else:
                     logits = model(batch_data.x, batch_data.edge_index, batch_data.batch)
-                    loss = criterion(logits, batch_data.y)
+                    # Get graph-level targets
+                    graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                    loss = criterion(logits, graph_targets)
                 
                 test_loss += loss.item()
                 
@@ -1355,7 +1507,7 @@ def evaluate_model_on_test(model, test_loader, criterion, device, args, metrics_
                 _, predicted = torch.max(logits, 1)
                 
                 # Collect true labels, predictions, and probabilities
-                y_true.extend(batch_data.y.cpu().numpy())
+                y_true.extend(graph_targets.cpu().numpy())
                 y_pred.extend(predicted.cpu().numpy())
                 y_probs.extend(probs.cpu().numpy())
         
@@ -1367,10 +1519,10 @@ def evaluate_model_on_test(model, test_loader, criterion, device, args, metrics_
         # Calculate metrics
         metrics = {}
         metrics['accuracy'] = accuracy_score(y_true, y_pred)
-        metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro')
-        metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted')
-        metrics['precision_macro'] = precision_score(y_true, y_pred, average='macro')
-        metrics['recall_macro'] = recall_score(y_true, y_pred, average='macro')
+        metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+        metrics['precision_macro'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        metrics['recall_macro'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
         metrics['mcc'] = matthews_corrcoef(y_true, y_pred)
         metrics['test_loss'] = test_loss / len(test_loader)
         
@@ -1444,7 +1596,7 @@ def evaluate_model_on_test(model, test_loader, criterion, device, args, metrics_
             print(colored(f"  {name}: {value:.4f}", "green"))
         
         return metrics
-
+    
 # Main function
 def main():
     # Start timing for performance tracking
@@ -2093,6 +2245,8 @@ def main():
     else:
         print(colored("\n⏩ Skipping reinforcement learning (--skip-rl flag used)", "yellow"))
     
+    # Update the code in the generate_final_summary_report section of main.py:
+
     # Generate final summary report
     try:
         total_duration = time.time() - total_start_time
@@ -2103,7 +2257,7 @@ def main():
             "total_duration_seconds": total_duration,
             "total_duration_formatted": f"{total_duration//3600:.0f}h {(total_duration%3600)//60:.0f}m {total_duration%60:.0f}s",
             "dataset": {
-                "filename": os.path.basename(data_path),
+                "filename": os.path.basename(args.data_path),  # Use args.data_path instead of data_path
                 "cases": df["case_id"].nunique(),
                 "events": len(df),
                 "activities": len(df["task_id"].unique()),
@@ -2140,12 +2294,13 @@ def main():
             f.write(f"**Duration:** {summary['total_duration_formatted']}\n\n")
             
             f.write(f"## Dataset Information\n\n")
-            f.write(f"- **Filename:** {os.path.basename(data_path)}\n")
+            f.write(f"- **Filename:** {summary['dataset']['filename']}\n")
             f.write(f"- **Cases:** {summary['dataset']['cases']:,}\n")
             f.write(f"- **Events:** {summary['dataset']['events']:,}\n")
             f.write(f"- **Activities:** {summary['dataset']['activities']}\n")
             f.write(f"- **Resources:** {summary['dataset']['resources']}\n\n")
             
+                
             f.write(f"## Model Performance\n\n")
             if using_phase1 and 'metrics' in locals():
                 f.write(f"- **{args.model_type.replace('_', ' ').title()} Accuracy:** {summary['models'][args.model_type]['accuracy']:.4f}\n")

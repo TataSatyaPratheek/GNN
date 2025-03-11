@@ -100,6 +100,8 @@ def plot_confusion_matrix(y_true, y_pred, class_names, save_path="confusion_matr
     print(f"Confusion matrix saved to {save_path} in {time.time() - start_time:.2f}s")
     return accuracy, f1
 
+# Update the t-SNE code in visualization/process_viz.py:
+
 def plot_embeddings(embeddings, labels=None, method="tsne", save_path=None):
     """Plot task embeddings using t-SNE or UMAP with enhanced visuals"""
     print(f"\n==== Creating Embeddings Visualization (using {method}) ====")
@@ -112,25 +114,30 @@ def plot_embeddings(embeddings, labels=None, method="tsne", save_path=None):
     
     # Calculate embeddings
     if method.lower() == "tsne":
-        tsne_perp = min(30, max(5, embeddings.shape[0] // 5))
-        print(f"Running t-SNE with perplexity {tsne_perp}...")
-        coords = TSNE(n_components=2, perplexity=tsne_perp, 
+        # Ensure perplexity is less than number of samples
+        safe_perplexity = min(30, max(5, embeddings.shape[0] - 1))
+        print(f"Running t-SNE with perplexity {safe_perplexity}...")
+        coords = TSNE(n_components=2, perplexity=safe_perplexity, 
                      random_state=42, n_jobs=-1).fit_transform(embeddings)
         title = "Task Embeddings - t-SNE"
     else:  # umap
         print("Running UMAP...")
         try:
+            # Ensure n_neighbors is less than number of samples
+            n_neighbors = min(30, max(2, embeddings.shape[0] // 2))
             coords = umap.UMAP(n_components=2, random_state=42,
-                              n_neighbors=min(30, embeddings.shape[0] // 2),
+                              n_neighbors=n_neighbors,
                               min_dist=0.1).fit_transform(embeddings)
             title = "Task Embeddings - UMAP"
         except Exception as e:
             print(f"\033[91mError running UMAP: {e}\033[0m")
             print("Falling back to t-SNE...")
-            coords = TSNE(n_components=2, perplexity=min(30, embeddings.shape[0] // 5), 
+            # Safe perplexity for t-SNE
+            safe_perplexity = min(30, max(5, embeddings.shape[0] - 1))
+            coords = TSNE(n_components=2, perplexity=safe_perplexity, 
                          random_state=42, n_jobs=-1).fit_transform(embeddings)
             title = "Task Embeddings - t-SNE (UMAP failed)"
-    
+                
     # Create plot with better visuals
     plt.figure(figsize=(10, 8))
     
