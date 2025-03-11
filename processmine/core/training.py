@@ -17,6 +17,9 @@ from sklearn.metrics import (
 from colorama import Fore, Style
 
 from processmine.utils.memory import MemoryOptimizer
+# Import optimized components
+from processmine.utils.dependency import check_dependency
+from processmine.utils.checkpoint import CheckpointManager, TrainingCheckpoint
 
 def setup_device():
     """
