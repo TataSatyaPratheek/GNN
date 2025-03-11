@@ -33,4 +33,4 @@ model = create_model("gat", input_dim=10, hidden_dim=64, output_dim=5)
 
 ## License
 
-MIT
+Apache License 2.0
