@@ -440,7 +440,7 @@ def _log_graph_statistics(graphs, stats, start_time, verbose):
         logger.warning(f"Very large graphs detected. Consider limiting graph size with limit_nodes parameter.")
 
 def build_heterogeneous_graph(
-    df, 
+    df: pd.DataFrame, 
     node_types: Optional[Dict[str, List[str]]] = None, 
     edge_types: Optional[List[str]] = None, 
     batch_size: int = 1000, 
@@ -452,14 +452,16 @@ def build_heterogeneous_graph(
     
     Args:
         df: Process data dataframe
-        node_types: Dictionary mapping feature columns to node types
+        node_types: Dictionary mapping node types to feature columns
+                    (e.g., {'task': ['task_id', 'feat_task_id'], 'resource': ['resource_id']})
         edge_types: List of edge types to create
+                    (e.g., ['task_to_task', 'task_to_resource', 'resource_to_task'])
         batch_size: Batch size for memory-efficient processing
         verbose: Whether to print progress information
         use_edge_attr: Whether to include edge attributes
         
     Returns:
-        List of heterogeneous graph data objects
+        List of heterogeneous graph data objects compatible with PyG
     """
     if verbose:
         logger.info("Building heterogeneous graph data")
@@ -467,9 +469,12 @@ def build_heterogeneous_graph(
     
     # Define default node types if not provided
     if node_types is None:
+        task_cols = [col for col in df.columns if col.startswith('feat_task') or col == 'task_id']
+        resource_cols = [col for col in df.columns if col.startswith('feat_resource') or col == 'resource_id']
+        
         node_types = {
-            "task": ["task_id", "feat_task_id"],
-            "resource": ["resource_id", "feat_resource_id"]
+            "task": task_cols,
+            "resource": resource_cols
         }
     
     # Define default edge types if not provided
@@ -497,72 +502,217 @@ def build_heterogeneous_graph(
         batch_df.sort_values(["case_id", "timestamp"], inplace=True)
         
         # Process each case
-        for _, case_group in batch_df.groupby("case_id"):
-            # Create node features for each node type
-            node_features = {}
+        for case_id, case_group in batch_df.groupby("case_id"):
+            # Dictionary to store all node data
+            node_data = {}
+            
+            # Dictionary to map node IDs to indices
+            node_indices = {}
+            
+            # Dictionary to store edge data for each edge type
+            edge_data = {}
+            
+            # Extract nodes and features for each node type
             for node_type, feature_cols in node_types.items():
-                # Extract relevant features
+                # Get valid feature columns
                 valid_cols = [col for col in feature_cols if col in case_group.columns]
-                if valid_cols:
-                    features = case_group[valid_cols].values
-                    node_features[node_type] = torch.tensor(features, dtype=torch.float32)
-            
-            # Create edge indices for each edge type
-            edge_indices = {}
-            edge_attrs = {}
-            
-            n_nodes = len(case_group)
-            
-            # Create task-to-task edges (sequential flow)
-            if "task_to_task" in edge_types and n_nodes > 1:
-                src = torch.arange(n_nodes-1, dtype=torch.long)
-                tgt = torch.arange(1, n_nodes, dtype=torch.long)
-                edge_indices["task_to_task"] = torch.stack([src, tgt])
                 
-                if use_edge_attr:
-                    # Add time difference as edge attribute
-                    timestamps = case_group["timestamp"].values
-                    time_diffs = np.array([
-                        (timestamps[i+1] - timestamps[i]) / np.timedelta64(1, 'h')
-                        for i in range(n_nodes-1)
-                    ], dtype=np.float32)
-                    edge_attrs["task_to_task"] = torch.tensor(time_diffs, dtype=torch.float32).view(-1, 1)
+                if not valid_cols:
+                    if verbose:
+                        logger.warning(f"No valid columns found for node type {node_type}")
+                    continue
+                
+                # Get unique node IDs
+                if node_type == "task":
+                    node_ids = case_group["task_id"].values
+                    id_col = "task_id"
+                elif node_type == "resource":
+                    node_ids = case_group["resource_id"].values
+                    id_col = "resource_id"
+                else:
+                    # For custom node types, use the first column as ID
+                    id_col = valid_cols[0]
+                    node_ids = case_group[id_col].values
+                
+                # Extract features
+                if len(valid_cols) > 1:
+                    # Use all feature columns
+                    features = case_group[valid_cols].values
+                else:
+                    # Use ID column as feature
+                    features = case_group[id_col].values.reshape(-1, 1)
+                
+                # Convert to tensors
+                node_features = torch.tensor(features, dtype=torch.float32)
+                
+                # Store node data
+                node_data[node_type] = node_features
+                
+                # Map node IDs to indices
+                for idx, node_id in enumerate(node_ids):
+                    if node_type not in node_indices:
+                        node_indices[node_type] = {}
+                    node_indices[node_type][node_id] = idx
             
-            # Create task-to-resource edges
-            if "task_to_resource" in edge_types:
-                # Map tasks to resources
-                task_idx = torch.arange(n_nodes, dtype=torch.long)
-                resource_idx = torch.arange(n_nodes, dtype=torch.long)  # Same length, resource for each task
-                edge_indices["task_to_resource"] = torch.stack([task_idx, resource_idx])
+            # Create edges for each edge type
+            for edge_type in edge_types:
+                if edge_type == "task_to_task":
+                    # Sequential task transitions
+                    n_tasks = len(case_group)
+                    if n_tasks > 1:
+                        sources = list(range(n_tasks - 1))
+                        targets = list(range(1, n_tasks))
+                        
+                        # Create edge indices
+                        edge_indices = torch.tensor([sources, targets], dtype=torch.long)
+                        
+                        # Create edge attributes if enabled
+                        if use_edge_attr:
+                            # Add time difference as edge attribute
+                            if "timestamp" in case_group.columns:
+                                timestamps = case_group["timestamp"].values
+                                time_diffs = np.array([
+                                    (timestamps[i+1] - timestamps[i]).total_seconds() / 3600.0  # Hours
+                                    for i in range(n_tasks-1)
+                                ], dtype=np.float32)
+                                
+                                edge_attrs = torch.tensor(time_diffs, dtype=torch.float32).view(-1, 1)
+                            else:
+                                # Default edge attributes
+                                edge_attrs = torch.ones(len(sources), 1, dtype=torch.float32)
+                        else:
+                            edge_attrs = None
+                        
+                        # Store edge data
+                        edge_data[edge_type] = {
+                            "edge_index": edge_indices,
+                            "edge_attr": edge_attrs
+                        }
+                
+                elif edge_type == "task_to_resource":
+                    # Connect tasks to resources
+                    if "task_id" in case_group.columns and "resource_id" in case_group.columns:
+                        task_indices = []
+                        resource_indices = []
+                        
+                        for idx, row in case_group.iterrows():
+                            task_id = row["task_id"]
+                            resource_id = row["resource_id"]
+                            
+                            if "task" in node_indices and task_id in node_indices["task"] and \
+                               "resource" in node_indices and resource_id in node_indices["resource"]:
+                                task_idx = node_indices["task"][task_id]
+                                resource_idx = node_indices["resource"][resource_id]
+                                
+                                task_indices.append(task_idx)
+                                resource_indices.append(resource_idx)
+                        
+                        if task_indices and resource_indices:
+                            # Create edge indices
+                            edge_indices = torch.tensor([task_indices, resource_indices], dtype=torch.long)
+                            
+                            # Create edge attributes
+                            if use_edge_attr:
+                                # Default edge attributes
+                                edge_attrs = torch.ones(len(task_indices), 1, dtype=torch.float32)
+                            else:
+                                edge_attrs = None
+                            
+                            # Store edge data
+                            edge_data[edge_type] = {
+                                "edge_index": edge_indices,
+                                "edge_attr": edge_attrs
+                            }
+                
+                elif edge_type == "resource_to_task":
+                    # Connect resources to tasks (reverse of task_to_resource)
+                    if "task_to_resource" in edge_data:
+                        task_to_resource = edge_data["task_to_resource"]
+                        
+                        # Reverse source and target indices
+                        edge_indices = torch.stack([
+                            task_to_resource["edge_index"][1],
+                            task_to_resource["edge_index"][0]
+                        ])
+                        
+                        # Create edge attributes
+                        if use_edge_attr and "edge_attr" in task_to_resource and task_to_resource["edge_attr"] is not None:
+                            # Use same edge attributes but potentially modify them to indicate reverse direction
+                            edge_attrs = task_to_resource["edge_attr"].clone()
+                        else:
+                            edge_attrs = None
+                        
+                        # Store edge data
+                        edge_data[edge_type] = {
+                            "edge_index": edge_indices,
+                            "edge_attr": edge_attrs
+                        }
+                
+                # Add support for custom edge types
+                elif "_to_" in edge_type:
+                    source_type, target_type = edge_type.split("_to_")
+                    
+                    if source_type in node_indices and target_type in node_indices:
+                        # Get mapping between node types
+                        # This requires domain knowledge about the relationship
+                        # Here we assume a simple approach: each node in source type connects to all nodes in target type
+                        # This should be customized based on actual data relationships
+                        
+                        src_indices = []
+                        tgt_indices = []
+                        
+                        for src_id, src_idx in node_indices[source_type].items():
+                            for tgt_id, tgt_idx in node_indices[target_type].items():
+                                src_indices.append(src_idx)
+                                tgt_indices.append(tgt_idx)
+                        
+                        if src_indices and tgt_indices:
+                            # Create edge indices
+                            edge_indices = torch.tensor([src_indices, tgt_indices], dtype=torch.long)
+                            
+                            # Create edge attributes
+                            if use_edge_attr:
+                                edge_attrs = torch.ones(len(src_indices), 1, dtype=torch.float32)
+                            else:
+                                edge_attrs = None
+                            
+                            # Store edge data
+                            edge_data[edge_type] = {
+                                "edge_index": edge_indices,
+                                "edge_attr": edge_attrs
+                            }
             
-            # Create resource-to-task edges (reversed task-to-resource)
-            if "resource_to_task" in edge_types and "task_to_resource" in edge_indices:
-                edge_indices["resource_to_task"] = torch.stack([
-                    edge_indices["task_to_resource"][1],
-                    edge_indices["task_to_resource"][0]
-                ])
-            
-            # Build heterogeneous graph data object
-            # This is a simplified version for compatibility
+            # Create heterogeneous graph data object
             het_graph = {
-                "num_nodes": n_nodes,
-                "node_features": node_features,
-                "edge_indices": edge_indices,
-                "edge_attrs": edge_attrs,
-                "y": torch.tensor(case_group["next_task"].values, dtype=torch.long) if "next_task" in case_group.columns else None
+                "num_nodes": {
+                    node_type: data.size(0) for node_type, data in node_data.items()
+                },
+                "node_features": node_data,
+                "edge_indices": {
+                    edge_type: data["edge_index"] for edge_type, data in edge_data.items()
+                },
+                "edge_attrs": {
+                    edge_type: data["edge_attr"] for edge_type, data in edge_data.items() 
+                    if "edge_attr" in data and data["edge_attr"] is not None
+                },
+                "y": torch.tensor(case_group["next_task"].values, dtype=torch.long) 
+                     if "next_task" in case_group.columns else None
+            }
+            
+            # Add metadata
+            het_graph["metadata"] = {
+                "case_id": case_id,
+                "num_events": len(case_group),
+                "node_types": list(node_data.keys()),
+                "edge_types": list(edge_data.keys())
             }
             
             het_graphs.append(het_graph)
-        
+            
         # Update progress
         progress_tracker(batch_end - i)
-        
-        # Force garbage collection after each batch
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     
-    # Log statistics
+    # Log completion
     if verbose:
         logger.info(f"Built {len(het_graphs)} heterogeneous graphs in {time.time() - start_time:.2f}s")
     
