@@ -3,6 +3,7 @@ High-performance training utilities with mixed precision training, gradient accu
 memory-optimized batching, and systematic CUDA management.
 """
 import torch
+import os
 import numpy as np
 import time
 import logging

@@ -10,6 +10,7 @@ import logging
 import gc
 import os
 import psutil
+import dask
 from typing import Tuple, Dict, Any, Optional, List, Union
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from functools import partial

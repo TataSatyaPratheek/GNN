@@ -2,6 +2,8 @@
 
 import numpy as np
 import torch
+import time
+
 
 def normalize_features(features, method='l2', in_place=False, return_tensor=False):
     """

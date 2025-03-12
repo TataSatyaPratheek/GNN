@@ -8,6 +8,7 @@ import torch.sparse as sparse
 import numpy as np
 from torch_geometric.data import Data
 from torch_geometric.utils import to_undirected
+import pandas as pd
 import time
 import logging
 import gc

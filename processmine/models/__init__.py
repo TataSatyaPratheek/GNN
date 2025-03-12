@@ -3,18 +3,7 @@
 Model implementations for process mining.
 """
 from processmine.models.base import BaseModel
+from processmine.models.factory import create_model, get_model_config
 
-# Import factory function
-def create_model(model_type, **kwargs):
-    """
-    Factory function to create models with consistent interface
-    
-    Args:
-        model_type: Type of model ('gnn', 'lstm', etc.)
-        **kwargs: Model parameters
-        
-    Returns:
-        Model instance
-    """
-    from processmine import create_model as root_create_model
-    return root_create_model(model_type, **kwargs)
+# Re-export factory functions for convenience
+__all__ = ['BaseModel', 'create_model', 'get_model_config']
