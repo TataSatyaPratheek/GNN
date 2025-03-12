@@ -869,6 +869,8 @@ class PositionalGATConv(MessagePassing):
         return scatter_add(inputs, index, dim=0, dim_size=dim_size)
 
 
+# processmine/models/gnn/architectures.py (UPDATED CLASS)
+
 class DiverseGATConv(MessagePassing):
     """
     GAT layer with attention diversity loss to avoid attention collapse
@@ -911,21 +913,34 @@ class DiverseGATConv(MessagePassing):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights"""
+        """Initialize weights with Xavier uniform"""
         nn.init.xavier_uniform_(self.lin.weight)
         nn.init.xavier_uniform_(self.att)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
     
     def forward(self, x, edge_index, return_attention=False):
-        """Forward pass with diversity loss"""
-        # Add self-loops
+        """
+        Forward pass with improved diversity loss
+        
+        Args:
+            x: Node features [N, in_channels]
+            edge_index: Edge indices [2, E]
+            return_attention: Whether to return attention weights and diversity loss
+            
+        Returns:
+            If return_attention=False:
+                Tuple of (node_embeddings, diversity_loss)
+            If return_attention=True:
+                Tuple of (node_embeddings, diversity_loss, attention_weights)
+        """
+        # Add self-loops for better message passing
         edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
         
-        # Linear transformation
+        # Linear transformation to get node embeddings
         x = self.lin(x).view(-1, self.heads, self.out_channels)
         
-        # Extract node indices
+        # Extract node features for source and target nodes
         row, col = edge_index
         x_i, x_j = x[row], x[col]
         
@@ -939,8 +954,8 @@ class DiverseGATConv(MessagePassing):
         # Normalize attention weights
         alpha = softmax(alpha, row, num_nodes=x.size(0))
         
-        # Calculate diversity loss (correlation between heads)
-        diversity_loss = self._calculate_diversity_loss(alpha)
+        # Calculate diversity loss with improved method
+        diversity_loss = self._calculate_diversity_loss(alpha, row, x.size(0))
         
         # Apply dropout
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
@@ -958,40 +973,87 @@ class DiverseGATConv(MessagePassing):
         if self.bias is not None:
             out = out + self.bias
         
-        # Return with diversity loss if requested
+        # Return with attention weights if requested
         if return_attention:
             return out, diversity_loss, alpha
         else:
             return out, diversity_loss
     
-    def _calculate_diversity_loss(self, alpha):
-        """Calculate diversity loss to encourage different attention patterns"""
-        # Initialize correlation matrix
-        device = alpha.device
-        head_corr = torch.zeros(self.heads, self.heads, device=device)
+    def _calculate_diversity_loss(self, alpha, row, num_nodes):
+        """
+        Calculate diversity loss to encourage different attention patterns
         
-        # Calculate correlation between attention heads
-        for h1 in range(self.heads):
-            for h2 in range(h1+1, self.heads):
-                # Calculate cosine similarity
-                a1 = alpha[:, h1]
-                a2 = alpha[:, h2]
-                
-                # Normalize vectors for numerical stability
-                a1_norm = F.normalize(a1, p=2, dim=0)
-                a2_norm = F.normalize(a2, p=2, dim=0)
-                
-                # Compute cosine similarity
-                corr = torch.sum(a1_norm * a2_norm)
-                
-                # Store in matrix (symmetrically)
-                head_corr[h1, h2] = corr
-                head_corr[h2, h1] = corr
+        Args:
+            alpha: Attention weights [E, heads]
+            row: Row indices [E]
+            num_nodes: Number of nodes
+            
+        Returns:
+            Diversity loss tensor
+        """
+        # Create a node-level view of attention weights
+        # For each node, gather attention distributions from all heads
         
-        # Average correlation - higher means more similar patterns
-        diversity_loss = torch.mean(head_corr) * self.diversity_weight
+        # Step 1: Compute head attention correlations
+        head_correlations = torch.zeros(self.heads, self.heads, device=alpha.device)
         
-        return diversity_loss
+        for i in range(self.heads):
+            for j in range(i+1, self.heads):
+                # Get attention weights for each head
+                alpha_i = alpha[:, i]
+                alpha_j = alpha[:, j]
+                
+                # Normalize for numerical stability
+                alpha_i = F.normalize(alpha_i, p=2, dim=0)
+                alpha_j = F.normalize(alpha_j, p=2, dim=0)
+                
+                # Compute cosine similarity between attention distributions
+                sim = torch.sum(alpha_i * alpha_j)
+                
+                # Store similarity (symmetrically)
+                head_correlations[i, j] = sim
+                head_correlations[j, i] = sim
+        
+        # Step 2: Calculate node-level diversity
+        node_diversity = torch.zeros(num_nodes, device=alpha.device)
+        
+        for node in range(num_nodes):
+            # Find edges where this node is the source
+            mask = (row == node)
+            
+            # If node has edges
+            if mask.sum() > 0:
+                # Get normalized attention weights for this node's outgoing edges
+                node_alpha = alpha[mask]
+                
+                # Calculate pairwise cosine similarity between heads
+                head_sims = torch.zeros(self.heads, self.heads, device=alpha.device)
+                
+                for h1 in range(self.heads):
+                    for h2 in range(h1+1, self.heads):
+                        a1 = F.normalize(node_alpha[:, h1], p=2, dim=0)
+                        a2 = F.normalize(node_alpha[:, h2], p=2, dim=0)
+                        
+                        # Compute cosine similarity if vectors are non-zero
+                        if torch.norm(a1) > 1e-8 and torch.norm(a2) > 1e-8:
+                            sim = torch.sum(a1 * a2)
+                            head_sims[h1, h2] = sim
+                            head_sims[h2, h1] = sim
+                
+                # Node diversity is average pairwise similarity
+                if self.heads > 1:
+                    node_diversity[node] = head_sims.sum() / (self.heads * (self.heads - 1))
+        
+        # Step 3: Compute weighted diversity loss
+        # Higher similarity means less diversity, so we want to minimize this
+        global_diversity_loss = head_correlations.sum() / (self.heads * (self.heads - 1)) if self.heads > 1 else 0
+        node_diversity_loss = node_diversity.mean()
+        
+        # Combine global and node-level diversities
+        combined_loss = (global_diversity_loss + node_diversity_loss) / 2
+        
+        # Apply weight and return
+        return combined_loss * self.diversity_weight
     
     def message(self, x_j, alpha):
         """Message function for aggregation"""
@@ -1001,12 +1063,14 @@ class DiverseGATConv(MessagePassing):
     
     def aggregate(self, inputs, index, dim_size=None):
         """Aggregate messages using sum"""
+        from torch_scatter import scatter_add
         return scatter_add(inputs, index, dim=0, dim_size=dim_size)
 
+# processmine/models/gnn/architectures.py (UPDATED CLASS)
 
 class CombinedGATConv(MessagePassing):
     """
-    Combined GAT layer with positional encoding and attention diversity
+    Combined GAT layer with position-aware diverse attention
     """
     def __init__(
         self, 
@@ -1016,6 +1080,7 @@ class CombinedGATConv(MessagePassing):
         concat: bool = True, 
         pos_dim: int = 16,
         diversity_weight: float = 0.1, 
+        pos_weight: float = 0.5,
         negative_slope: float = 0.2, 
         dropout: float = 0.0, 
         bias: bool = True
@@ -1028,18 +1093,25 @@ class CombinedGATConv(MessagePassing):
         self.concat = concat
         self.pos_dim = pos_dim
         self.diversity_weight = diversity_weight
+        self.pos_weight = pos_weight
         self.negative_slope = negative_slope
         self.dropout = dropout
         
-        # Main transformation
-        content_dim = in_channels - pos_dim  # Dimension without positional part
-        self.lin = nn.Linear(content_dim, heads * out_channels, bias=False)
+        # Content features dimension (excluding position)
+        content_dim = in_channels - pos_dim
         
-        # Attention weights for content
-        self.att = nn.Parameter(torch.Tensor(1, heads, 2 * out_channels))
+        # Main transformation for content features
+        self.content_lin = nn.Linear(content_dim, heads * out_channels, bias=False)
         
-        # Positional attention component
-        self.pos_att = nn.Parameter(torch.Tensor(1, heads, 2 * pos_dim))
+        # Transformation for positional features
+        self.pos_lin = nn.Linear(pos_dim, heads * out_channels // 4, bias=False)
+        
+        # Attention weights for content and position
+        self.content_att = nn.Parameter(torch.Tensor(1, heads, 2 * out_channels))
+        self.pos_att = nn.Parameter(torch.Tensor(1, heads, 2 * (out_channels // 4)))
+        
+        # Weights to combine attention components
+        self.att_combination = nn.Parameter(torch.Tensor(heads, 2))
         
         # Bias
         if bias and concat:
@@ -1052,58 +1124,79 @@ class CombinedGATConv(MessagePassing):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights"""
-        nn.init.xavier_uniform_(self.lin.weight)
-        nn.init.xavier_uniform_(self.att)
+        """Initialize weights with Xavier uniform"""
+        nn.init.xavier_uniform_(self.content_lin.weight)
+        nn.init.xavier_uniform_(self.pos_lin.weight)
+        nn.init.xavier_uniform_(self.content_att)
         nn.init.xavier_uniform_(self.pos_att)
+        
+        # Initialize combination weights to balance content and position
+        nn.init.constant_(self.att_combination, 0.5)
+        
         if self.bias is not None:
             nn.init.zeros_(self.bias)
     
     def forward(self, x, edge_index, return_attention=False):
-        """Forward pass with diversity loss and position-aware attention"""
-        # Add self-loops
+        """
+        Forward pass with combined positional and diverse attention
+        
+        Args:
+            x: Node features [N, in_channels] including positional features
+            edge_index: Edge indices [2, E]
+            return_attention: Whether to return attention weights and diversity loss
+            
+        Returns:
+            If return_attention=False:
+                Tuple of (node_embeddings, diversity_loss)
+            If return_attention=True:
+                Tuple of (node_embeddings, diversity_loss, attention_weights)
+        """
+        # Add self-loops for better message passing
         edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
         
-        # Split features into content and position parts
+        # Split features into content and position
         content_features = x[:, :-self.pos_dim]
         pos_features = x[:, -self.pos_dim:]
         
-        # Apply content transformation
-        content = self.lin(content_features).view(-1, self.heads, self.out_channels)
+        # Transform features
+        transformed_content = self.content_lin(content_features).view(-1, self.heads, self.out_channels)
+        transformed_pos = self.pos_lin(pos_features).view(-1, self.heads, self.out_channels // 4)
         
-        # Extract node indices
+        # Extract node features for source and target nodes
         row, col = edge_index
-        content_i, content_j = content[row], content[col]
-        pos_i, pos_j = pos_features[row], pos_features[col]
         
-        # Compute content attention component
+        # Content features
+        content_i, content_j = transformed_content[row], transformed_content[col]
+        
+        # Positional features
+        pos_i, pos_j = transformed_pos[row], transformed_pos[col]
+        
+        # Compute content attention
         alpha_content = torch.cat([content_i, content_j], dim=-1)
-        alpha_content = (alpha_content * self.att).sum(dim=-1)
+        alpha_content = (alpha_content * self.content_att).sum(dim=-1)
         
-        # Compute positional attention component
-        alpha_pos = torch.cat([
-            pos_i.unsqueeze(1).repeat(1, self.heads, 1),
-            pos_j.unsqueeze(1).repeat(1, self.heads, 1)
-        ], dim=-1)
+        # Compute positional attention
+        alpha_pos = torch.cat([pos_i, pos_j], dim=-1)
         alpha_pos = (alpha_pos * self.pos_att).sum(dim=-1)
         
-        # Combine attentions
-        alpha = alpha_content + alpha_pos
+        # Combine attention components with learned weights
+        alpha_combined = alpha_content * self.att_combination[:, 0].view(1, -1) + \
+                        alpha_pos * self.att_combination[:, 1].view(1, -1)
         
         # Apply LeakyReLU
-        alpha = F.leaky_relu(alpha, self.negative_slope)
+        alpha = F.leaky_relu(alpha_combined, self.negative_slope)
         
         # Normalize attention weights
         alpha = softmax(alpha, row, num_nodes=x.size(0))
         
         # Calculate diversity loss
-        diversity_loss = self._calculate_diversity_loss(alpha)
+        diversity_loss = self._calculate_diversity_loss(alpha, row, x.size(0))
         
         # Apply dropout
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
         
-        # Apply weighted aggregation
-        out = self.propagate(edge_index, x=content, alpha=alpha, size=None)
+        # Propagate with combined embeddings (mainly content)
+        out = self.propagate(edge_index, x=transformed_content, alpha=alpha, size=None)
         
         # Apply concat/mean
         if self.concat:
@@ -1115,38 +1208,78 @@ class CombinedGATConv(MessagePassing):
         if self.bias is not None:
             out = out + self.bias
         
-        # Return with diversity loss if requested
+        # Return with attention weights if requested
         if return_attention:
             return out, diversity_loss, alpha
         else:
             return out, diversity_loss
     
-    def _calculate_diversity_loss(self, alpha):
-        """Calculate diversity loss to encourage different attention patterns"""
-        # Initialize correlation matrix
-        device = alpha.device
-        head_corr = torch.zeros(self.heads, self.heads, device=device)
+    def _calculate_diversity_loss(self, alpha, row, num_nodes):
+        """
+        Calculate diversity loss with improved implementation
         
-        # Calculate correlation between attention heads
+        Args:
+            alpha: Attention weights [E, heads]
+            row: Row indices [E]
+            num_nodes: Number of nodes
+            
+        Returns:
+            Diversity loss tensor
+        """
+        if self.heads <= 1:
+            return torch.tensor(0.0, device=alpha.device)
+        
+        # Step 1: Calculate pairwise head similarity
+        sims = torch.zeros(self.heads, self.heads, device=alpha.device)
+        
         for h1 in range(self.heads):
             for h2 in range(h1+1, self.heads):
-                # Calculate cosine similarity
+                # Get attention for each head
                 a1 = alpha[:, h1]
                 a2 = alpha[:, h2]
                 
-                # Normalize vectors for numerical stability
-                a1_norm = F.normalize(a1, p=2, dim=0)
-                a2_norm = F.normalize(a2, p=2, dim=0)
-                
                 # Compute cosine similarity
-                corr = torch.sum(a1_norm * a2_norm)
+                sim = F.cosine_similarity(a1, a2, dim=0)
                 
-                # Store in matrix (symmetrically)
-                head_corr[h1, h2] = corr
-                head_corr[h2, h1] = corr
+                # Store similarity (symmetrically)
+                sims[h1, h2] = sim
+                sims[h2, h1] = sim
         
-        # Average correlation - higher means more similar patterns
-        diversity_loss = torch.mean(head_corr) * self.diversity_weight
+        # Step 2: Compute node-level diversity
+        node_diversity = torch.zeros(num_nodes, device=alpha.device)
+        
+        for node in range(num_nodes):
+            # Find edges where this node is the source
+            node_edges_mask = (row == node)
+            
+            # If node has edges
+            if node_edges_mask.sum() > 1:  # Need at least 2 edges for diversity
+                # Get attention distribution for this node
+                node_alpha = alpha[node_edges_mask]
+                
+                # Calculate entropy of attention distribution for each head
+                # Higher entropy = more diverse attention
+                entropy_per_head = torch.zeros(self.heads, device=alpha.device)
+                
+                for h in range(self.heads):
+                    # Get normalized attention weights
+                    head_alpha = F.normalize(node_alpha[:, h], p=1, dim=0)
+                    
+                    # Avoid log(0) by adding epsilon
+                    epsilon = 1e-10
+                    entropy = -torch.sum(head_alpha * torch.log(head_alpha + epsilon))
+                    entropy_per_head[h] = entropy
+                
+                # Node diversity is average attention entropy
+                node_diversity[node] = entropy_per_head.mean()
+        
+        # Step 3: Compute final diversity loss
+        # Maximize entropy (diversity) and minimize similarity between heads
+        head_similarity = sims.sum() / (self.heads * (self.heads - 1))
+        avg_node_diversity = -node_diversity.mean()  # Negative as we want to maximize entropy
+        
+        # Combined loss - balance head similarity and node diversity
+        diversity_loss = (head_similarity * 0.7 + avg_node_diversity * 0.3) * self.diversity_weight
         
         return diversity_loss
     
@@ -1158,8 +1291,8 @@ class CombinedGATConv(MessagePassing):
     
     def aggregate(self, inputs, index, dim_size=None):
         """Aggregate messages using sum"""
+        from torch_scatter import scatter_add
         return scatter_add(inputs, index, dim=0, dim_size=dim_size)
-
 
 # Utility functions for attention and message passing
 def softmax(src, index, num_nodes=None):

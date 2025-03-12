@@ -437,7 +437,7 @@ def run_training(args, device, output_dir, analysis_results=None):
     try:
         # Import necessary modules
         from processmine.data.loader import load_and_preprocess_data
-        from processmine.data.graph_builder import build_graph_data
+        from processmine.data.graphs import build_graph_data
         from processmine.utils.memory import log_memory_usage
         from processmine.utils.evaluation import compute_class_weights
         

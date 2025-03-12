@@ -17,6 +17,8 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
+# processmine/data/graph_builder.py (UPDATED FUNCTION)
+
 def build_graph_data(
     df, 
     enhanced: bool = False, 
@@ -25,7 +27,7 @@ def build_graph_data(
     verbose: bool = True,
     bidirectional: bool = True,
     limit_nodes: Optional[int] = None,
-    use_sparse: bool = True
+    mode: str = 'auto'
 ) -> List[Data]:
     """
     Build graph data with optimized memory usage and vectorized operations
@@ -39,7 +41,7 @@ def build_graph_data(
         verbose: Whether to print progress information
         bidirectional: Whether to create bidirectional edges
         limit_nodes: Maximum number of nodes per graph (None for no limit)
-        use_sparse: Whether to use sparse matrix operations
+        mode: Graph building strategy ('auto', 'standard', 'sparse')
         
     Returns:
         List of graph data objects
@@ -71,6 +73,15 @@ def build_graph_data(
     # Statistics for logging
     stats = {"node_counts": [], "edge_counts": []}
     
+    # Auto-determine mode if not specified
+    if mode == 'auto':
+        # Use sparse for larger datasets
+        use_sparse = len(df) > 50000 or len(case_ids) > 1000
+        mode = 'sparse' if use_sparse else 'standard'
+        
+        if verbose:
+            logger.info(f"Selected graph building mode: {mode}")
+    
     # Process in batches with optimized memory usage
     graphs = []
     for i in range(0, num_cases, batch_size):
@@ -83,13 +94,11 @@ def build_graph_data(
         # Pre-sort all data to avoid sorting in loop
         batch_df.sort_values(["case_id", "timestamp"], inplace=True)
         
-        # Process each case in the batch using vectorized operations where possible
-        if use_sparse and len(batch_case_ids) > 50:
-            # Use sparse matrix operations for large batches
+        # Process batch using the specified mode
+        if mode == 'sparse':
             batch_graphs = _build_graphs_sparse(batch_df, feature_cols, enhanced, 
                                           bidirectional, limit_nodes, stats)
-        else:
-            # Use standard approach for smaller batches
+        else:  # 'standard' mode
             batch_graphs = _build_graphs_standard(batch_df, feature_cols, enhanced, 
                                               bidirectional, limit_nodes, stats)
             

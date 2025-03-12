@@ -13,36 +13,111 @@ import os
 import pickle
 import matplotlib.pyplot as plt
 
+# processmine/process_mining/optimization.py (UPDATED CLASS)
+
 class ProcessEnv:
     """
-    Environment for process optimization using RL
-    The agent chooses (next_activity, resource) pairs and receives rewards
-    based on cost, delay, and resource utilization
+    Enhanced environment for process optimization using RL
     """
-    def __init__(self, df, le_task, resources):
+    
+    def __init__(self, df, le_task, resources, 
+                weighting_strategy="balanced", terminal_states=None):
+        """
+        Initialize process environment
+        
+        Args:
+            df: Process data dataframe
+            le_task: Task label encoder 
+            resources: List of available resources
+            weighting_strategy: Strategy for reward weighting ('balanced', 'time', 'conformance')
+            terminal_states: Optional list of terminal task IDs
+        """
         self.df = df
         self.le_task = le_task
         self.all_tasks = sorted(df["task_id"].unique())
         self.resources = resources
-        self.start_task_id = 0
         self.done = False
         self.current_task = None
         
-        # Additional state information could be added here
+        # Additional state tracking
         self.resource_usage = {r: 0 for r in resources}
         self.total_cost = 0
         self.total_delay = 0
-        
-        # Enhanced tracking
         self.step_count = 0
         self.history = []
+        self.max_steps = 50  # Prevent infinite loops
         
-        # Precompute transition probabilities for more realistic environment
+        # Compute transition probabilities for more realistic environment
         self._compute_transition_probabilities()
+        self._extract_time_statistics()
         
+        # Set terminal states - either provided or auto-detected
+        if terminal_states:
+            self.terminal_states = terminal_states
+        else:
+            self.terminal_states = self._auto_detect_terminal_tasks()
+        
+        # Configure reward weights based on strategy
+        self.weights = self._configure_reward_weights(weighting_strategy)
+    
+    def _configure_reward_weights(self, strategy):
+        """Configure reward component weights based on selected strategy"""
+        if strategy == "balanced":
+            return {
+                'cost': 0.2,
+                'resource': 0.2, 
+                'time': 0.2,
+                'conformance': 0.2,
+                'goal': 0.2
+            }
+        elif strategy == "time":
+            return {
+                'cost': 0.1,
+                'resource': 0.1, 
+                'time': 0.5,  # Emphasize time efficiency
+                'conformance': 0.2,
+                'goal': 0.1
+            }
+        elif strategy == "conformance":
+            return {
+                'cost': 0.1,
+                'resource': 0.1, 
+                'time': 0.1,
+                'conformance': 0.6,  # Emphasize following common patterns
+                'goal': 0.1
+            }
+        else:
+            # Custom weighting
+            return strategy if isinstance(strategy, dict) else self._configure_reward_weights("balanced")
+    
+    def _auto_detect_terminal_tasks(self):
+        """Auto-detect terminal tasks from data"""
+        # Count occurrences of tasks as next_task
+        task_counts = {}
+        for task in self.all_tasks:
+            # How often task appears as the next task
+            next_count = self.df[self.df['next_task'] == task].shape[0]
+            # How often task appears as current task
+            curr_count = self.df[self.df['task_id'] == task].shape[0]
+            
+            task_counts[task] = {
+                'next_count': next_count,
+                'curr_count': curr_count,
+                'ratio': next_count / max(1, curr_count)
+            }
+        
+        # Tasks rarely appearing as next_task are likely terminal
+        terminal_candidates = []
+        for task, counts in task_counts.items():
+            if counts['ratio'] < 0.2 and counts['curr_count'] > 5:
+                terminal_candidates.append(task)
+        
+        return terminal_candidates
+    
     def _compute_transition_probabilities(self):
-        """Calculate transition probabilities from data for more realistic simulation"""
-        print("\nComputing transition probabilities from data...")
+        """
+        Calculate transition probabilities from data for more realistic simulation
+        """
         self.transition_probs = {}
         
         # Prepare transitions dataframe
@@ -58,34 +133,75 @@ class ProcessEnv:
                 self.transition_probs[task_id] = next_tasks
             else:
                 self.transition_probs[task_id] = {}
-        
-        # Calculate task durations for each resource
+    
+    def _extract_time_statistics(self):
+        """Extract time statistics for tasks and resources"""
+        # Calculate average processing time for each task-resource pair
         self.task_durations = {}
-        for task_id in self.all_tasks:
-            self.task_durations[task_id] = {}
-            for resource in self.resources:
-                # In real implementation, would use actual durations from data
-                # For now, generate reasonable values
-                self.task_durations[task_id][resource] = random.uniform(0.5, 2.0)
         
-        print(f"Computed transition probabilities for {len(self.transition_probs)} tasks")
-        
+        # If timestamp data is available, use it to calculate durations
+        if all(col in self.df.columns for col in ['timestamp', 'next_timestamp']):
+            # Group by task and resource
+            time_stats = self.df.groupby(['task_id', 'resource_id']).apply(
+                lambda g: (g['next_timestamp'] - g['timestamp']).dt.total_seconds().mean()
+            ).reset_index(name='duration')
+            
+            # Convert to dictionary for fast lookup
+            for _, row in time_stats.iterrows():
+                task = int(row['task_id'])
+                resource = int(row['resource_id'])
+                
+                if task not in self.task_durations:
+                    self.task_durations[task] = {}
+                
+                self.task_durations[task][resource] = row['duration'] / 3600  # Convert to hours
+        else:
+            # No timestamp data, generate reasonable random values
+            for task in self.all_tasks:
+                self.task_durations[task] = {}
+                for resource in self.resources:
+                    # Generate random duration between 0.5 and 3 hours
+                    self.task_durations[task][resource] = np.random.uniform(0.5, 3.0)
+    
     def reset(self):
-        """Reset the environment to initial state"""
-        self.current_task = self.start_task_id
+        """Reset environment to initial state"""
+        # Randomly choose a starting task with higher probability for common start tasks
+        # Identify potential start tasks (those that don't often appear as next_task)
+        start_candidates = []
+        for task in self.all_tasks:
+            # Only consider tasks that appear in the data
+            task_count = self.df[self.df['task_id'] == task].shape[0]
+            if task_count > 0:
+                # Check ratio of appearances as next_task vs. current task
+                next_count = self.df[self.df['next_task'] == task].shape[0]
+                ratio = next_count / task_count
+                
+                # Tasks with low ratio are likely start tasks
+                if ratio < 0.5:
+                    weight = 1.0 - ratio  # Higher weight for tasks that rarely appear as next_task
+                    start_candidates.append((task, weight))
+        
+        # If no candidates found, use all tasks
+        if not start_candidates:
+            start_candidates = [(task, 1.0) for task in self.all_tasks]
+        
+        # Choose starting task based on weights
+        tasks, weights = zip(*start_candidates)
+        normalized_weights = np.array(weights) / sum(weights)
+        self.current_task = np.random.choice(tasks, p=normalized_weights)
+        
+        # Reset state
         self.done = False
         self.resource_usage = {r: 0 for r in self.resources}
         self.total_cost = 0
         self.total_delay = 0
         self.step_count = 0
         self.history = []
+        
         return self._get_state()
     
     def _get_state(self):
-        """
-        Get current state representation
-        Enhanced with resource availability
-        """
+        """Get current state representation"""
         state_vec = np.zeros(len(self.all_tasks) + len(self.resources), dtype=np.float32)
         
         # One-hot encoding of current task
@@ -100,47 +216,29 @@ class ProcessEnv:
     
     def step(self, action):
         """
-        Take a step in the environment with enhanced feedback
-        action = (next_activity_id, resource_id)
-        Returns: (next_state, reward, done, info)
+        Take a step in the environment with enhanced reward calculation
+        
+        Args:
+            action: Tuple of (next_activity_id, resource_id)
+            
+        Returns:
+            Tuple of (next_state, reward, done, info)
         """
         next_task, resource = action
         self.step_count += 1
         
-        # Check if next_task is valid based on transition probabilities
+        # Check if resource is valid
+        if resource not in self.resources:
+            return self._get_state(), -100.0, True, {"error": "Invalid resource"}
+        
+        # Check if next_task is valid
         if next_task not in self.all_tasks:
-            # Invalid task
-            reward = -100.0
-            self.done = True
-            return self._get_state(), reward, self.done, {"error": "Invalid task"}
+            return self._get_state(), -100.0, True, {"error": "Invalid task"}
         
-        # Check if transition is possible with reasonable probability
-        if self.current_task in self.transition_probs:
-            task_probs = self.transition_probs[self.current_task]
-            transition_prob = task_probs.get(next_task, 0)
-            
-            if transition_prob < 0.01:  # Less than 1% probability
-                # Highly unlikely transition
-                reward = -50.0 * (0.01 - transition_prob) / 0.01  # Scale penalty by improbability
-                self.done = False  # Don't terminate but penalize
-                info = {"warning": f"Unlikely transition ({transition_prob:.4f} probability)"}
-                
-                # We still execute the action but with a penalty
-            else:
-                # Valid transition
-                info = {"transition_probability": transition_prob}
-        else:
-            # No data for current task
-            info = {"warning": "No transition data for current task"}
-        
-        # Compute costs and delays more realistically
-        transition_cost = self._compute_transition_cost(self.current_task, next_task)
-        processing_delay = self._compute_processing_delay(next_task, resource)
-        resource_efficiency = self._compute_resource_efficiency(resource)
+        # Calculate reward components
+        reward, reward_components = self._compute_reward(self.current_task, next_task, resource)
         
         # Update internal state
-        self.total_cost += transition_cost
-        self.total_delay += processing_delay
         self.resource_usage[resource] += 1
         
         # Track history
@@ -149,115 +247,180 @@ class ProcessEnv:
             "from_task": self.current_task,
             "to_task": next_task,
             "resource": resource,
-            "cost": transition_cost,
-            "delay": processing_delay,
-            "efficiency": resource_efficiency
+            "reward": reward,
+            "reward_components": reward_components
         })
-        
-        # Compute reward components
-        cost_penalty = -transition_cost
-        delay_penalty = -processing_delay
-        efficiency_bonus = resource_efficiency
-        
-        # Combined reward
-        reward = cost_penalty + delay_penalty + efficiency_bonus
         
         # Move to next state
         self.current_task = next_task
         
-        # Check if process should terminate
+        # Check termination conditions
         if self._should_terminate():
             self.done = True
-            # Add completion bonus for successful termination
+            # Add completion bonus
             reward += 20.0
-        elif self.step_count >= 20:
-            # Limit maximum steps to prevent infinite loops
+        elif self.step_count >= self.max_steps:
+            # Limit steps to prevent infinite loops
             self.done = True
             reward -= 10.0  # Penalty for excessive length
-            info["warning"] = "Maximum steps reached"
         
-        info.update({
-            'transition_cost': transition_cost,
-            'processing_delay': processing_delay,
-            'resource_efficiency': resource_efficiency,
-            'step_count': self.step_count
-        })
+        # Prepare info dict
+        info = {
+            'reward_components': reward_components,
+            'step_count': self.step_count,
+        }
+        
+        if self.done:
+            info['episode_length'] = self.step_count
+            info['total_reward'] = sum(h['reward'] for h in self.history)
         
         return self._get_state(), reward, self.done, info
     
-    def _compute_transition_cost(self, current_task, next_task):
+    def _compute_reward(self, current_task, next_task, resource):
         """
-        Compute cost of transitioning between tasks
-        Enhanced with data-based costs
-        """
-        # In a real implementation, would use historical data
-        # For now, use a simple model based on task difference
-        base_cost = abs(next_task - current_task) * 0.5
+        Comprehensive reward function with multiple components
         
-        # Add random variation
-        variation = random.uniform(0.8, 1.2)
-        
-        return base_cost * variation
-    
-    def _compute_processing_delay(self, task, resource):
+        Args:
+            current_task: Current task ID
+            next_task: Next task ID
+            resource: Resource ID to use
+            
+        Returns:
+            Tuple of (total_reward, component_dict)
         """
-        Compute processing delay for task-resource pair
-        Enhanced with learned patterns
-        """
-        # Use pre-computed durations if available
-        if task in self.task_durations and resource in self.task_durations[task]:
-            base_delay = self.task_durations[task][resource]
+        # 1. Transition cost - penalize unlikely transitions
+        if current_task in self.transition_probs:
+            probs = self.transition_probs[current_task]
+            transition_prob = probs.get(next_task, 0)
+            if transition_prob > 0:
+                # Normalize to 0-1 scale: higher probability = lower cost
+                transition_cost = 1.0 - transition_prob
+            else:
+                # Very high cost for transitions not seen in data
+                transition_cost = 5.0
         else:
-            base_delay = random.uniform(0.5, 2.0)
+            # No data for current task
+            transition_cost = 2.0
         
-        # Factor in resource utilization
-        resource_factor = 1.0 + (self.resource_usage[resource] * 0.1)
+        # 2. Time efficiency - reward efficient resource assignment
+        if next_task in self.task_durations and resource in self.task_durations[next_task]:
+            # Get expected time for this task-resource pair
+            time_value = self.task_durations[next_task][resource]
+            
+            # Find best and worst times for this task
+            all_times = [self.task_durations[next_task][r] for r in self.task_durations[next_task]
+                        if r in self.resources]
+            
+            if all_times:
+                best_time = min(all_times)
+                worst_time = max(all_times)
+                
+                # Calculate time efficiency: 1 = best, 0 = worst
+                time_range = max(0.1, worst_time - best_time)  # Avoid division by zero
+                time_efficiency = 1.0 - ((time_value - best_time) / time_range)
+            else:
+                time_efficiency = 0.5  # Neutral if no data
+        else:
+            time_efficiency = 0.5  # Neutral if no data
         
-        # Add random variation
-        variation = random.uniform(0.9, 1.1)
-        
-        return base_delay * resource_factor * variation
-    
-    def _compute_resource_efficiency(self, resource):
-        """
-        Compute resource utilization efficiency
-        Enhanced with more realistic model
-        """
+        # 3. Resource efficiency - prefer balanced resource utilization
         total_usage = sum(self.resource_usage.values())
-        if total_usage == 0:
-            return 1.0
         
-        current_usage = self.resource_usage[resource]
-        expected_usage = total_usage / len(self.resources)
-        
-        # Calculate efficiency - higher when closer to balanced utilization
-        if current_usage <= expected_usage:
-            efficiency = 1.0
+        if total_usage > 0:
+            # Expected usage per resource
+            expected_usage = total_usage / len(self.resources)
+            current_usage = self.resource_usage[resource]
+            
+            # Penalize overutilization more than underutilization
+            if current_usage <= expected_usage:
+                # Underutilized - good to assign
+                resource_efficiency = 1.0
+            else:
+                # Overutilized - penalize but allow use
+                overuse_ratio = (current_usage - expected_usage) / max(1, expected_usage)
+                resource_efficiency = max(0.0, 1.0 - (overuse_ratio * 0.5))
         else:
-            # Diminishing efficiency with overutilization
-            overuse_ratio = (current_usage - expected_usage) / expected_usage
-            efficiency = max(0.0, 1.0 - (overuse_ratio * 0.5))
+            # First step, all resources equal
+            resource_efficiency = 1.0
         
-        return efficiency
+        # 4. Conformance - reward following common patterns
+        conformance = 0.0
+        if current_task in self.transition_probs:
+            # Higher reward for common transitions
+            conformance = self.transition_probs[current_task].get(next_task, 0) * 2.0
+        
+        # 5. Goal orientation - reward progression toward terminal states
+        goal_reward = 0.0
+        if next_task in self.terminal_states:
+            goal_reward = 2.0  # Strong reward for reaching terminal state
+        elif self._is_closer_to_terminal(next_task):
+            goal_reward = 1.0  # Moderate reward for moving toward terminal states
+        
+        # Apply weights to components
+        weighted_components = {
+            'transition_cost': -transition_cost * self.weights['cost'],
+            'time_efficiency': time_efficiency * self.weights['time'] * 2.0,  # Scale up for balance
+            'resource_efficiency': resource_efficiency * self.weights['resource'],
+            'conformance': conformance * self.weights['conformance'],
+            'goal_reward': goal_reward * self.weights['goal']
+        }
+        
+        # Calculate total reward
+        total_reward = sum(weighted_components.values())
+        
+        # Return total and components for analysis
+        return total_reward, weighted_components
+    
+    def _is_closer_to_terminal(self, task):
+        """
+        Determine if a task is closer to terminal states based on transition probabilities
+        
+        Args:
+            task: Task ID to check
+            
+        Returns:
+            True if task is likely to lead to terminal state soon
+        """
+        if task in self.terminal_states:
+            return True
+            
+        # Look at transition probabilities to see how likely it leads to terminal states
+        if task in self.transition_probs:
+            probs = self.transition_probs[task]
+            
+            # Check direct transitions to terminal states
+            terminal_prob = sum(probs.get(term, 0) for term in self.terminal_states)
+            
+            # High probability of direct transition to terminal
+            if terminal_prob > 0.3:
+                return True
+        
+        return False
     
     def _should_terminate(self):
         """
         Determine if the process should terminate
-        Enhanced with data-based termination probability
+        
+        Returns:
+            True if process should terminate
         """
-        # Probability increases with step count
-        base_prob = 0.05 + (self.step_count * 0.01)
+        # Terminate if we've reached a terminal state
+        if self.current_task in self.terminal_states:
+            return True
         
-        # Certain tasks are more likely to be terminal
+        # Probability increases with step count for organic endings
+        base_prob = 0.05 + (self.step_count * 0.02)
+        
+        # Higher probability of termination if current task has few outgoing transitions
         if self.current_task in self.transition_probs:
-            # Check if this task often has no further transitions
-            task_probs = self.transition_probs[self.current_task]
-            if not task_probs or sum(task_probs.values()) < 0.5:
-                # Often a terminal task
-                base_prob += 0.3
+            # Few outgoing transitions suggest terminal-like behavior
+            num_transitions = len(self.transition_probs[self.current_task])
+            if num_transitions <= 2:
+                base_prob += 0.2
+            elif num_transitions <= 4:
+                base_prob += 0.1
         
-        return random.random() < min(0.5, base_prob)
-
+        return random.random() < min(0.7, base_prob)  # Cap at 70% to avoid too quick termination
 
 def run_q_learning(env, episodes=30, alpha=0.1, gamma=0.9, epsilon=0.1, viz_dir=None, policy_dir=None):
     """

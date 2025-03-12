@@ -241,18 +241,19 @@ class NextActivityLSTM(BaseModel):
         # Process padded batch
         return self.forward(padded, seq_lengths)
     
+    # processmine/models/sequence/lstm.py (UPDATED METHOD)
+
     def _process_graph_data(self, data):
         """
-        Process PyG Data by extracting case-level sequences
+        Process PyG Data by extracting case-level sequences with proper feature handling
         
         Args:
-            data: PyG Data object
-            
+            data: PyG Data object with batch information
+                
         Returns:
             Output logits [batch_size, num_classes]
         """
-        # Extract features and batch assignments
-        x = data.x
+        # Extract batch information
         batch = data.batch
         
         # Get unique batch indices (cases)
@@ -263,19 +264,57 @@ class NextActivityLSTM(BaseModel):
         sequences = []
         seq_lengths = []
         
-        for b in unique_batches:
-            # Get nodes for this case
-            mask = (batch == b)
-            case_nodes = x[mask]
+        # Check if data has feature names for better feature selection
+        feature_indices = {}
+        if hasattr(data, 'feature_names') and len(data.feature_names) > 0:
+            # Find indices of useful features by name pattern
+            for i, name in enumerate(data.feature_names):
+                if 'task' in name.lower():
+                    feature_indices['task'] = i
+                elif 'resource' in name.lower():
+                    feature_indices['resource'] = i
+                elif 'time' in name.lower() or 'timestamp' in name.lower():
+                    feature_indices['time'] = i
             
-            # Extract task IDs assuming they're in the first column
-            # This is a simplification - in practice, you'd extract the right feature
+            # Default to first column if no task feature found
+            if 'task' not in feature_indices:
+                feature_indices['task'] = 0
+        
+        # Process each case
+        for b in unique_batches:
+            # Get nodes for this case in order
+            mask = (batch == b)
+            case_idx = torch.where(mask)[0]
+            
+            # Check if position information is available
+            # PyG doesn't guarantee node order within a graph, so we try to reconstruct it
+            if hasattr(data, 'pos'):
+                # Sort nodes by position if available
+                pos = data.pos[mask]
+                # Sort by sequence position
+                sorted_order = torch.argsort(pos.view(-1))
+                case_idx = case_idx[sorted_order]
+            
+            # Get case nodes in proper order
+            case_nodes = data.x[case_idx]
+            
+            # Extract task IDs using the appropriate feature
             if case_nodes.size(1) > 1:
-                # Multi-feature node - first feature is usually task ID
-                task_ids = case_nodes[:, 0].long()
+                # Multi-feature nodes
+                if feature_indices:
+                    # Use identified task feature
+                    task_feature_idx = feature_indices['task']
+                else:
+                    # Assume first dimension contains task ID
+                    task_feature_idx = 0
+                    
+                task_ids = case_nodes[:, task_feature_idx].long()
             else:
-                # Single feature node
-                task_ids = case_nodes.long()
+                # Single feature node - use directly
+                task_ids = case_nodes.squeeze(-1).long()
+            
+            # Handle possible negative or out-of-range IDs
+            task_ids = torch.clamp(task_ids, min=0, max=self.num_cls-1)
             
             # Store sequence and length
             sequences.append(task_ids)

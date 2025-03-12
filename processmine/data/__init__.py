@@ -8,7 +8,7 @@ from processmine.data.loader import (
     create_data_loader
 )
 
-from processmine.data.graph_builder import (
+from processmine.data.graphs import (
     build_graph_data,
     build_heterogeneous_graph
 )

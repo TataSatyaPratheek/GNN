@@ -330,8 +330,12 @@ def train_model(
         val_metrics = {}
         
         if val_loader is not None and (epoch % eval_every == 0 or epoch == epochs):
-            val_loss, val_metrics = _evaluate_during_training(
-                model, val_loader, criterion, device, memory_efficient, mem_tracker
+            val_loss, val_metrics = evaluate_model(
+                model, val_loader, 
+                criterion, device, 
+                memory_efficient=memory_efficient, 
+                detailed=False,
+                is_during_training=True
             )
             
             # Update validation metrics history
@@ -639,27 +643,35 @@ def _get_progress_bar(iterable, desc, total=None):
         print(f"{desc}...")
         return iterable
 
+# processmine/core/training.py (UPDATED FUNCTION)
+
 def evaluate_model(
     model: torch.nn.Module,
-    test_loader: Any,
+    data_loader: Any,
     device: Optional[torch.device] = None,
     criterion: Optional[Any] = None,
     detailed: bool = True,
-    memory_efficient: bool = True
-) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray]:
+    memory_efficient: bool = True,
+    is_during_training: bool = False  # New parameter to handle training evaluation
+) -> Union[Tuple[Dict[str, Any], np.ndarray, np.ndarray], Tuple[float, Dict[str, Any]]]:
     """
-    Evaluate model on test data with memory optimization
+    Evaluate model on test data with memory optimization.
+    Unified function for both standalone evaluation and during-training evaluation.
     
     Args:
         model: PyTorch model to evaluate
-        test_loader: Test data loader
+        data_loader: Test data loader
         device: Computing device
         criterion: Loss function (optional)
         detailed: Whether to compute detailed metrics
         memory_efficient: Whether to use memory-efficient evaluation
+        is_during_training: Whether this is being called during training
         
     Returns:
-        Tuple of (metrics_dict, predictions, true_labels)
+        If is_during_training=False:
+            Tuple of (metrics_dict, predictions, true_labels)
+        If is_during_training=True:
+            Tuple of (validation_loss, metrics_dict)
     """
     # Set up device
     if device is None:
@@ -682,7 +694,7 @@ def evaluate_model(
         clear_memory()
     
     # Get progress bar
-    progress_bar = _get_progress_bar(test_loader, "Evaluating")
+    progress_bar = _get_progress_bar(data_loader, "Evaluating")
     
     # Evaluate without gradient tracking
     with torch.no_grad():
@@ -726,7 +738,7 @@ def evaluate_model(
                 del outputs
                 if criterion is not None:
                     del loss
-            
+    
     # Convert to numpy arrays
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
@@ -736,20 +748,26 @@ def evaluate_model(
     
     # Add loss if calculated
     if test_loss is not None:
-        metrics['test_loss'] = test_loss / max(test_samples, 1) if test_samples > 0 else 0.0
+        avg_test_loss = test_loss / max(test_samples, 1) if test_samples > 0 else 0.0
+        metrics['test_loss'] = avg_test_loss
     
-    # Log summary of results
-    logger.info(f"Evaluation results:")
-    logger.info(f"  Accuracy: {metrics['accuracy']:.4f}")
-    logger.info(f"  F1 (weighted): {metrics['f1_weighted']:.4f}")
-    if 'mcc' in metrics:
-        logger.info(f"  MCC: {metrics['mcc']:.4f}")
+    # Log summary of results if not during training
+    if not is_during_training:
+        logger.info(f"Evaluation results:")
+        logger.info(f"  Accuracy: {metrics['accuracy']:.4f}")
+        logger.info(f"  F1 (weighted): {metrics['f1_weighted']:.4f}")
+        if 'mcc' in metrics:
+            logger.info(f"  MCC: {metrics['mcc']:.4f}")
     
     # Final memory cleanup
     if memory_efficient and torch.cuda.is_available():
         clear_memory(full_clear=True)
     
-    return metrics, all_preds, all_labels
+    # Return different output formats based on context
+    if is_during_training:
+        return avg_test_loss if 'test_loss' in metrics else 0.0, metrics
+    else:
+        return metrics, all_preds, all_labels
 
 def _calculate_metrics(true_labels, predictions, detailed=True):
     """Calculate performance metrics with proper handling of edge cases"""
