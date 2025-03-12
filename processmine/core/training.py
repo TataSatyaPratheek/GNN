@@ -1,13 +1,86 @@
-# core/training.py
+"""
+Memory-optimized training utilities with efficient CUDA management, batching strategies, 
+and mixed precision training.
+"""
 import torch
 import time
 import logging
 import numpy as np
 from tqdm import tqdm
-from typing import Dict, Any, Optional, Union, Tuple, Callable
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+import gc
+from typing import Dict, Any, Optional, Union, Tuple, Callable, List
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, matthews_corrcoef
 
 logger = logging.getLogger(__name__)
+
+class MemoryTracker:
+    """Utility class to track memory usage during training"""
+    
+    def __init__(self, logging_interval: int = 5, device: Optional[torch.device] = None):
+        """
+        Initialize memory tracker
+        
+        Args:
+            logging_interval: How often to log memory usage (in iterations)
+            device: Torch device to track
+        """
+        self.logging_interval = logging_interval
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.is_cuda = self.device.type == 'cuda'
+        self.current_step = 0
+        self.peak_memory = 0
+        self.history = []
+    
+    def step(self, manual_log: bool = False):
+        """
+        Track memory for current step
+        
+        Args:
+            manual_log: Whether to force logging regardless of interval
+        """
+        self.current_step += 1
+        
+        if self.is_cuda:
+            current = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
+            peak = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
+            self.peak_memory = max(self.peak_memory, peak)
+            
+            self.history.append(current)
+            
+            if manual_log or (self.current_step % self.logging_interval == 0):
+                logger.debug(f"Step {self.current_step}: {current:.1f} MB, Peak: {peak:.1f} MB")
+    
+    def reset_peak(self):
+        """Reset peak memory stats"""
+        if self.is_cuda:
+            torch.cuda.reset_peak_memory_stats(self.device)
+    
+    def summary(self):
+        """Print memory usage summary"""
+        if self.is_cuda:
+            current = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
+            peak = self.peak_memory
+            logger.info(f"Memory usage - Current: {current:.1f} MB, Peak: {peak:.1f} MB")
+            return {"current_mb": current, "peak_mb": peak}
+        return {"current_mb": 0, "peak_mb": 0}
+
+def clear_memory(full_clear: bool = False):
+    """
+    Clear memory caches and unused objects
+    
+    Args:
+        full_clear: Whether to perform a more aggressive memory clearing
+    """
+    # Python garbage collection
+    gc.collect()
+    
+    # PyTorch CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
+        if full_clear:
+            # Force synchronization
+            torch.cuda.synchronize()
 
 def train_model(
     model: torch.nn.Module,
@@ -20,10 +93,14 @@ def train_model(
     patience: int = 5,
     model_path: Optional[str] = None,
     callback: Optional[Callable] = None,
-    use_amp: bool = False
+    use_amp: bool = False,
+    clip_grad_norm: Optional[float] = None,
+    lr_scheduler: Optional[Any] = None,
+    memory_efficient: bool = True,
+    track_memory: bool = False
 ) -> Tuple[torch.nn.Module, Dict[str, Any]]:
     """
-    Unified training function for all model types
+    Unified training function with memory optimization, mixed precision, and advanced features
     
     Args:
         model: PyTorch model to train
@@ -37,6 +114,10 @@ def train_model(
         model_path: Path to save best model
         callback: Optional callback function after each epoch
         use_amp: Whether to use automatic mixed precision
+        clip_grad_norm: Max norm for gradient clipping (None to disable)
+        lr_scheduler: Learning rate scheduler (None to disable)
+        memory_efficient: Whether to use memory-efficient training
+        track_memory: Whether to track memory usage
         
     Returns:
         Tuple of (trained model, training metrics)
@@ -44,6 +125,9 @@ def train_model(
     # Set up device
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Memory tracker
+    mem_tracker = MemoryTracker() if track_memory else None
     
     # Move model to device
     model = model.to(device)
@@ -69,6 +153,7 @@ def train_model(
     metrics_history = {
         'train_loss': [],
         'val_loss': [],
+        'learning_rates': [],
         'epoch_times': []
     }
     best_model_state = None
@@ -85,7 +170,11 @@ def train_model(
         # Progress bar for training
         train_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Train]")
         
-        for batch in train_bar:
+        # Clear memory before epoch
+        if memory_efficient:
+            clear_memory()
+        
+        for batch_idx, batch in enumerate(train_bar):
             # Move batch to device
             batch = batch.to(device)
             
@@ -100,6 +189,13 @@ def train_model(
                 
                 # Backward pass with gradient scaling
                 scaler.scale(loss).backward()
+                
+                # Gradient clipping if enabled
+                if clip_grad_norm is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+                
+                # Optimizer step with scaler
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -107,6 +203,11 @@ def train_model(
                 outputs = model(batch)
                 loss = _compute_loss(outputs, batch, criterion)
                 loss.backward()
+                
+                # Gradient clipping if enabled
+                if clip_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+                
                 optimizer.step()
             
             # Track loss
@@ -116,10 +217,39 @@ def train_model(
             
             # Update progress bar
             train_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+            
+            # Memory tracking
+            if mem_tracker is not None:
+                mem_tracker.step(batch_idx % 50 == 0)  # Log every 50 batches
+            
+            # Aggressive memory clearing for very large models
+            if memory_efficient and batch_idx % 50 == 0:
+                # Clear unnecessary memory
+                del loss, outputs
+                if torch.cuda.is_available():
+                    # Don't empty cache too often as it can slow down training
+                    if batch_idx % 200 == 0:
+                        torch.cuda.empty_cache()
         
         # Calculate average training loss
         avg_train_loss = train_loss / max(train_samples, 1)
         metrics_history['train_loss'].append(avg_train_loss)
+        
+        # Update learning rate scheduler if provided
+        if lr_scheduler is not None:
+            current_lr = optimizer.param_groups[0]['lr']
+            metrics_history['learning_rates'].append(current_lr)
+            
+            if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                # This type needs validation loss
+                if val_loader is not None:
+                    # Will update after validation
+                    pass
+                else:
+                    lr_scheduler.step(avg_train_loss)
+            else:
+                # Other schedulers update per epoch
+                lr_scheduler.step()
         
         # Validation phase (if validation loader provided)
         val_loss = 0.0
@@ -127,6 +257,11 @@ def train_model(
         
         if val_loader is not None:
             model.eval()
+            
+            # Clear memory before validation
+            if memory_efficient:
+                clear_memory()
+            
             val_bar = tqdm(val_loader, desc=f"Epoch {epoch}/{epochs} [Valid]")
             
             with torch.no_grad():
@@ -147,13 +282,21 @@ def train_model(
             avg_val_loss = val_loss / max(val_samples, 1)
             metrics_history['val_loss'].append(avg_val_loss)
             
+            # Update learning rate scheduler if it's ReduceLROnPlateau
+            if lr_scheduler is not None and isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                lr_scheduler.step(avg_val_loss)
+            
             # Early stopping check
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 patience_counter = 0
                 
                 # Save best model state
-                best_model_state = {key: value.cpu().clone() for key, value in model.state_dict().items()}
+                # Use memory-efficient copy to CPU
+                best_model_state = {
+                    key: value.cpu().clone() 
+                    for key, value in model.state_dict().items()
+                }
                 
                 # Save to disk if path provided
                 if model_path:
@@ -179,6 +322,10 @@ def train_model(
             logger.info(f"Epoch {epoch}/{epochs}: train_loss={avg_train_loss:.4f}, "
                        f"time={epoch_time:.2f}s")
         
+        # Memory usage summary
+        if mem_tracker is not None:
+            mem_tracker.summary()
+        
         # Call callback if provided
         if callback is not None:
             callback(epoch=epoch, model=model, train_loss=avg_train_loss,
@@ -188,6 +335,14 @@ def train_model(
     if val_loader is not None and best_model_state is not None:
         model.load_state_dict(best_model_state)
         logger.info("Restored best model state")
+    
+    # Final memory cleanup
+    if memory_efficient:
+        clear_memory(full_clear=True)
+    
+    # Add memory tracking data if available
+    if mem_tracker is not None:
+        metrics_history['memory'] = mem_tracker.summary()
     
     # Return model and metrics
     return model, metrics_history
@@ -203,26 +358,9 @@ def _compute_loss(outputs, batch, criterion):
             # Get predictions and targets
             preds = outputs["task_pred"]
             
-            # Handle PyG batch targets
+            # Get graph-level targets efficiently
             if hasattr(batch, 'batch') and hasattr(batch, 'y'):
-                from torch_geometric.nn import global_mean_pool
-                # Get graph-level targets (assuming first node's target per graph)
-                node_targets = batch.y
-                graph_indices = batch.batch
-                unique_graphs = torch.unique(graph_indices)
-                targets = []
-                
-                for g in unique_graphs:
-                    graph_mask = (graph_indices == g)
-                    graph_targets = node_targets[graph_mask]
-                    # Use most common target (mode) for the graph
-                    if len(graph_targets) > 0:
-                        values, counts = torch.unique(graph_targets, return_counts=True)
-                        targets.append(values[torch.argmax(counts)])
-                    else:
-                        targets.append(torch.tensor(0, device=node_targets.device))
-                
-                targets = torch.stack(targets)
+                targets = _get_graph_targets(batch.y, batch.batch)
             else:
                 targets = batch.y
             
@@ -231,7 +369,7 @@ def _compute_loss(outputs, batch, criterion):
             
             # Add diversity loss if available
             if "diversity_loss" in outputs:
-                return task_loss + outputs["diversity_loss"]
+                return task_loss + outputs["diversity_loss"] * outputs.get("diversity_weight", 0.1)
             
             return task_loss
     
@@ -239,23 +377,7 @@ def _compute_loss(outputs, batch, criterion):
     elif isinstance(outputs, tuple) and len(outputs) == 2:
         preds, aux_loss = outputs
         if hasattr(batch, 'batch') and hasattr(batch, 'y'):
-            from torch_geometric.nn import global_mean_pool
-            # Same graph-level target extraction as above
-            node_targets = batch.y
-            graph_indices = batch.batch
-            unique_graphs = torch.unique(graph_indices)
-            targets = []
-            
-            for g in unique_graphs:
-                graph_mask = (graph_indices == g)
-                graph_targets = node_targets[graph_mask]
-                if len(graph_targets) > 0:
-                    values, counts = torch.unique(graph_targets, return_counts=True)
-                    targets.append(values[torch.argmax(counts)])
-                else:
-                    targets.append(torch.tensor(0, device=node_targets.device))
-            
-            targets = torch.stack(targets)
+            targets = _get_graph_targets(batch.y, batch.batch)
         else:
             targets = batch.y
         
@@ -264,34 +386,52 @@ def _compute_loss(outputs, batch, criterion):
     # Standard case (direct output tensor)
     else:
         if hasattr(batch, 'batch') and hasattr(batch, 'y'):
-            # Same graph-level target extraction
-            node_targets = batch.y
-            graph_indices = batch.batch
-            unique_graphs = torch.unique(graph_indices)
-            targets = []
-            
-            for g in unique_graphs:
-                graph_mask = (graph_indices == g)
-                graph_targets = node_targets[graph_mask]
-                if len(graph_targets) > 0:
-                    values, counts = torch.unique(graph_targets, return_counts=True)
-                    targets.append(values[torch.argmax(counts)])
-                else:
-                    targets.append(torch.tensor(0, device=node_targets.device))
-            
-            targets = torch.stack(targets)
+            targets = _get_graph_targets(batch.y, batch.batch)
         else:
             targets = batch.y
         
         return criterion(outputs, targets)
 
+def _get_graph_targets(node_targets, batch_indices):
+    """
+    Extract graph-level targets from node-level targets efficiently
+    
+    Args:
+        node_targets: Node-level targets
+        batch_indices: Batch assignment indices
+        
+    Returns:
+        Graph-level targets
+    """
+    # Get unique graphs
+    unique_graphs = torch.unique(batch_indices)
+    graph_targets = []
+    
+    # Extract most common target for each graph
+    for g in unique_graphs:
+        # Get targets for this graph
+        graph_mask = (batch_indices == g)
+        graph_node_targets = node_targets[graph_mask]
+        
+        # Find most common target (mode)
+        if len(graph_node_targets) > 0:
+            values, counts = torch.unique(graph_node_targets, return_counts=True)
+            mode_idx = torch.argmax(counts)
+            graph_targets.append(values[mode_idx])
+        else:
+            # Fallback if no targets (should not happen)
+            graph_targets.append(torch.tensor(0, device=node_targets.device))
+    
+    # Convert to tensor
+    return torch.stack(graph_targets)
+
 def _get_batch_size(batch):
     """Extract batch size from different batch formats"""
     if hasattr(batch, 'batch'):
-        # PyG batch
+        # PyG batch - use unique batch indices
         return torch.unique(batch.batch).size(0)
     elif hasattr(batch, 'size') and isinstance(batch.size(), tuple):
-        # Regular tensor batch
+        # Regular tensor batch - use first dimension
         return batch.size(0)
     else:
         # Fallback
@@ -300,15 +440,19 @@ def _get_batch_size(batch):
 def evaluate_model(
     model: torch.nn.Module,
     test_loader: Any,
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
+    criterion: Optional[Any] = None,
+    detailed: bool = True
 ) -> Dict[str, Any]:
     """
-    Evaluate model on test data
+    Evaluate model on test data with expanded metrics
     
     Args:
         model: PyTorch model to evaluate
         test_loader: Test data loader
         device: Computing device
+        criterion: Loss function (optional)
+        detailed: Whether to compute detailed metrics
         
     Returns:
         Dictionary of evaluation metrics
@@ -326,12 +470,18 @@ def evaluate_model(
     # Initialize result arrays
     all_preds = []
     all_labels = []
+    test_loss = 0.0 if criterion is not None else None
     
     # Evaluate without gradient tracking
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating"):
             batch = batch.to(device)
             outputs = model(batch)
+            
+            # Calculate loss if criterion provided
+            if criterion is not None:
+                loss = _compute_loss(outputs, batch, criterion)
+                test_loss += loss.item() * _get_batch_size(batch)
             
             # Extract predictions
             if isinstance(outputs, dict):
@@ -342,23 +492,9 @@ def evaluate_model(
             # Get predicted classes
             _, preds = torch.max(outputs, dim=1)
             
-            # Get targets (same as in _compute_loss)
+            # Get targets
             if hasattr(batch, 'batch') and hasattr(batch, 'y'):
-                node_targets = batch.y
-                graph_indices = batch.batch
-                unique_graphs = torch.unique(graph_indices)
-                targets = []
-                
-                for g in unique_graphs:
-                    graph_mask = (graph_indices == g)
-                    graph_targets = node_targets[graph_mask]
-                    if len(graph_targets) > 0:
-                        values, counts = torch.unique(graph_targets, return_counts=True)
-                        targets.append(values[torch.argmax(counts)])
-                    else:
-                        targets.append(torch.tensor(0, device=node_targets.device))
-                
-                targets = torch.stack(targets)
+                targets = _get_graph_targets(batch.y, batch.batch)
             else:
                 targets = batch.y
             
@@ -376,7 +512,337 @@ def evaluate_model(
         'f1_macro': f1_score(all_labels, all_preds, average='macro', zero_division=0),
         'f1_weighted': f1_score(all_labels, all_preds, average='weighted', zero_division=0),
         'precision': precision_score(all_labels, all_preds, average='macro', zero_division=0),
-        'recall': recall_score(all_labels, all_preds, average='macro', zero_division=0)
+        'recall': recall_score(all_labels, all_preds, average='macro', zero_division=0),
+        'mcc': matthews_corrcoef(all_labels, all_preds)
     }
     
-    return metrics
+    # Add loss if calculated
+    if test_loss is not None:
+        metrics['test_loss'] = test_loss / len(test_loader) if len(test_loader) > 0 else 0.0
+    
+    # Add class-wise metrics if detailed
+    if detailed:
+        # Class-wise F1, precision, and recall
+        unique_classes = np.unique(np.concatenate([all_labels, all_preds]))
+        class_metrics = {}
+        
+        for cls in unique_classes:
+            class_metrics[int(cls)] = {
+                'f1': f1_score(all_labels, all_preds, average=None, zero_division=0)[int(cls)],
+                'precision': precision_score(all_labels, all_preds, average=None, zero_division=0)[int(cls)],
+                'recall': recall_score(all_labels, all_preds, average=None, zero_division=0)[int(cls)]
+            }
+        
+        metrics['class_metrics'] = class_metrics
+        
+        # Confusion matrix
+        from sklearn.metrics import confusion_matrix
+        metrics['confusion_matrix'] = confusion_matrix(all_labels, all_preds).tolist()
+    
+    # Log summary of results
+    logger.info(f"Evaluation results:")
+    logger.info(f"  Accuracy: {metrics['accuracy']:.4f}")
+    logger.info(f"  F1 (weighted): {metrics['f1_weighted']:.4f}")
+    logger.info(f"  MCC: {metrics['mcc']:.4f}")
+    
+    return metrics, all_preds, all_labels
+
+def create_optimizer(
+    model: torch.nn.Module, 
+    optimizer_type: str = 'adamw',
+    lr: float = 0.001,
+    weight_decay: float = 5e-4,
+    momentum: float = 0.9,
+    layer_decay: Optional[float] = None
+) -> torch.optim.Optimizer:
+    """
+    Create optimizer with advanced options
+    
+    Args:
+        model: Model to optimize
+        optimizer_type: Type of optimizer ('adam', 'adamw', 'sgd', 'rmsprop')
+        lr: Learning rate
+        weight_decay: Weight decay factor
+        momentum: Momentum factor (SGD only)
+        layer_decay: Optional layer-wise learning rate decay factor
+        
+    Returns:
+        PyTorch optimizer
+    """
+    # Get model parameters
+    if layer_decay is not None:
+        # Group parameters by layer
+        params_with_decay = []
+        params_without_decay = []
+        
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            # Skip batch norm and bias terms for weight decay
+            if name.endswith('.bias') or 'norm' in name or 'bn' in name:
+                params_without_decay.append(param)
+            else:
+                params_with_decay.append(param)
+        
+        # Create optimizer with param groups
+        param_groups = [
+            {'params': params_with_decay, 'weight_decay': weight_decay},
+            {'params': params_without_decay, 'weight_decay': 0.0}
+        ]
+    else:
+        # Single param group
+        param_groups = model.parameters()
+    
+    # Create optimizer based on type
+    if optimizer_type.lower() == 'adam':
+        return torch.optim.Adam(param_groups, lr=lr, weight_decay=weight_decay)
+    elif optimizer_type.lower() == 'adamw':
+        return torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+    elif optimizer_type.lower() == 'sgd':
+        return torch.optim.SGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay)
+    elif optimizer_type.lower() == 'rmsprop':
+        return torch.optim.RMSprop(param_groups, lr=lr, weight_decay=weight_decay, momentum=momentum)
+    else:
+        raise ValueError(f"Unknown optimizer type: {optimizer_type}")
+
+def create_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    scheduler_type: str = 'cosine',
+    epochs: int = 100,
+    warmup_epochs: int = 5,
+    min_lr: float = 1e-6,
+    patience: int = 10,
+    factor: float = 0.1
+) -> torch.optim.lr_scheduler._LRScheduler:
+    """
+    Create learning rate scheduler with advanced options
+    
+    Args:
+        optimizer: Optimizer to schedule
+        scheduler_type: Type of scheduler ('cosine', 'step', 'plateau', 'linear', 'constant')
+        epochs: Total epochs
+        warmup_epochs: Epochs for linear warmup
+        min_lr: Minimum learning rate
+        patience: Patience for ReduceLROnPlateau
+        factor: Reduction factor for step and plateau schedulers
+        
+    Returns:
+        PyTorch learning rate scheduler
+    """
+    if scheduler_type == 'cosine':
+        # Cosine decay with warmup
+        if warmup_epochs > 0:
+            # Linear warmup followed by cosine decay
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, 
+                start_factor=0.1, 
+                end_factor=1.0, 
+                total_iters=warmup_epochs
+            )
+            
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=epochs - warmup_epochs,
+                eta_min=min_lr
+            )
+            
+            # Chain schedulers
+            return torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs]
+            )
+        else:
+            # Just cosine decay
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=epochs,
+                eta_min=min_lr
+            )
+    
+    elif scheduler_type == 'step':
+        # Step decay
+        step_size = max(epochs // 3, 1)  # Default: 3 steps over the training
+        return torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=step_size,
+            gamma=factor
+        )
+    
+    elif scheduler_type == 'plateau':
+        # Reduce on plateau
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=factor,
+            patience=patience,
+            min_lr=min_lr
+        )
+    
+    elif scheduler_type == 'linear':
+        # Linear decay
+        return torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=min_lr,
+            total_iters=epochs
+        )
+    
+    elif scheduler_type == 'constant':
+        # Constant LR
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lambda epoch: 1.0
+        )
+    
+    else:
+        raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+
+def compute_class_weights(df, num_classes, method='balanced'):
+    """
+    Compute class weights to handle imbalanced datasets
+    
+    Args:
+        df: Process data dataframe
+        num_classes: Number of classes
+        method: Weight calculation method ('balanced', 'log', 'sqrt')
+        
+    Returns:
+        Tensor of class weights
+    """
+    from sklearn.utils.class_weight import compute_class_weight
+    
+    # Extract labels
+    labels = df["next_task"].values
+    
+    # Get unique classes
+    unique_classes = np.unique(labels)
+    
+    # Create weight array (default to 1.0)
+    weights = np.ones(num_classes, dtype=np.float32)
+    
+    # Compute weights based on method
+    if method == 'balanced':
+        # Use sklearn's balanced method
+        class_weights = compute_class_weight('balanced', classes=unique_classes, y=labels)
+        weights[unique_classes] = class_weights
+    
+    elif method == 'log':
+        # Log-based weighting (less aggressive than balanced)
+        class_counts = np.bincount(labels, minlength=num_classes)
+        valid_counts = class_counts[class_counts > 0]
+        total = len(labels)
+        
+        # Log-based inverse weighting
+        for cls in unique_classes:
+            count = class_counts[cls]
+            weights[cls] = np.log(total / max(count, 1))
+        
+        # Normalize weights
+        weights = weights / np.min(weights[weights > 0])
+    
+    elif method == 'sqrt':
+        # Square root based weighting (even less aggressive)
+        class_counts = np.bincount(labels, minlength=num_classes)
+        total = len(labels)
+        
+        for cls in unique_classes:
+            count = class_counts[cls]
+            weights[cls] = np.sqrt(total / max(count, 1))
+        
+        # Normalize weights
+        weights = weights / np.min(weights[weights > 0])
+    
+    # Convert to tensor
+    return torch.tensor(weights, dtype=torch.float32)
+
+def setup_training(
+    model: torch.nn.Module,
+    df: pd.DataFrame,
+    batch_size: int = 32,
+    val_ratio: float = 0.2,
+    test_ratio: float = 0.1,
+    device: Optional[torch.device] = None,
+    seed: int = 42,
+    class_weight_method: str = 'balanced',
+    optimizer_type: str = 'adamw',
+    lr: float = 0.001,
+    weight_decay: float = 5e-4,
+    scheduler_type: str = 'cosine',
+    epochs: int = 100,
+    warmup_epochs: int = 5,
+    memory_efficient: bool = True
+) -> Dict[str, Any]:
+    """
+    Complete training setup with data split, model, optimizer, and loss function
+    
+    Args:
+        model: PyTorch model to train
+        df: Process data dataframe
+        batch_size: Batch size
+        val_ratio: Validation set ratio
+        test_ratio: Test set ratio
+        device: Computing device
+        seed: Random seed
+        class_weight_method: Method for class weight calculation
+        optimizer_type: Type of optimizer
+        lr: Learning rate
+        weight_decay: Weight decay factor
+        scheduler_type: Type of learning rate scheduler
+        epochs: Total epochs
+        warmup_epochs: Epochs for linear warmup
+        memory_efficient: Whether to use memory-efficient training
+        
+    Returns:
+        Dictionary with training setup
+    """
+    # Set random seed for reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    
+    # Set device
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Determine number of classes
+    num_classes = df["next_task"].nunique()
+    
+    # Compute class weights for handling imbalance
+    class_weights = compute_class_weights(df, num_classes, method=class_weight_method)
+    class_weights = class_weights.to(device)
+    
+    # Create criterion with class weights
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    
+    # Create optimizer
+    optimizer = create_optimizer(
+        model,
+        optimizer_type=optimizer_type,
+        lr=lr,
+        weight_decay=weight_decay
+    )
+    
+    # Create learning rate scheduler
+    lr_scheduler = create_lr_scheduler(
+        optimizer,
+        scheduler_type=scheduler_type,
+        epochs=epochs,
+        warmup_epochs=warmup_epochs
+    )
+    
+    # Return complete setup
+    return {
+        'model': model,
+        'device': device,
+        'criterion': criterion,
+        'optimizer': optimizer,
+        'lr_scheduler': lr_scheduler,
+        'class_weights': class_weights,
+        'num_classes': num_classes,
+        'memory_efficient': memory_efficient,
+        'batch_size': batch_size,
+        'epochs': epochs
+    }

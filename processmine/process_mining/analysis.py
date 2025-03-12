@@ -1,13 +1,25 @@
+"""
+Highly optimized process mining analysis utilities with vectorized operations
+"""
 import pandas as pd
 import numpy as np
 import time
 import logging
+import gc
 from typing import Dict, List, Tuple, Union, Optional, Any
 
 logger = logging.getLogger(__name__)
 
 def vectorize(func):
-    """Decorator for vectorized versions of analysis functions"""
+    """
+    Decorator that provides a vectorized implementation with fallback to standard
+    
+    Args:
+        func: Function to decorate
+        
+    Returns:
+        Decorated function with vectorization
+    """
     def wrapper(*args, **kwargs):
         # Check if vectorized version is enabled
         use_vectorized = kwargs.pop('vectorized', True)
@@ -30,7 +42,7 @@ def analyze_bottlenecks(df: pd.DataFrame,
                        percentile_threshold: float = 90.0,
                        vectorized: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Analyze process bottlenecks using vectorized operations
+    Analyze process bottlenecks using highly optimized vectorized operations
     
     Args:
         df: Process data dataframe
@@ -44,29 +56,32 @@ def analyze_bottlenecks(df: pd.DataFrame,
     start_time = time.time()
     logger.info("Analyzing process bottlenecks")
     
-    # Make a copy to avoid modifying the original
-    df_copy = df.copy()
+    # Add transitions in a single vectorized operation
+    # This avoids making a full copy of the dataframe
+    transitions = df[['case_id', 'task_id', 'timestamp']].copy()
+    transitions["next_task_id"] = transitions.groupby("case_id")["task_id"].shift(-1)
+    transitions["next_timestamp"] = transitions.groupby("case_id")["timestamp"].shift(-1)
     
-    # Add next_task_id and next_timestamp columns
-    df_copy["next_task_id"] = df_copy.groupby("case_id")["task_id"].shift(-1)
-    df_copy["next_timestamp"] = df_copy.groupby("case_id")["timestamp"].shift(-1)
+    # Filter transitions efficiently
+    transitions = transitions.dropna(subset=["next_task_id"])
     
-    # Filter transitions
-    transitions = df_copy.dropna(subset=["next_task_id"]).copy()
-    
-    # Compute wait times
+    # Vectorized computation of wait times
     transitions["wait_sec"] = (transitions["next_timestamp"] - transitions["timestamp"]).dt.total_seconds()
     
-    # Group and calculate statistics
+    # Group and calculate statistics in one operation
     bottleneck_stats = transitions.groupby(["task_id", "next_task_id"])["wait_sec"].agg([
         "count", "mean", "median", "std", "min", "max"
     ]).reset_index()
     
-    # Add derived metrics
+    # Convert task IDs to integers to avoid type issues
+    bottleneck_stats["task_id"] = bottleneck_stats["task_id"].astype(int)
+    bottleneck_stats["next_task_id"] = bottleneck_stats["next_task_id"].astype(int)
+    
+    # Add derived metrics vectorized
     bottleneck_stats["mean_hours"] = bottleneck_stats["mean"] / 3600.0
     bottleneck_stats["cv"] = bottleneck_stats["std"] / bottleneck_stats["mean"].clip(lower=1e-10)
     
-    # Calculate wait time percentiles
+    # Calculate wait time percentiles efficiently
     wait_time_percentiles = np.percentile(transitions["wait_sec"], [50, 75, 90, 95, 99])
     percentile_labels = ["p50", "p75", "p90", "p95", "p99"]
     percentile_dict = dict(zip(percentile_labels, wait_time_percentiles))
@@ -74,24 +89,26 @@ def analyze_bottlenecks(df: pd.DataFrame,
     # Set bottleneck threshold
     bottleneck_threshold = np.percentile(transitions["wait_sec"], percentile_threshold)
     
-    # Identify significant bottlenecks
+    # Identify significant bottlenecks vectorized
     significant_bottlenecks = bottleneck_stats[
         (bottleneck_stats["mean"] > bottleneck_threshold) & 
         (bottleneck_stats["count"] >= freq_threshold)
     ].copy()
     
-    # Add bottleneck score
-    significant_bottlenecks["bottleneck_score"] = (
-        significant_bottlenecks["mean"] / bottleneck_threshold * 
-        np.log1p(significant_bottlenecks["count"] / freq_threshold)
-    )
+    # Add bottleneck score vectorized
+    if len(significant_bottlenecks) > 0:
+        significant_bottlenecks["bottleneck_score"] = (
+            significant_bottlenecks["mean"] / bottleneck_threshold * 
+            np.log1p(significant_bottlenecks["count"] / freq_threshold)
+        )
+        
+        # Sort by bottleneck score
+        significant_bottlenecks = significant_bottlenecks.sort_values("bottleneck_score", ascending=False)
     
-    # Sort by bottleneck score
-    significant_bottlenecks = significant_bottlenecks.sort_values("bottleneck_score", ascending=False)
-    
-    # Add rank columns
+    # Add rank columns efficiently
     bottleneck_stats["rank"] = bottleneck_stats["mean"].rank(ascending=False)
-    significant_bottlenecks["rank"] = significant_bottlenecks["bottleneck_score"].rank(ascending=False)
+    if len(significant_bottlenecks) > 0:
+        significant_bottlenecks["rank"] = significant_bottlenecks["bottleneck_score"].rank(ascending=False)
     
     # Log summary
     logger.info(f"Found {len(significant_bottlenecks)} significant bottlenecks out of {len(bottleneck_stats)} transitions")
@@ -101,12 +118,16 @@ def analyze_bottlenecks(df: pd.DataFrame,
     bottleneck_stats.attrs["percentiles"] = percentile_dict
     bottleneck_stats.attrs["bottleneck_threshold"] = bottleneck_threshold
     
+    # Force memory cleanup for large datasets
+    del transitions
+    gc.collect()
+    
     return bottleneck_stats, significant_bottlenecks
 
 @vectorize
 def analyze_cycle_times(df: pd.DataFrame, percentile_threshold: float = 95.0) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """
-    Analyze cycle times with vectorized operations
+    Analyze cycle times with optimized vectorized operations
     
     Args:
         df: Process data dataframe
@@ -118,16 +139,19 @@ def analyze_cycle_times(df: pd.DataFrame, percentile_threshold: float = 95.0) ->
     start_time = time.time()
     logger.info("Analyzing cycle times")
     
-    # Group by case and calculate min/max timestamps
-    case_stats = df.groupby("case_id")["timestamp"].agg(["min", "max"]).copy()
+    # Select only needed columns to reduce memory usage
+    df_slim = df[['case_id', 'task_id', 'resource_id', 'timestamp']].copy()
     
-    # Calculate durations
+    # Group by case and calculate min/max timestamps in one operation
+    case_stats = df_slim.groupby("case_id")["timestamp"].agg(["min", "max"])
+    
+    # Calculate durations vectorized
     case_stats["duration"] = case_stats["max"] - case_stats["min"]
     case_stats["duration_h"] = case_stats["duration"].dt.total_seconds() / 3600.0
     case_stats["duration_days"] = case_stats["duration"].dt.total_seconds() / (3600.0 * 24)
     
-    # Add case-level features
-    case_features = df.groupby("case_id").agg({
+    # Add case-level features efficiently
+    case_features = df_slim.groupby("case_id").agg({
         "task_id": ["count", "nunique"],
         "resource_id": "nunique"
     })
@@ -135,12 +159,13 @@ def analyze_cycle_times(df: pd.DataFrame, percentile_threshold: float = 95.0) ->
     # Flatten columns for easier access
     case_features.columns = [f"{col[0]}_{col[1]}" for col in case_features.columns]
     
-    # Merge features with case stats
+    # Merge features with case stats efficiently
     case_stats = case_stats.join(case_features)
     case_stats = case_stats.reset_index()
     
-    # Calculate percentiles
-    percentiles = np.percentile(case_stats["duration_h"], [50, 75, 90, 95, 99])
+    # Calculate percentiles efficiently
+    duration_values = case_stats["duration_h"].values
+    percentiles = np.percentile(duration_values, [50, 75, 90, 95, 99])
     percentile_dict = {
         "p50": percentiles[0],
         "p75": percentiles[1],
@@ -150,23 +175,36 @@ def analyze_cycle_times(df: pd.DataFrame, percentile_threshold: float = 95.0) ->
     }
     
     # Get the specified percentile value
-    percentile_value = percentiles[3]  # p95 by default
+    idx = min(int(percentile_threshold / 25), 3)  # Map threshold to index (0-3)
+    percentile_value = percentiles[idx]
     
-    # Identify long-running cases
+    # Identify long-running cases vectorized
     long_cases = case_stats[case_stats["duration_h"] > percentile_value].copy()
     
-    # Store percentiles as attributes
+    # Calculate correlation metrics for insights
+    corr_events = case_stats["duration_h"].corr(case_stats["task_id_count"])
+    corr_unique = case_stats["duration_h"].corr(case_stats["task_id_nunique"])
+    
+    # Store metrics as attributes
     case_stats.attrs["percentiles"] = percentile_dict
+    case_stats.attrs["correlations"] = {
+        "events_vs_duration": corr_events,
+        "unique_tasks_vs_duration": corr_unique
+    }
     
     # Log summary
     logger.info(f"Analyzed {len(case_stats)} cases, identified {len(long_cases)} long-running cases (>{percentile_value:.1f}h)")
     logger.info(f"Analysis completed in {time.time() - start_time:.2f}s")
     
+    # Clean up memory
+    del df_slim
+    gc.collect()
+    
     return case_stats, long_cases, percentile_value
 
 def analyze_transition_patterns(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Analyze transition patterns and compute transition matrix
+    Analyze transition patterns and compute transition matrix with optimized operations
     
     Args:
         df: Process data dataframe
@@ -177,28 +215,42 @@ def analyze_transition_patterns(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
     start_time = time.time()
     logger.info("Analyzing transition patterns")
     
-    # Compute transitions
-    transitions = df.copy()
+    # Select only needed columns
+    df_slim = df[['case_id', 'task_id', 'timestamp']].copy()
+    
+    # Compute transitions in a single operation
+    transitions = df_slim.copy()
     transitions["next_task_id"] = transitions.groupby("case_id")["task_id"].shift(-1)
     
     # Filter out last events in cases
     transitions = transitions.dropna(subset=["next_task_id"])
     
-    # Create transition count matrix and probability matrix
-    trans_count = transitions.groupby(["task_id", "next_task_id"]).size().unstack(fill_value=0)
-    prob_matrix = trans_count.div(trans_count.sum(axis=1), axis=0)
+    # Create transition count matrix in a single operation
+    trans_count = pd.crosstab(
+        transitions["task_id"], 
+        transitions["next_task_id"],
+        normalize=False
+    )
+    
+    # Calculate probability matrix efficiently
+    row_sums = trans_count.sum(axis=1)
+    prob_matrix = trans_count.div(row_sums, axis=0).fillna(0)
     
     # Log summary
     total_transitions = trans_count.sum().sum()
     unique_transitions = (trans_count > 0).sum().sum()
-    logger.info(f"Found {total_transitions} total transitions with {unique_transitions} unique patterns")
+    logger.info(f"Found {total_transitions:,} total transitions across {unique_transitions:,} unique patterns")
     logger.info(f"Analysis completed in {time.time() - start_time:.2f}s")
+    
+    # Clean up memory
+    del df_slim
+    gc.collect()
     
     return transitions, trans_count, prob_matrix
 
 def identify_process_variants(df: pd.DataFrame, max_variants: int = 10) -> Tuple[pd.DataFrame, Dict[int, List]]:
     """
-    Identify process variants (unique sequences of activities)
+    Identify process variants (unique sequences of activities) with optimized memory usage
     
     Args:
         df: Process data dataframe
@@ -210,33 +262,42 @@ def identify_process_variants(df: pd.DataFrame, max_variants: int = 10) -> Tuple
     start_time = time.time()
     logger.info("Identifying process variants")
     
-    # Pre-sort the dataframe
-    df_sorted = df.sort_values(["case_id", "timestamp"])
+    # Select only needed columns
+    df_slim = df[['case_id', 'task_id', 'timestamp']].copy()
     
-    # Extract case sequences efficiently
-    case_sequences = {}
+    # Pre-sort the dataframe for faster groupby operations
+    df_sorted = df_slim.sort_values(["case_id", "timestamp"])
+    
+    # Extract case sequences efficiently using string representation for hashing
+    variant_hash = {}
     variant_counts = {}
     
-    # Process each case
-    for case_id, group in df_sorted.groupby("case_id"):
-        # Convert to tuple for hashing
-        sequence = tuple(group["task_id"].values)
-        case_sequences[case_id] = sequence
-        
-        # Count variants
-        if sequence in variant_counts:
-            variant_counts[sequence] += 1
-        else:
-            variant_counts[sequence] = 1
+    # Create a dictionary to track variants by case_id
+    case_to_variant = {}
     
-    # Create variant statistics
+    # First pass: extract sequences and count variants
+    for case_id, group in df_sorted.groupby("case_id"):
+        # Convert to string for efficient hashing
+        task_seq = group["task_id"].astype(str).str.cat(sep=',')
+        case_to_variant[case_id] = task_seq
+        
+        if task_seq in variant_counts:
+            variant_counts[task_seq] += 1
+            # Store full sequence only for the first occurrence to save memory
+        else:
+            variant_counts[task_seq] = 1
+            variant_hash[task_seq] = list(group["task_id"].values)
+    
+    # Create variant statistics dataframe
     variant_data = []
-    for i, (sequence, count) in enumerate(sorted(variant_counts.items(), key=lambda x: x[1], reverse=True)):
+    for i, (sequence_str, count) in enumerate(sorted(variant_counts.items(), key=lambda x: x[1], reverse=True)):
+        variant_id = i + 1
+        sequence = variant_hash[sequence_str]
         variant_data.append({
-            'variant_id': i+1,
-            'sequence': sequence,
+            'variant_id': variant_id,
+            'sequence': sequence,  # Store as list
             'count': count,
-            'percentage': count / len(case_sequences) * 100,
+            'percentage': count / len(case_to_variant) * 100,
             'sequence_length': len(sequence)
         })
     
@@ -244,20 +305,25 @@ def identify_process_variants(df: pd.DataFrame, max_variants: int = 10) -> Tuple
     
     # Extract top variant sequences
     variant_sequences = {
-        row['variant_id']: list(row['sequence'])
+        row['variant_id']: row['sequence']
         for row in variant_data[:max_variants]
     }
     
     # Log summary
-    logger.info(f"Identified {len(variant_stats)} unique process variants")
-    logger.info(f"Top variant covers {variant_stats['percentage'].max():.1f}% of cases")
+    logger.info(f"Identified {len(variant_stats)} unique process variants across {len(case_to_variant)} cases")
+    if len(variant_stats) > 0:
+        logger.info(f"Top variant covers {variant_stats['percentage'].iloc[0]:.1f}% of cases")
     logger.info(f"Analysis completed in {time.time() - start_time:.2f}s")
+    
+    # Clean up memory
+    del df_slim, df_sorted, variant_hash, case_to_variant
+    gc.collect()
     
     return variant_stats, variant_sequences
 
 def analyze_resource_workload(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Analyze resource workload and efficiency
+    Analyze resource workload and efficiency with vectorized operations
     
     Args:
         df: Process data dataframe
@@ -268,8 +334,11 @@ def analyze_resource_workload(df: pd.DataFrame) -> pd.DataFrame:
     start_time = time.time()
     logger.info("Analyzing resource workload")
     
-    # Calculate activity counts per resource
-    resource_stats = df.groupby("resource_id").agg({
+    # Select only the necessary columns
+    df_slim = df[['resource_id', 'task_id', 'case_id']].copy()
+    
+    # Calculate activity counts per resource in one operation
+    resource_stats = df_slim.groupby("resource_id").agg({
         "task_id": "count",
         "case_id": "nunique"
     }).rename(columns={
@@ -278,15 +347,19 @@ def analyze_resource_workload(df: pd.DataFrame) -> pd.DataFrame:
     })
     
     # Calculate unique activities per resource
-    resource_tasks = df.groupby("resource_id")["task_id"].nunique().rename("unique_activities")
+    resource_tasks = df_slim.groupby("resource_id")["task_id"].nunique().rename("unique_activities")
     resource_stats = resource_stats.join(resource_tasks)
     
     # Calculate specialization ratio (higher = more specialized)
-    resource_stats["specialization"] = 1 - (resource_stats["unique_activities"] / df["task_id"].nunique())
+    task_count = df_slim["task_id"].nunique()
+    resource_stats["specialization"] = 1 - (resource_stats["unique_activities"] / task_count)
     
     # Calculate load distribution
-    total_activities = df.shape[0]
+    total_activities = df_slim.shape[0]
     resource_stats["workload_percentage"] = resource_stats["activity_count"] / total_activities * 100
+    
+    # Calculate efficiency metric
+    resource_stats["efficiency"] = resource_stats["case_count"] / resource_stats["activity_count"]
     
     # Calculate Gini coefficient for workload inequality
     gini = _calculate_gini_coefficient(resource_stats["activity_count"].values)
@@ -300,93 +373,43 @@ def analyze_resource_workload(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"Workload inequality (Gini): {gini:.3f}")
     logger.info(f"Analysis completed in {time.time() - start_time:.2f}s")
     
+    # Clean up memory
+    del df_slim
+    gc.collect()
+    
     return resource_stats
 
 def _calculate_gini_coefficient(values: np.ndarray) -> float:
-    """Calculate the Gini coefficient for measuring inequality"""
-    # Sort values
+    """
+    Calculate the Gini coefficient with optimized numpy operations
+    
+    Args:
+        values: Array of values to calculate Gini coefficient for
+        
+    Returns:
+        Gini coefficient (0=equal distribution, 1=complete inequality)
+    """
+    # Handle edge cases
+    if len(values) == 0 or np.sum(values) == 0:
+        return 0
+    
+    # Sort values (required for Lorenz curve)
     sorted_values = np.sort(values)
     n = len(sorted_values)
     
-    if n == 0 or np.sum(sorted_values) == 0:
-        return 0
+    # Calculate Lorenz curve using cumulative sum
+    lorenz = np.cumsum(sorted_values) / np.sum(sorted_values)
     
-    # Calculate cumulative sum of sorted array
-    cumsum = np.cumsum(sorted_values)
+    # Calculate Gini coefficient using area under Lorenz curve
+    # Formula: G = 1 - 2 * area under Lorenz curve
+    # For discrete points: G = 1 - sum((y_i + y_{i-1}) * (x_i - x_{i-1}))
+    # With uniform x points: G = 1 - sum(y_i + y_{i-1}) / n
     
-    # Gini = 1 - 2 * sum of the area under the Lorenz curve
-    return (n + 1 - 2 * np.sum(cumsum) / np.sum(sorted_values)) / n
-
-def perform_conformance_checking(df: pd.DataFrame) -> Tuple[List, int]:
-    """
-    Simplified conformance checking without PM4Py dependency
+    # Using vectorized approach for (y_i + y_{i-1})
+    lorenz_padded = np.pad(lorenz, (1, 0), 'constant')
+    sum_pairs = lorenz_padded[:-1] + lorenz_padded[1:]
     
-    Args:
-        df: Process data dataframe
-        
-    Returns:
-        Tuple of (replayed_traces, num_deviant_traces)
-    """
-    start_time = time.time()
-    logger.info("Performing conformance checking")
+    # Gini coefficient
+    gini = 1 - np.sum(sum_pairs[1:]) / n
     
-    # Extract variants
-    variant_stats, _ = identify_process_variants(df)
-    
-    # Use top variant as reference model (simplified approach)
-    top_variant_sequence = eval(variant_stats.iloc[0]['sequence'])
-    top_variant_count = variant_stats.iloc[0]['count']
-    total_variants = variant_stats['count'].sum()
-    
-    # Count non-conforming traces (those not following top variant)
-    n_deviant = total_variants - top_variant_count
-    
-    # Create a simple representation of replayed traces
-    replayed = [{'is_fit': True}] * top_variant_count + [{'is_fit': False}] * n_deviant
-    
-    conformance = top_variant_count / total_variants
-    
-    # Log summary
-    logger.info(f"Conformance check: {conformance:.1%} traces conform to the top variant")
-    logger.info(f"Analysis completed in {time.time() - start_time:.2f}s")
-    
-    return replayed, n_deviant
-
-# Functions to incorporate from analysis.py
-def build_task_adjacency(df: pd.DataFrame, num_tasks: int) -> np.ndarray:
-    """
-    Build adjacency matrix weighted by transition frequencies
-    
-    Args:
-        df: Process data dataframe
-        num_tasks: Number of tasks
-        
-    Returns:
-        Weighted adjacency matrix
-    """
-    # Implementation from analysis.py
-    start_time = time.time()
-    logger.info("Building task adjacency matrix")
-    
-    # Initialize matrix
-    A = np.zeros((num_tasks, num_tasks), dtype=np.float32)
-    
-    # Process transitions
-    for cid, cdata in df.groupby("case_id"):
-        cdata = cdata.sort_values("timestamp")
-        tasks_seq = cdata["task_id"].values
-        for i in range(len(tasks_seq)-1):
-            src = int(tasks_seq[i])
-            tgt = int(tasks_seq[i+1])
-            A[src, tgt] += 1.0
-    
-    # Add reverse edges for undirected clustering
-    A_sym = A + A.T
-    
-    # Log summary
-    non_zero = np.count_nonzero(A)
-    density = non_zero / (num_tasks * num_tasks)
-    logger.info(f"Built adjacency matrix {A.shape} with {non_zero} non-zero entries ({density:.1%} density)")
-    logger.info(f"Matrix built in {time.time() - start_time:.2f}s")
-    
-    return A_sym
+    return gini
