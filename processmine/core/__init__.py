@@ -1,6 +1,6 @@
 # processmine/core/__init__.py
 """
-Core functionality for ProcessMine including training, evaluation, and experiment management.
+Core functionality for ProcessMine including training, evaluation, experiment management, and execution.
 """
 from processmine.core.training import (
     train_model,
@@ -15,4 +15,11 @@ from processmine.core.experiment import (
     setup_results_dir,
     save_metrics,
     print_section_header
+)
+
+from processmine.core.runner import (
+    run_analysis,
+    run_training,
+    run_optimization,
+    run_full_pipeline
 )

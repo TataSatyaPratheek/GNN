@@ -14,53 +14,8 @@ from processmine.core.runner import run_analysis, run_training, run_optimization
 from processmine.data.loader import load_and_preprocess_data
 from processmine.utils.memory import log_memory_usage, clear_memory, get_memory_stats
 
-# Import for model creation
-def create_model(model_type, **kwargs):
-    """
-    Factory function to create models of different types with consistent interface
-    
-    Args:
-        model_type: Type of model to create ('gnn', 'lstm', 'enhanced_gnn', etc.)
-        **kwargs: Model-specific parameters
-        
-    Returns:
-        Instantiated model
-    """
-    if model_type == 'gnn':
-        from processmine.models.gnn.architectures import OptimizedGNN
-        return OptimizedGNN(
-            attention_type="basic",
-            **kwargs
-        )
-    
-    elif model_type == 'enhanced_gnn':
-        from processmine.models.gnn.architectures import OptimizedGNN
-        return OptimizedGNN(
-            attention_type="combined", 
-            **kwargs
-        )
-    
-    elif model_type == 'lstm':
-        from processmine.models.sequence.lstm import NextActivityLSTM
-        return NextActivityLSTM(**kwargs)
-        
-    elif model_type == 'enhanced_lstm':
-        from processmine.models.sequence.lstm import EnhancedProcessRNN
-        return EnhancedProcessRNN(**kwargs)
-        
-    elif model_type == 'random_forest':
-        from sklearn.ensemble import RandomForestClassifier
-        return RandomForestClassifier(**kwargs)
-        
-    elif model_type == 'xgboost':
-        try:
-            import xgboost as xgb
-            return xgb.XGBClassifier(**kwargs)
-        except ImportError:
-            raise ImportError("XGBoost is not installed. Install it with: pip install xgboost")
-    
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
+# Import model factory
+from processmine.models.factory import create_model, get_model_config
 
 # Process Mining Core
 from processmine.process_mining.analysis import (
