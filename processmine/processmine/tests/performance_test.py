@@ -179,7 +179,7 @@ class ProcessMinePerformanceTests(unittest.TestCase):
         
         # Check if package is available
         try:
-            import processmine.processmine as processmine
+            import processmine
             cls.is_available = True
         except ImportError:
             cls.is_available = False
@@ -392,7 +392,7 @@ class ProcessMinePerformanceTests(unittest.TestCase):
         """Test model performance."""
         from processmine.data.loader import load_and_preprocess_data
         from processmine.data.graphs import build_graph_data
-        from processmine.processmine import create_model
+        from processmine.models.factory import create_model
         from processmine.utils.memory import clear_memory
         
         # Check if PyG is available
@@ -500,7 +500,7 @@ class ProcessMinePerformanceTests(unittest.TestCase):
         """Test model training performance."""
         from processmine.data.loader import load_and_preprocess_data
         from processmine.data.graphs import build_graph_data
-        from processmine.processmine import create_model
+        from processmine.models.factory import create_model
         from processmine.utils.memory import clear_memory
         from processmine.core.training import train_model, compute_class_weights
         

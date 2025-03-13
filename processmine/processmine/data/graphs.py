@@ -573,7 +573,7 @@ def build_heterogeneous_graph(
                             if "timestamp" in case_group.columns:
                                 timestamps = case_group["timestamp"].values
                                 time_diffs = np.array([
-                                    (timestamps[i+1] - timestamps[i]).total_seconds() / 3600.0  # Hours
+                                    (timestamps[i+1] - timestamps[i]) / np.timedelta64(1, 'h')  # Hours directly in hours using NumPy time units
                                     for i in range(n_tasks-1)
                                 ], dtype=np.float32)
                                 
