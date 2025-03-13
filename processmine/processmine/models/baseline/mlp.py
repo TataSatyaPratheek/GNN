@@ -22,168 +22,6 @@ from processmine.models.base import ProcessModel
 logger = logging.getLogger(__name__)
 
 
-class BasicMLP(ProcessModel):
-    """
-    Basic MLP model for process mining with DGL compatibility
-    """
-    def __init__(self, input_dim, hidden_dims, output_dim, dropout=0.3,
-                 activation=F.relu, use_layer_norm=True):
-        """
-        Initialize MLP model
-        
-        Args:
-            input_dim: Input dimension
-            hidden_dims: List of hidden layer dimensions
-            output_dim: Output dimension
-            dropout: Dropout probability
-            activation: Activation function
-            use_layer_norm: Whether to use layer normalization
-        """
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dims = hidden_dims
-        self.output_dim = output_dim
-        self.dropout = dropout
-        self.activation = activation
-        self.use_layer_norm = use_layer_norm
-        
-        # Create layers
-        layers = []
-        prev_dim = input_dim
-        
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, h_dim))
-            if use_layer_norm:
-                layers.append(nn.LayerNorm(h_dim))
-            layers.append(nn.Dropout(dropout))
-            prev_dim = h_dim
-        
-        self.hidden_layers = nn.ModuleList(layers)
-        self.output_layer = nn.Linear(prev_dim, output_dim)
-        
-        # Xavier initialization for better gradient flow
-        nn.init.xavier_uniform_(self.output_layer.weight)
-        nn.init.zeros_(self.output_layer.bias)
-
-    def forward(self, x):
-        """
-        Forward pass with DGL support
-        
-        Args:
-            x: Input tensor [batch_size, input_dim] or DGL/PyG graph
-            
-        Returns:
-            Output logits [batch_size, num_classes] or dict with task_pred
-        """
-        # Handle DGL graph objects
-        if hasattr(x, 'ndata') and 'feat' in x.ndata:
-            return self._process_dgl_graph(x)
-        
-        # Handle PyG Data objects for backward compatibility
-        elif hasattr(x, 'x') and hasattr(x, 'batch'):
-            return self._process_graph_data(x)
-        
-        # Standard tensor processing
-        for i in range(0, len(self.hidden_layers), 3):
-            x = self.hidden_layers[i](x)  # Linear
-            if self.use_layer_norm:
-                x = self.hidden_layers[i+1](x)  # LayerNorm
-            x = self.activation(x)  # Activation
-            x = self.hidden_layers[i+2](x)  # Dropout
-        
-        # Apply output layer
-        logits = self.output_layer(x)
-        
-        return {"task_pred": logits}
-    
-    def _process_dgl_graph(self, g):
-        """
-        Process DGL graph data
-        
-        Args:
-            g: DGL graph or batched graph
-            
-        Returns:
-            Dict with task_pred tensor
-        """
-        # Extract node features
-        node_features = g.ndata['feat']
-        
-        # Apply hidden layers to node features
-        h = node_features
-        for i in range(0, len(self.hidden_layers), 3):
-            h = self.hidden_layers[i](h)  # Linear
-            if self.use_layer_norm:
-                h = self.hidden_layers[i+1](h)  # BatchNorm/LayerNorm
-            h = self.activation(h)  # Activation
-            h = self.hidden_layers[i+2](h)  # Dropout
-        
-        # Global graph-level pooling
-        if g.batch_size > 1:
-            # Batched graph - apply readout to get graph-level features
-            g.ndata['h'] = h
-            readout = dgl.readout_nodes(g, 'h', op='mean')
-        else:
-            # Single graph - simple mean pooling
-            readout = h.mean(dim=0, keepdim=True)
-        
-        # Apply output layer
-        logits = self.output_layer(readout)
-        
-        return {"task_pred": logits}
-    
-    def _process_graph_data(self, data):
-        """
-        Process PyG Data for backward compatibility
-        
-        Args:
-            data: PyG Data object
-            
-        Returns:
-            Dict with task_pred tensor
-        """
-        x, batch = data.x, data.batch
-        
-        # Apply model to node features
-        h = x
-        for i in range(0, len(self.hidden_layers), 3):
-            h = self.hidden_layers[i](h)  # Linear
-            if self.use_layer_norm:
-                h = self.hidden_layers[i+1](h)  # BatchNorm/LayerNorm
-            h = self.activation(h)  # Activation
-            h = self.hidden_layers[i+2](h)  # Dropout
-        
-        # Global pooling
-        from torch_scatter import scatter_mean
-        readout = scatter_mean(h, batch, dim=0)
-        
-        # Apply output layer
-        logits = self.output_layer(readout)
-        
-        return {"task_pred": logits}
-    
-    def predict(self, g):
-        """
-        Make predictions with a consistent interface
-        
-        Args:
-            g: Input data, graph or tensor
-            
-        Returns:
-            Prediction tensor
-        """
-        self.eval()
-        with torch.no_grad():
-            outputs = self.forward(g)
-            # Handle different output formats
-            if isinstance(outputs, dict):
-                logits = outputs.get("task_pred", next(iter(outputs.values())))
-            else:
-                logits = outputs
-            
-            _, predictions = torch.max(logits, dim=1)
-            return predictions
-
 
 def train_mlp_model(model, train_loader, val_loader, criterion, optimizer, 
                   device, num_epochs=20, patience=5, model_path=None):
@@ -429,3 +267,76 @@ def evaluate_mlp_model(model, test_loader, device, criterion=None):
         metrics['test_loss'] = test_loss / len(test_loader)
     
     return metrics, np.array(all_preds), np.array(all_labels)
+
+class BasicMLP(ProcessModel):
+    """
+    Basic MLP model for process mining
+    """
+    def __init__(self, input_dim, hidden_dims, output_dim, dropout=0.3,
+                 activation=F.relu):
+        """
+        Initialize MLP model
+        
+        Args:
+            input_dim: Input dimension
+            hidden_dims: List of hidden layer dimensions
+            output_dim: Output dimension
+            dropout: Dropout probability
+            activation: Activation function
+        """
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
+        self.output_dim = output_dim
+        self.dropout = dropout
+        self.activation = activation
+        
+        # Create layers
+        layers = []
+        prev_dim = input_dim
+        
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, h_dim))
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.Dropout(dropout))
+            prev_dim = h_dim
+        
+        self.hidden_layers = nn.ModuleList(layers)
+        self.output_layer = nn.Linear(prev_dim, output_dim)
+    
+    def forward(self, x):
+        """
+        Forward pass
+        
+        Args:
+            x: Input tensor [batch_size, input_dim] or DGL graph
+            
+        Returns:
+            Output logits [batch_size, output_dim]
+        """
+        # Handle DGL Graph objects
+        if hasattr(x, 'ndata') and 'feat' in x.ndata:
+            # Extract node features and perform pooling
+            node_x = x.ndata['feat']
+            
+            # Apply hidden layers to nodes
+            for i in range(0, len(self.hidden_layers), 3):
+                node_x = self.hidden_layers[i](node_x)  # Linear
+                node_x = self.hidden_layers[i+1](node_x)  # BatchNorm
+                node_x = self.activation(node_x)  # Activation
+                node_x = self.hidden_layers[i+2](node_x)  # Dropout
+            
+            # Global mean pooling using DGL's readout
+            x = dgl.readout_nodes(x, 'feat', op='mean')
+        else:
+            # Standard tensor processing
+            for i in range(0, len(self.hidden_layers), 3):
+                x = self.hidden_layers[i](x)  # Linear
+                x = self.hidden_layers[i+1](x)  # BatchNorm
+                x = self.activation(x)  # Activation
+                x = self.hidden_layers[i+2](x)  # Dropout
+        
+        # Apply output layer
+        logits = self.output_layer(x)
+        
+        return logits

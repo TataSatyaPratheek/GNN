@@ -1279,8 +1279,8 @@ class ExpressiveGATConv(nn.Module):
             self.register_buffer('res_fc', None)
         
         # Dropout
-        self.feat_drop_layer = nn.Dropout(feat_drop)
-        self.attn_drop_layer = nn.Dropout(attn_drop)
+        self.feat_drop = nn.Dropout(feat_drop)
+        self.attn_drop = nn.Dropout(attn_drop)
         
         # Activation
         self.leaky_relu = nn.LeakyReLU(negative_slope)
@@ -1316,7 +1316,7 @@ class ExpressiveGATConv(nn.Module):
         """
         with graph.local_scope():
             # Feature dropout
-            h_src = h_dst = self.feat_drop_layer(feat)
+            h_src = h_dst = self.feat_drop(feat)
             
             # Feature transformation
             feat_src = feat_dst = self.fc(h_src).view(-1, self.num_heads, self.out_dim)
@@ -1343,31 +1343,25 @@ class ExpressiveGATConv(nn.Module):
                     edge_feat = edge_feat.view(-1, 1, 1).expand(-1, self.num_heads, 1)
                 graph.edata.update({'ee': edge_feat})
                 
-                # Define custom message function with edge features
+                # Define message function with edge features
                 def message_func(edges):
                     # Combine source, destination, and edge attention
                     ee = (edges.data['ee'] * self.attn_e).sum(dim=-1).unsqueeze(-1)
                     a = self.leaky_relu(edges.src['el'] + edges.dst['er'] + ee)
-                    a = self.attn_drop_layer(a)
+                    a = self.attn_drop(a)
                     return {'a': a, 'm': edges.src['ft'] + edges.src['proj']}
             else:
                 # Standard message function without edge features
                 def message_func(edges):
                     a = self.leaky_relu(edges.src['el'] + edges.dst['er'])
-                    a = self.attn_drop_layer(a)
+                    a = self.attn_drop(a)
                     return {'a': a, 'm': edges.src['ft'] + edges.src['proj']}
             
             # Apply edge softmax using DGL's optimized function
             graph.apply_edges(message_func)
             graph.edata['a'] = dgl.nn.functional.edge_softmax(graph, graph.edata['a'])
             
-            # Define reduce function
-            def reduce_func(nodes):
-                alpha = nodes.mailbox['a']
-                h = torch.sum(alpha * nodes.mailbox['m'], dim=1)
-                return {'h': h}
-            
-            # Update all nodes
+            # Update all nodes with message passing
             graph.update_all(fn.src_mul_edge('proj', 'a', 'm'), fn.sum('m', 'h'))
             
             # Get updated features

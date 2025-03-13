@@ -708,3 +708,99 @@ def build_heterogeneous_graph(
             logger.info(f"  Edge types used: {sorted(edge_types_used)}")
     
     return het_graphs
+
+def build_dgl_graph_batch(node_features, edge_indices, edge_features=None):
+    """
+    Build a batched DGL graph from node features and edge indices
+    
+    Args:
+        node_features: Tensor of node features [num_nodes, feature_dim]
+        edge_indices: Tuple of (src, dst) tensors for edges
+        edge_features: Optional tensor of edge features [num_edges, feature_dim]
+        
+    Returns:
+        DGL graph
+    """
+    # Create graph
+    g = dgl.graph((edge_indices[0], edge_indices[1]))
+    
+    # Add node features
+    g.ndata['feat'] = node_features
+    
+    # Add edge features if provided
+    if edge_features is not None:
+        g.edata['feat'] = edge_features
+    
+    return g
+
+def add_self_loops_to_dgl(g):
+    """
+    Add self-loops to a DGL graph
+    
+    Args:
+        g: DGL graph
+        
+    Returns:
+        DGL graph with self-loops
+    """
+    return dgl.add_self_loop(g)
+
+def create_dgl_heterograph(data_dict, num_nodes_dict=None):
+    """
+    Create a heterogeneous DGL graph
+    
+    Args:
+        data_dict: Dictionary mapping edge types to edge data
+        num_nodes_dict: Optional dictionary mapping node types to node counts
+        
+    Returns:
+        Heterogeneous DGL graph
+    """
+    return dgl.heterograph(data_dict, num_nodes_dict=num_nodes_dict)
+
+def extract_subgraphs_dgl(g, nodes_list):
+    """
+    Extract multiple node-induced subgraphs from a DGL graph
+    
+    Args:
+        g: DGL graph
+        nodes_list: List of lists of nodes for each subgraph
+        
+    Returns:
+        List of DGL subgraphs
+    """
+    return [dgl.node_subgraph(g, nodes) for nodes in nodes_list]
+
+def convert_to_bidirectional_dgl(g):
+    """
+    Convert a directed DGL graph to bidirectional by adding reverse edges
+    
+    Args:
+        g: DGL graph
+        
+    Returns:
+        Bidirectional DGL graph
+    """
+    # Get edges
+    src, dst = g.edges()
+    
+    # Add reverse edges
+    src_reverse, dst_reverse = dst, src
+    
+    # Combine original and reverse edges
+    new_src = torch.cat([src, src_reverse])
+    new_dst = torch.cat([dst, dst_reverse])
+    
+    # Create new graph with bidirectional edges
+    new_g = dgl.graph((new_src, new_dst), num_nodes=g.num_nodes())
+    
+    # Copy node features
+    for key, value in g.ndata.items():
+        new_g.ndata[key] = value
+    
+    # Copy and extend edge features
+    for key, value in g.edata.items():
+        # Duplicate edge features for reverse edges
+        new_g.edata[key] = torch.cat([value, value])
+    
+    return new_g

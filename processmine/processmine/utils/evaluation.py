@@ -57,52 +57,6 @@ def compute_class_weights(df, num_classes):
     # Keep weights on CPU initially - will be moved to device in setup_optimizer_and_loss if needed
     return torch.tensor(class_weights, dtype=torch.float32)
 
-def get_graph_targets(g):
-    """
-    Extract graph-level targets from a DGL graph or batched graph
-    
-    Args:
-        g: DGL graph or batched graph
-        
-    Returns:
-        Graph-level target tensor
-    """
-    if 'label' in g.ndata:
-        # Get node labels
-        node_labels = g.ndata['label']
-        
-        if hasattr(g, 'batch_size') and g.batch_size > 1:
-            # For batched graph, extract one label per graph
-            batch_num_nodes = g.batch_num_nodes()
-            graph_labels = []
-            
-            node_offset = 0
-            for num_nodes in batch_num_nodes:
-                # Get labels for this graph
-                graph_node_labels = node_labels[node_offset:node_offset + num_nodes]
-                
-                # Use mode (most common label) as graph label
-                if len(graph_node_labels) > 0:
-                    values, counts = torch.unique(graph_node_labels, return_counts=True)
-                    mode_idx = torch.argmax(counts)
-                    graph_labels.append(values[mode_idx])
-                else:
-                    # Fallback if no labels
-                    graph_labels.append(torch.tensor(0, device=node_labels.device))
-                
-                # Update offset
-                node_offset += num_nodes
-            
-            return torch.stack(graph_labels)
-        else:
-            # For single graph, use mode of node labels
-            values, counts = torch.unique(node_labels, return_counts=True)
-            mode_idx = torch.argmax(counts)
-            return values[mode_idx].unsqueeze(0)
-    else:
-        # No labels found
-        return None
-    
 def evaluate_model(model, data_loader, criterion=None, device=None, detailed=True, memory_efficient=True):
     """
     Evaluate model on test data with improved DGL compatibility
@@ -271,3 +225,49 @@ def calculate_f1_scores(true_labels, predictions, average='weighted'):
     
     # Use scikit-learn's implementation with proper zero division handling
     return f1_score(true_labels, predictions, average=average, zero_division=0)
+
+def get_graph_targets(g):
+    """
+    Extract graph-level targets from a DGL graph or batched graph
+    
+    Args:
+        g: DGL graph or batched graph
+        
+    Returns:
+        Graph-level target tensor
+    """
+    if 'label' in g.ndata:
+        # Get node labels
+        node_labels = g.ndata['label']
+        
+        if hasattr(g, 'batch_size') and g.batch_size > 1:
+            # For batched graph, extract one label per graph
+            batch_num_nodes = g.batch_num_nodes()
+            graph_labels = []
+            
+            node_offset = 0
+            for num_nodes in batch_num_nodes:
+                # Get labels for this graph
+                graph_node_labels = node_labels[node_offset:node_offset + num_nodes]
+                
+                # Use mode (most common label) as graph label
+                if len(graph_node_labels) > 0:
+                    values, counts = torch.unique(graph_node_labels, return_counts=True)
+                    mode_idx = torch.argmax(counts)
+                    graph_labels.append(values[mode_idx])
+                else:
+                    # Fallback if no labels
+                    graph_labels.append(torch.tensor(0, device=node_labels.device))
+                
+                # Update offset
+                node_offset += num_nodes
+            
+            return torch.stack(graph_labels)
+        else:
+            # For single graph, use mode of node labels
+            values, counts = torch.unique(node_labels, return_counts=True)
+            mode_idx = torch.argmax(counts)
+            return values[mode_idx].unsqueeze(0)
+    else:
+        # No labels found
+        return None
