@@ -440,7 +440,7 @@ def run_training(
                 train_idx = indices[:int(0.7 * len(indices))]
                 val_idx = indices[int(0.7 * len(indices)):int(0.85 * len(indices))]
                 test_idx = indices[int(0.85 * len(indices)):]
-            
+
             # Apply DGL sampling if requested (for very large graphs)
             if dgl_sampling != "none" and any(g.num_nodes() > 1000 for g in graphs):
                 logger.info(f"Applying DGL {dgl_sampling} sampling for large graphs")
@@ -452,7 +452,18 @@ def run_training(
                     sampled_graphs = []
                     for g in graphs:
                         if g.num_nodes() > 1000:  # Only sample large graphs
-                            sampled_g = apply_dgl_sampling(g, method=dgl_sampling)
+                            if dgl_sampling == 'neighbor':
+                                # Use neighbor sampling for maintaining local structure
+                                sampled_g = apply_dgl_sampling(g, method='neighbor', fanout=50)
+                            elif dgl_sampling == 'topk':
+                                # Use top-k sampling for selecting important nodes
+                                sampled_g = apply_dgl_sampling(g, method='topk', k=500)
+                            elif dgl_sampling == 'khop':
+                                # Use k-hop sampling for preserving neighborhood
+                                sampled_g = apply_dgl_sampling(g, method='khop')
+                            else:
+                                # Default to random sampling
+                                sampled_g = apply_dgl_sampling(g, method='random')
                             sampled_graphs.append(sampled_g)
                         else:
                             sampled_graphs.append(g)
@@ -461,7 +472,7 @@ def run_training(
                     logger.info("Applied DGL sampling to reduce graph sizes")
                 except Exception as e:
                     logger.warning(f"DGL sampling failed: {e}")
-            
+                    
             # Create data loaders with memory efficiency in mind
             num_workers = kwargs.get('num_workers', 0) if not mem_efficient else 0
             

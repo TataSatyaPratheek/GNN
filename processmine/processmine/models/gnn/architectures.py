@@ -1549,10 +1549,11 @@ class PositionalEncoding(nn.Module):
             raise ValueError(f"Unsupported input dimension: {x.dim()}")
 
 
+# Update processmine/models/gnn/architectures.py to ensure ExpressiveGATConv properly uses DGL
+
 class ExpressiveGATConv(nn.Module):
     """
-    More expressive GAT convolution with additional features as mentioned in the improvement plan
-    Implemented with DGL for performance and memory efficiency
+    More expressive GAT convolution with DGL-optimized implementation
     """
     def __init__(
         self, 
@@ -1659,37 +1660,32 @@ class ExpressiveGATConv(nn.Module):
                     edge_feat = edge_feat.view(-1, 1, 1).expand(-1, self.num_heads, 1)
                 graph.edata.update({'ee': edge_feat})
                 
-                # Compute edge attention
-                def edge_attention(edges):
+                # Define custom message function with edge features
+                def message_func(edges):
+                    # Combine source, destination, and edge attention
                     ee = (edges.data['ee'] * self.attn_e).sum(dim=-1).unsqueeze(-1)
                     a = self.leaky_relu(edges.src['el'] + edges.dst['er'] + ee)
-                    return {'a': self.attn_drop(a)}
+                    a = self.attn_drop(a)
+                    return {'a': a, 'm': edges.src['ft'] + edges.src['proj']}
             else:
-                # Standard attention calculation
-                def edge_attention(edges):
+                # Standard message function without edge features
+                def message_func(edges):
                     a = self.leaky_relu(edges.src['el'] + edges.dst['er'])
-                    return {'a': self.attn_drop(a)}
+                    a = self.attn_drop(a)
+                    return {'a': a, 'm': edges.src['ft'] + edges.src['proj']}
             
-            # Apply attention
-            graph.apply_edges(edge_attention)
+            # Apply edge softmax using DGL's optimized function
+            graph.apply_edges(message_func)
+            graph.edata['a'] = dgl.nn.functional.edge_softmax(graph, graph.edata['a'])
             
-            # Edge softmax for normalized attention
-            graph.edata['a'] = dgl.ops.edge_softmax(graph, graph.edata['a'])
-            
-            # Message passing
-            def message_func(edges):
-                # Combine features with projected features for more expressivity
-                combined = edges.src['ft'] + edges.src['proj']
-                return {'a': edges.data['a'], 'm': combined}
-            
+            # Define reduce function
             def reduce_func(nodes):
-                # Weighted sum based on attention
                 alpha = nodes.mailbox['a']
                 h = torch.sum(alpha * nodes.mailbox['m'], dim=1)
                 return {'h': h}
             
             # Update all nodes
-            graph.update_all(message_func, reduce_func)
+            graph.update_all(fn.src_mul_edge('proj', 'a', 'm'), fn.sum('m', 'h'))
             
             # Get updated features
             h = graph.dstdata['h']

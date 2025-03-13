@@ -539,7 +539,8 @@ class MemoryEfficientDataLoader:
         prefetch_factor=2, 
         memory_threshold=0.85,
         drop_last=False,
-        collate_fn=None
+        collate_fn=None,
+        num_workers=0
     ):
         """
         Initialize memory-efficient data loader
@@ -553,6 +554,7 @@ class MemoryEfficientDataLoader:
             memory_threshold: Memory usage threshold to trigger adjustments
             drop_last: Whether to drop the last batch if incomplete
             collate_fn: Custom collate function (defaults to dgl.batch)
+            num_workers: Number of worker processes
         """
         self.dataset = dataset
         self.batch_size = batch_size
@@ -561,6 +563,7 @@ class MemoryEfficientDataLoader:
         self.prefetch_factor = prefetch_factor
         self.memory_threshold = memory_threshold
         self.drop_last = drop_last
+        self.num_workers = num_workers
         
         # Default to DGL batch collate if not provided
         self.collate_fn = collate_fn or (lambda graphs: dgl.batch(graphs))
@@ -568,28 +571,61 @@ class MemoryEfficientDataLoader:
         # Calculate initial indices
         self.indices = list(range(len(dataset)))
         if self.shuffle:
+            import random
             random.shuffle(self.indices)
         
         # Track memory usage for adaptive batch sizing
         self.batch_size_history = []
         self.memory_usage_history = []
         
+        # Set up DGL DataLoader for multi-process loading if workers > 0
+        if num_workers > 0:
+            try:
+                from dgl.dataloading import GraphDataLoader
+                self.dataloader = GraphDataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=shuffle,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    drop_last=drop_last,
+                    collate_fn=self.collate_fn
+                )
+                self.use_dgl_loader = True
+            except ImportError:
+                self.use_dgl_loader = False
+        else:
+            self.use_dgl_loader = False
+        
         # Track current position
         self.position = 0
+        self._iterator = None
     
     def __iter__(self):
         """Create iterator for batches"""
+        # If using DGL DataLoader, return its iterator
+        if self.use_dgl_loader:
+            self._iterator = iter(self.dataloader)
+            return self
+        
         # Reset position
         self.position = 0
         
         # Reshuffle if needed
         if self.shuffle:
+            import random
             random.shuffle(self.indices)
         
         return self
     
     def __next__(self):
         """Get next batch with memory-aware adaptive sizing"""
+        if self.use_dgl_loader:
+            try:
+                return next(self._iterator)
+            except StopIteration:
+                raise StopIteration
+        
         if self.position >= len(self.indices):
             raise StopIteration
         
@@ -622,68 +658,13 @@ class MemoryEfficientDataLoader:
         
         # Run garbage collection if memory usage is high
         if current_memory > self.memory_threshold * 0.95:
+            import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
         return self.collate_fn(batch)
     
-    def __len__(self):
-        """Get number of batches"""
-        if self.drop_last:
-            return len(self.indices) // self.batch_size
-        else:
-            return (len(self.indices) + self.batch_size - 1) // self.batch_size
-    
-    def _get_memory_usage(self):
-        """Get current memory usage as a fraction"""
-        if torch.cuda.is_available():
-            # GPU memory
-            allocated = torch.cuda.memory_allocated()
-            total = torch.cuda.get_device_properties(0).total_memory
-            return allocated / total
-        else:
-            # CPU memory
-            vm = psutil.virtual_memory()
-            return vm.percent / 100.0
-    
-    def _adjust_batch_size(self, memory_usage):
-        """
-        Dynamically adjust batch size based on memory usage
-        
-        Args:
-            memory_usage: Current memory usage as fraction
-            
-        Returns:
-            Adjusted batch size
-        """
-        if memory_usage > self.memory_threshold:
-            # Memory usage too high, reduce batch size
-            reduction_factor = self.memory_threshold / max(memory_usage, 0.001)
-            new_batch_size = max(1, int(self.batch_size * reduction_factor))
-            return new_batch_size
-        elif memory_usage < self.memory_threshold * 0.7:
-            # Memory usage is low, can increase batch size
-            # Be conservative with increases (10% at a time)
-            increase_factor = min(1.1, self.memory_threshold / max(memory_usage, 0.001))
-            new_batch_size = min(len(self.dataset), int(self.batch_size * increase_factor))
-            return new_batch_size
-        else:
-            # Memory usage is in a good range, keep current batch size
-            return self.batch_size
-    
-    def get_memory_stats(self):
-        """Get memory usage statistics"""
-        return {
-            "batch_sizes": self.batch_size_history,
-            "memory_usage": self.memory_usage_history,
-            "average_batch_size": sum(self.batch_size_history) / max(1, len(self.batch_size_history)),
-            "min_batch_size": min(self.batch_size_history) if self.batch_size_history else self.batch_size,
-            "max_batch_size": max(self.batch_size_history) if self.batch_size_history else self.batch_size,
-            "current_memory": self._get_memory_usage()
-        }
-
-
 def adaptive_normalization(features, feature_statistics=None):
     """
     Apply appropriate normalization based on data characteristics
@@ -809,3 +790,85 @@ def get_pyg_compatible_attributes(g):
         compat_dict['batch'] = torch.tensor(batch, device=g.device)
     
     return compat_dict
+
+def apply_dgl_sampling(g, method='neighbor', fanout=10, k=16):
+    """
+    Apply DGL's graph sampling techniques for memory-efficient processing
+    
+    Args:
+        g: DGL graph to sample
+        method: Sampling method ('neighbor', 'topk', 'random', 'khop')
+        fanout: Number of neighbors to sample in neighbor sampling
+        k: Number of nodes to select in topk sampling
+        
+    Returns:
+        Sampled DGL graph
+    """
+    import dgl
+    
+    try:
+        if method == 'neighbor':
+            # Sample neighbors with importance weights
+            if 'weight' in g.edata:
+                # Use edge weights for importance sampling
+                frontier = dgl.sampling.sample_neighbors(
+                    g, 
+                    torch.arange(g.num_nodes()), 
+                    fanout, 
+                    edge_dir='out',
+                    prob='weight'
+                )
+                return frontier
+            else:
+                # Uniform sampling if no weights
+                frontier = dgl.sampling.sample_neighbors(
+                    g, 
+                    torch.arange(g.num_nodes()), 
+                    fanout, 
+                    edge_dir='out'
+                )
+                return frontier
+                
+        elif method == 'topk':
+            # Select important nodes based on connectivity or features
+            # Either use in-degree for importance or node features
+            if g.in_degrees().sum() > 0:
+                scores = g.in_degrees().float()
+            else:
+                # Use feature magnitude as importance if available
+                if 'feat' in g.ndata:
+                    scores = g.ndata['feat'].sum(dim=1)
+                else:
+                    scores = torch.ones(g.num_nodes())
+                    
+            # Select top-k nodes
+            _, indices = torch.topk(scores, min(k, g.num_nodes()))
+            return g.subgraph(indices)
+            
+        elif method == 'khop':
+            # Get k-hop subgraph from a set of seed nodes
+            # Choose important nodes as seeds (e.g., with highest degree)
+            if g.in_degrees().sum() > 0:
+                scores = g.in_degrees().float()
+                _, seeds = torch.topk(scores, min(10, g.num_nodes()))
+            else:
+                seeds = torch.arange(min(10, g.num_nodes()))
+                
+            # Extract k-hop subgraph
+            nodes, edges = dgl.khop_in_subgraph(g, seeds, k=2)
+            subg = g.subgraph(nodes)
+            return subg
+            
+        elif method == 'random':
+            # Simple random node sampling
+            sample_size = min(g.num_nodes() // 2 + 1, g.num_nodes())
+            nodes = torch.randperm(g.num_nodes())[:sample_size]
+            return g.subgraph(nodes)
+            
+        else:
+            return g  # Return original graph if method not supported
+            
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"DGL sampling failed: {e}")
+        return g  # Return original graph on error
