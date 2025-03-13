@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Streamlined CLI for ProcessMine with consolidated configuration-based argument handling
-and optimized memory usage.
+and optimized memory usage. Now using DGL for graph operations.
 """
 import argparse
 import logging
@@ -11,6 +11,7 @@ import os
 import sys
 import json
 import numpy as np
+import dgl
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Union, Tuple
 import importlib
@@ -314,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
         Configured ArgumentParser
     """
     parser = argparse.ArgumentParser(
-        description="ProcessMine: Memory-Efficient Process Mining with GNN, LSTM, and RL",
+        description="ProcessMine: Memory-Efficient Process Mining with DGL, LSTM, and RL",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -451,6 +452,9 @@ def set_random_seed(seed):
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+        
+        # DGL
+        dgl.random.seed(seed)
             
         logger.info(f"Random seed set to {seed}")
 

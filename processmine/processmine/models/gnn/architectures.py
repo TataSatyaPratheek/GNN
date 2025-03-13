@@ -1,13 +1,13 @@
 """
 Memory-efficient graph neural network architectures for process mining with 
-optimized attention mechanisms and minimal memory footprint.
+DGL-based implementations for optimized attention mechanisms and minimal memory footprint.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing, GATConv
-from torch_geometric.nn import global_mean_pool, global_add_pool, global_max_pool
-from torch_geometric.utils import add_self_loops, degree
+import dgl
+import dgl.nn as dglnn
+import dgl.function as fn
 import numpy as np
 import logging
 import math
@@ -21,15 +21,15 @@ class BaseProcessModel(nn.Module):
     def __init__(self):
         super().__init__()
     
-    def forward(self, x):
+    def forward(self, g):
         """Forward pass - to be implemented by subclasses"""
         raise NotImplementedError("Subclasses must implement forward method")
     
-    def predict(self, x):
+    def predict(self, g):
         """Make predictions with a consistent interface"""
         self.eval()
         with torch.no_grad():
-            outputs = self.forward(x)
+            outputs = self.forward(g)
             # Handle different output formats
             if isinstance(outputs, dict):
                 logits = outputs.get("task_pred", next(iter(outputs.values())))
@@ -41,11 +41,11 @@ class BaseProcessModel(nn.Module):
             _, predictions = torch.max(logits, dim=1)
             return predictions
     
-    def get_embeddings(self, x):
+    def get_embeddings(self, g):
         """Get embeddings from model - to be implemented by subclasses"""
         raise NotImplementedError("Embedding extraction not implemented for this model")
     
-    def get_attention_weights(self, x):
+    def get_attention_weights(self, g):
         """Get attention weights from model - to be implemented by compatible subclasses"""
         raise NotImplementedError("Attention weights not available for this model")
     
@@ -169,8 +169,14 @@ class MemoryEfficientGNN(BaseProcessModel):
         
         # Create hidden layers
         for i in range(1, num_layers):
+            # Calculate input size for this layer
+            if attention_type in ["basic", "positional"]:
+                current_input_dim = hidden_dim * heads
+            else:
+                current_input_dim = hidden_dim * heads
+            
             self.convs.append(self._create_conv_layer(
-                hidden_dim * heads, 
+                current_input_dim, 
                 hidden_dim,
                 first_layer=False
             ))
@@ -187,28 +193,19 @@ class MemoryEfficientGNN(BaseProcessModel):
         else:
             self.norms = None
         
-        # Set up pooling layer
-        if pooling == "mean":
-            self.pool = global_mean_pool
-        elif pooling == "sum":
-            self.pool = global_add_pool
-        elif pooling == "max":
-            self.pool = global_max_pool
-        elif pooling == "combined":
-            # Combined pooling (concatenate mean, max, sum)
-            self.pool = self._combined_pooling
-            combined_size = hidden_dim * heads * 3
-            self.pool_proj = nn.Linear(combined_size, hidden_dim * heads)
-        elif pooling == "attention":
-            # Attention-based pooling
-            self.pool = self._attention_pooling
+        # Set up pooling
+        # In DGL, we can use readout functions for pooling
+        self.pooling_func = self._set_pooling_func(pooling)
+        
+        # For attention pooling and combined pooling, we need additional layers
+        if pooling == "attention":
             self.pool_attention = nn.Sequential(
                 nn.Linear(hidden_dim * heads, hidden_dim),
                 nn.Tanh(),
                 nn.Linear(hidden_dim, 1)
             )
-        else:
-            raise ValueError(f"Unknown pooling method: {pooling}")
+        elif pooling == "combined":
+            self.pool_proj = nn.Linear(hidden_dim * heads * 3, hidden_dim * heads)
         
         # Prediction heads
         # Task prediction
@@ -246,104 +243,140 @@ class MemoryEfficientGNN(BaseProcessModel):
     def _create_conv_layer(self, in_channels, out_channels, first_layer=False):
         """Create the appropriate convolutional layer based on attention type"""
         if self.attention_type == "basic":
-            return MemoryEfficientGATConv(
+            return MemoryEfficientGATLayer(
                 in_channels, 
                 out_channels,
-                heads=self.heads,
-                dropout=self.dropout,
-                add_self_loops=True,
-                sparse_attention=self.sparse_attention,
-                concat=True
+                num_heads=self.heads,
+                feat_drop=self.dropout,
+                residual=self.use_residual,
+                sparse_attention=self.sparse_attention
             )
         elif self.attention_type == "positional":
-            return PositionalGATConv(
+            return PositionalGATLayer(
                 in_channels, 
                 out_channels,
-                heads=self.heads,
+                num_heads=self.heads,
                 pos_dim=self.pos_enc_dim,
-                dropout=self.dropout,
-                concat=True
+                feat_drop=self.dropout,
+                residual=self.use_residual
             )
         elif self.attention_type == "diverse":
-            return DiverseGATConv(
+            return DiverseGATLayer(
                 in_channels, 
                 out_channels,
-                heads=self.heads,
+                num_heads=self.heads,
                 diversity_weight=self.diversity_weight,
-                dropout=self.dropout,
-                concat=True
+                feat_drop=self.dropout,
+                residual=self.use_residual
             )
         elif self.attention_type == "combined":
-            return CombinedGATConv(
+            return CombinedGATLayer(
                 in_channels, 
                 out_channels,
-                heads=self.heads,
+                num_heads=self.heads,
                 pos_dim=self.pos_enc_dim,
                 diversity_weight=self.diversity_weight,
-                dropout=self.dropout,
-                concat=True
+                feat_drop=self.dropout,
+                residual=self.use_residual
             )
         else:
             raise ValueError(f"Unknown attention type: {self.attention_type}")
     
-    def _combined_pooling(self, x, batch):
+    def _set_pooling_func(self, pooling):
+        """Set pooling function based on pooling type"""
+        if pooling == "mean":
+            return lambda g, h: dgl.readout_nodes(g, 'h', op='mean')
+        elif pooling == "sum":
+            return lambda g, h: dgl.readout_nodes(g, 'h', op='sum')
+        elif pooling == "max":
+            return lambda g, h: dgl.readout_nodes(g, 'h', op='max')
+        elif pooling == "attention":
+            # Will be handled in forward pass
+            return self._attention_pooling
+        elif pooling == "combined":
+            # Will be handled in forward pass
+            return self._combined_pooling
+        else:
+            raise ValueError(f"Unknown pooling method: {pooling}")
+    
+    def _combined_pooling(self, g, h):
         """Combined pooling (concatenate mean, max, sum)"""
-        mean_pool = global_mean_pool(x, batch)
-        max_pool = global_max_pool(x, batch)
-        sum_pool = global_add_pool(x, batch)
+        mean_pool = dgl.readout_nodes(g, 'h', op='mean')
+        max_pool = dgl.readout_nodes(g, 'h', op='max')
+        sum_pool = dgl.readout_nodes(g, 'h', op='sum')
         combined = torch.cat([mean_pool, max_pool, sum_pool], dim=1)
         return self.pool_proj(combined)
     
-    def _attention_pooling(self, x, batch):
+    def _attention_pooling(self, g, h):
         """Attention-based pooling"""
         # Calculate attention scores
-        scores = self.pool_attention(x)
+        scores = self.pool_attention(h)
         
-        # Apply softmax over nodes in each graph
-        scores = scores.view(-1, 1)
+        # Apply softmax within each graph
+        g.ndata['gate'] = scores
+        g.ndata['h'] = h
         
-        # Mask for each graph
-        from torch_scatter import scatter_softmax
-        scores = scatter_softmax(scores, batch, dim=0)
+        # Using DGL's softmax and weighted sum
+        g.group_apply_edges('src', lambda edges: {'gate': torch.softmax(edges.data['gate'], dim=0)})
+        g.ndata['h_weighted'] = g.ndata['h'] * g.ndata['gate']
         
-        # Weighted sum of node features
-        from torch_scatter import scatter_sum
-        weighted_x = x * scores
-        return scatter_sum(weighted_x, batch, dim=0)
+        # Readout weighted feature
+        return dgl.readout_nodes(g, 'h_weighted', op='sum')
     
-    def _generate_positions(self, batch):
+    def _generate_positions(self, g):
         """
         Generate positional encodings for nodes in each graph
         
         Args:
-            batch: Batch assignment tensor [num_nodes]
+            g: DGL graph or batched graph
             
         Returns:
             Position tensor [num_nodes, 2]
         """
         # Get device
-        device = batch.device
+        device = g.device if hasattr(g, 'device') else next(self.parameters()).device
         
-        # Get number of nodes
-        num_nodes = batch.size(0)
-        
-        # Get unique batch indices and their counts
-        unique_batches, counts = torch.unique(batch, return_counts=True)
-        
-        # Create positions tensor
-        pos = torch.zeros((num_nodes, 2), device=device)
-        
-        # Calculate position for each node
-        start_idx = 0
-        for b_idx, count in zip(unique_batches, counts):
-            # Get count as Python int
-            count_val = count.item()
+        # For batched graph, calculate positions per graph
+        if g.batch_size > 1:
+            # Get the number of nodes per graph
+            batch_num_nodes = g.batch_num_nodes()
+            
+            positions = []
+            offset = 0
+            
+            for num_nodes in batch_num_nodes:
+                # Calculate grid dimensions for 2D layout
+                grid_size = int(math.sqrt(num_nodes)) + 1
+                
+                # Generate positions for this graph
+                for i in range(num_nodes):
+                    row = i // grid_size
+                    col = i % grid_size
+                    
+                    # Normalize to [0,1]
+                    norm_row = row / max(1, grid_size - 1)
+                    norm_col = col / max(1, grid_size - 1)
+                    
+                    # Add position
+                    positions.append([norm_row, norm_col])
+                
+                # Update offset
+                offset += num_nodes
+            
+            # Create tensor of all positions
+            return torch.tensor(positions, device=device)
+        else:
+            # Single graph
+            num_nodes = g.num_nodes()
             
             # Calculate grid dimensions for 2D layout
-            grid_size = int(math.sqrt(count_val)) + 1
+            grid_size = int(math.sqrt(num_nodes)) + 1
+            
+            # Create positions tensor
+            positions = torch.zeros((num_nodes, 2), device=device)
             
             # Assign positions in grid pattern
-            for i in range(count_val):
+            for i in range(num_nodes):
                 row = i // grid_size
                 col = i % grid_size
                 
@@ -352,35 +385,32 @@ class MemoryEfficientGNN(BaseProcessModel):
                 norm_col = col / max(1, grid_size - 1)
                 
                 # Assign position
-                pos[start_idx + i, 0] = norm_row
-                pos[start_idx + i, 1] = norm_col
+                positions[i, 0] = norm_row
+                positions[i, 1] = norm_col
             
-            # Update start index
-            start_idx += count_val
-        
-        return pos
+            return positions
     
-    def forward(self, data):
+    def forward(self, g):
         """
         Forward pass with memory optimizations
         
         Args:
-            data: PyG data object with x, edge_index, and batch attributes
+            g: DGL graph or batched graph
             
         Returns:
             Model output (format depends on configuration)
         """
-        # Extract features and structure
-        x, edge_index, batch = data.x, data.edge_index, data.batch
+        # Get node features
+        h = g.ndata['feat']
         
         # Handle positional encodings
         if self.attention_type in ["positional", "combined"]:
-            # Generate positions based on batch indices
-            pos = self._generate_positions(batch)
+            # Generate positions based on graph
+            pos = self._generate_positions(g)
             
             # Add position embeddings to input
             pos_embedding = self.pos_encoder(pos)
-            x = torch.cat([x, pos_embedding], dim=-1)
+            h = torch.cat([h, pos_embedding], dim=-1)
         
         # Track diversity losses and attention weights
         diversity_losses = []
@@ -389,76 +419,88 @@ class MemoryEfficientGNN(BaseProcessModel):
         # Memory for residual connections
         residual = None
         
-        # Process through GNN layers with checkpointing if enabled
+        # Process through GNN layers
         for i, conv in enumerate(self.convs):
             # Apply convolutional layer with optional checkpointing
-            if self.use_checkpointing and self.training:
+            if self.use_checkpointing and self.training and torch.torch.utils.checkpoint.is_available():
                 # Use checkpointing to save memory during backprop
                 if self.attention_type in ["diverse", "combined"]:
-                    # Handle layers that return diversity loss and attention weights
-                    x_new, div_loss, attn_weights = torch.utils.checkpoint.checkpoint(
-                        conv, x, edge_index, True  # Return attention flag
+                    h_new, div_loss, attn_weights = torch.utils.checkpoint.checkpoint(
+                        lambda g, h: conv(g, h, return_attention=True),
+                        g, h
                     )
-                    x = x_new
+                    h = h_new
                     diversity_losses.append(div_loss)
                     attn_weights_list.append(attn_weights)
                 else:
-                    # Standard layers
+                    # Check if layer supports returning attention weights
                     if hasattr(conv, 'return_attention_weights'):
-                        # For layers that support attention weights
-                        x_new, attn_weights = torch.utils.checkpoint.checkpoint(
-                            lambda a, b: conv(a, b, return_attention_weights=True),
-                            x, edge_index
+                        h_new, attn_weights = torch.utils.checkpoint.checkpoint(
+                            lambda g, h: conv(g, h, return_attention_weights=True),
+                            g, h
                         )
-                        x = x_new
+                        h = h_new
                         attn_weights_list.append(attn_weights)
                     else:
-                        # Layers without attention weights
-                        x = torch.utils.checkpoint.checkpoint(conv, x, edge_index)
+                        h = torch.utils.checkpoint.checkpoint(
+                            lambda g, h: conv(g, h),
+                            g, h
+                        )
             else:
                 # Standard forward pass without checkpointing
                 if self.attention_type in ["diverse", "combined"]:
                     # Layers with diversity loss
-                    x, div_loss, attn_weights = conv(x, edge_index, return_attention=True)
+                    h, div_loss, attn_weights = conv(g, h, return_attention=True)
                     diversity_losses.append(div_loss)
                     attn_weights_list.append(attn_weights)
                 else:
                     # Standard or positional convolution
                     if hasattr(conv, 'return_attention_weights'):
-                        # Layers with attention weights
-                        x, attn_weights = conv(x, edge_index, return_attention_weights=True)
+                        h, attn_weights = conv(g, h, return_attention_weights=True)
                         attn_weights_list.append(attn_weights)
                     else:
-                        # Plain layers
-                        x = conv(x, edge_index)
+                        h = conv(g, h)
             
             # Apply normalization if enabled
             if self.norms is not None:
-                x = self.norms[i](x)
+                h = self.norms[i](h)
             
-            # Apply activation and dropout
-            x = F.elu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+            # Apply activation
+            h = F.elu(h)
+            
+            # Apply dropout
+            h = F.dropout(h, p=self.dropout, training=self.training)
             
             # Apply residual connection if enabled
             if self.use_residual and i > 0 and residual is not None:
-                if residual.shape == x.shape:
-                    x = x + residual
+                if residual.shape == h.shape:
+                    h = h + residual
             
             # Store for next residual connection
-            residual = x
+            residual = h
             
             # Aggressive memory optimization if needed
             if self.mem_efficient and i < self.num_layers - 1 and torch.cuda.is_available():
                 # Free memory from intermediate computations for very large graphs
-                if x.shape[0] > 10000:  # Only for very large graphs
+                if g.num_nodes() > 10000:  # Only for very large graphs
                     torch.cuda.empty_cache()
         
         # Store attention weights for visualization
         self.attention_weights = attn_weights_list
         
-        # Apply global pooling to get graph-level representations
-        pooled = self.pool(x, batch)
+        # Store node embeddings in graph for pooling
+        g.ndata['h'] = h
+        
+        # Apply graph pooling
+        if self.pooling_type in ["mean", "sum", "max"]:
+            # Use standard readout functions
+            pooled = self.pooling_func(g, h)
+        elif self.pooling_type == "attention":
+            # Use attention pooling
+            pooled = self._attention_pooling(g, h)
+        elif self.pooling_type == "combined":
+            # Use combined pooling
+            pooled = self._combined_pooling(g, h)
         
         # Task prediction
         task_pred = self.task_pred(pooled)
@@ -483,850 +525,850 @@ class MemoryEfficientGNN(BaseProcessModel):
         
         return outputs
     
-    def get_embeddings(self, data):
+    def get_embeddings(self, g):
         """
         Extract node embeddings from the model
         
         Args:
-            data: PyG data object
+            g: DGL graph or batched graph
             
         Returns:
-            Node embeddings
+            Node embeddings and graph IDs
         """
         self.eval()
         with torch.no_grad():
-            # Extract features and structure
-            x, edge_index, batch = data.x, data.edge_index, data.batch
+            # Get node features
+            h = g.ndata['feat']
             
             # Handle positional encodings
             if self.attention_type in ["positional", "combined"]:
-                pos = self._generate_positions(batch)
+                pos = self._generate_positions(g)
                 pos_embedding = self.pos_encoder(pos)
-                x = torch.cat([x, pos_embedding], dim=-1)
+                h = torch.cat([h, pos_embedding], dim=-1)
             
             # Process through GNN layers
             for i, conv in enumerate(self.convs):
                 # Apply convolutional layer
                 if self.attention_type in ["diverse", "combined"]:
-                    x, _, _ = conv(x, edge_index, return_attention=True)
+                    h, _, _ = conv(g, h, return_attention=True)
                 else:
                     if hasattr(conv, 'return_attention_weights'):
-                        x, _ = conv(x, edge_index, return_attention_weights=False)
+                        h, _ = conv(g, h, return_attention_weights=False)
                     else:
-                        x = conv(x, edge_index)
+                        h = conv(g, h)
                 
                 # Apply normalization if enabled
                 if self.norms is not None:
-                    x = self.norms[i](x)
+                    h = self.norms[i](h)
                 
                 # Apply activation
-                x = F.elu(x)
+                h = F.elu(h)
             
-            # Return node embeddings and batch assignments
-            return x, batch
+            # For batched graph, get graph IDs
+            if g.batch_size > 1:
+                # Create graph ID mapping (which node belongs to which graph)
+                graph_ids = []
+                offset = 0
+                for i, num_nodes in enumerate(g.batch_num_nodes()):
+                    graph_ids.extend([i] * num_nodes)
+                graph_ids = torch.tensor(graph_ids, device=h.device)
+            else:
+                # Single graph - all nodes have same graph ID
+                graph_ids = torch.zeros(g.num_nodes(), device=h.device)
+            
+            # Return node embeddings and graph IDs
+            return h, graph_ids
     
-    def get_attention_weights(self, data):
+    def get_attention_weights(self, g):
         """
         Get attention weights for interpretability
         
         Args:
-            data: PyG data object
+            g: DGL graph or batched graph
             
         Returns:
             List of attention weights for each layer
         """
         # Run forward pass to populate attention weights
-        _ = self.forward(data)
+        _ = self.forward(g)
         
         # Return stored attention weights
         return self.attention_weights
 
 
-class MemoryEfficientGATConv(MessagePassing):
+class MemoryEfficientGATLayer(nn.Module):
     """
-    Memory-efficient Graph Attention Layer with sparse attention option
-    for processing very large graphs
+    Memory-efficient Graph Attention Layer implementation based on DGL
+    with sparse attention option for processing very large graphs
     """
     def __init__(
         self, 
-        in_channels: int, 
-        out_channels: int, 
-        heads: int = 1, 
-        concat: bool = True, 
-        negative_slope: float = 0.2, 
-        dropout: float = 0.0, 
-        add_self_loops: bool = True,
-        bias: bool = True,
+        in_dim: int, 
+        out_dim: int, 
+        num_heads: int = 1, 
+        feat_drop: float = 0.0, 
+        residual: bool = True,
         sparse_attention: bool = False,
     ):
-        super().__init__(aggr='add', node_dim=0)
+        super().__init__()
         
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.heads = heads
-        self.concat = concat
-        self.negative_slope = negative_slope
-        self.dropout = dropout
-        self.add_self_loops = add_self_loops
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.num_heads = num_heads
+        self.feat_drop = feat_drop
+        self.residual = residual
         self.sparse_attention = sparse_attention
         
-        # Linear transformations
-        self.lin = nn.Linear(in_channels, heads * out_channels, bias=False)
+        # The input feature transformation
+        self.fc = nn.Linear(in_dim, out_dim * num_heads, bias=False)
         
-        # Attention weights
-        self.att = nn.Parameter(torch.Tensor(1, heads, 2 * out_channels))
+        # The attention mechanism
+        self.attn_src = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
+        self.attn_dst = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
         
-        # Bias
-        if bias and concat:
-            self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
-        elif bias and not concat:
-            self.bias = nn.Parameter(torch.Tensor(out_channels))
+        # Residual connection
+        if residual:
+            if in_dim != out_dim * num_heads:
+                self.res_fc = nn.Linear(in_dim, out_dim * num_heads, bias=False)
+            else:
+                self.res_fc = None
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter('res_fc', None)
         
         # Initialize weights
-        self._init_weights()
+        self.reset_parameters()
+        
+        # Message and reduce functions
+        self.message_func = self._message_func
+        self.reduce_func = fn.sum
+        
+        # Sparse attention support
+        self.chunk_size = 10000 if sparse_attention else None
     
-    def _init_weights(self):
+    def reset_parameters(self):
         """Initialize weights with Xavier uniform"""
-        nn.init.xavier_uniform_(self.lin.weight)
-        nn.init.xavier_uniform_(self.att)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.xavier_uniform_(self.attn_src)
+        nn.init.xavier_uniform_(self.attn_dst)
+        if self.res_fc is not None:
+            nn.init.xavier_uniform_(self.res_fc.weight)
     
-    def forward(self, x, edge_index, return_attention_weights=False):
+    def _message_func(self, edges):
+        """Message function for attention mechanism"""
+        # Compute attention coefficients
+        src_attn = (edges.src['ft'] * self.attn_src).sum(dim=-1)
+        dst_attn = (edges.dst['ft'] * self.attn_dst).sum(dim=-1)
+        e = src_attn + dst_attn
+        
+        # Apply activation and softmax
+        e = F.leaky_relu(e, negative_slope=0.2)
+        
+        # Return message and attention weight
+        return {'m': edges.src['ft'], 'e': e}
+    
+    def forward(self, g, feat, return_attention_weights=False):
         """
-        Forward pass with optional attention weight return
+        Forward computation
         
         Args:
-            x: Node features [N, in_channels]
-            edge_index: Edge indices [2, E]
+            g: DGL graph or batched graph
+            feat: Input node features
             return_attention_weights: Whether to return attention weights
             
         Returns:
             Updated node features or tuple of (features, attention weights)
         """
-        # Add self-loops for better message passing
-        if self.add_self_loops:
-            edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+        if self.sparse_attention and g.num_nodes() > self.chunk_size:
+            return self._forward_sparse(g, feat, return_attention_weights)
         
-        # Linear transformation to project input features
-        x = self.lin(x).view(-1, self.heads, self.out_channels)
+        # Node feature transformation
+        h = self.fc(feat).view(-1, self.num_heads, self.out_dim)
         
-        # Memory-efficient message passing with sparse attention if requested
-        if self.sparse_attention and x.size(0) > 10000:
-            # For very large graphs, use sparse implementation
-            return self._sparse_forward(x, edge_index, return_attention_weights)
-        else:
-            # For regular graphs, use standard implementation
-            return self._dense_forward(x, edge_index, return_attention_weights)
-    
-    def _dense_forward(self, x, edge_index, return_attention_weights):
-        """Standard GATConv implementation using dense attention"""
-        # Compute attention scores
-        # Extract node features for source and target nodes
-        row, col = edge_index
-        x_i, x_j = x[row], x[col]
+        # Apply feature dropout
+        h = F.dropout(h, p=self.feat_drop, training=self.training)
         
-        # Concatenate source and target features for attention
-        alpha = torch.cat([x_i, x_j], dim=-1)
-        alpha = (alpha * self.att).sum(dim=-1)
+        # Store transformed features
+        g.ndata['ft'] = h
         
-        # Apply LeakyReLU activation
-        alpha = F.leaky_relu(alpha, self.negative_slope)
+        # Compute attention weights
+        g.apply_edges(self._message_func)
         
-        # Normalize attention scores using softmax (grouped by source node)
-        alpha = softmax(alpha, row, num_nodes=x.size(0))
+        # Apply softmax to attention weights (grouped by destination node)
+        g.edata['a'] = dgl.ops.edge_softmax(g, g.edata['e'])
         
-        # Apply dropout to attention weights
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        # Message passing
+        g.update_all(fn.u_mul_e('ft', 'a', 'm'), fn.sum('m', 'ft'))
         
-        # Apply weighted aggregation of neighbor features
-        out = torch.zeros(x.size(0), self.heads, self.out_channels, device=x.device)
-        alpha = alpha.view(-1, self.heads, 1)
-        out.index_add_(0, row, x_j * alpha)
+        # Get the updated features
+        h = g.ndata['ft']
         
-        # Apply concatenation or mean
-        if self.concat:
-            out = out.view(-1, self.heads * self.out_channels)
-        else:
-            out = out.mean(dim=1)
+        # Reshape for output
+        h = h.view(-1, self.num_heads * self.out_dim)
         
-        # Add bias
-        if self.bias is not None:
-            out = out + self.bias
+        # Apply residual connection if specified
+        if self.residual:
+            if self.res_fc is not None:
+                resval = self.res_fc(feat)
+            else:
+                resval = feat
+            h = h + resval
         
         # Return with attention weights if requested
         if return_attention_weights:
-            return out, (edge_index, alpha)
+            return h, g.edata['a']
         else:
-            return out
+            return h
     
-    def _sparse_forward(self, x, edge_index, return_attention_weights):
-        """Sparse implementation for very large graphs"""
-        # This implementation uses less memory by performing operations in chunks
-        row, col = edge_index
+    def _forward_sparse(self, g, feat, return_attention_weights=False):
+        """
+        Sparse implementation of forward pass for very large graphs.
+        Process the graph in chunks to reduce memory usage.
+        """
+        num_nodes = g.num_nodes()
+        chunk_size = self.chunk_size
         
-        # Process in chunks to save memory
-        chunk_size = 10000
-        num_edges = row.size(0)
+        # Node feature transformation
+        h = self.fc(feat).view(-1, self.num_heads, self.out_dim)
+        
+        # Apply feature dropout
+        h = F.dropout(h, p=self.feat_drop, training=self.training)
+        
+        # Store transformed features
+        g.ndata['ft'] = h
         
         # Initialize output tensor
-        out = torch.zeros(x.size(0), self.heads * self.out_channels if self.concat else self.out_channels, 
-                         device=x.device)
+        out = torch.zeros(num_nodes, self.num_heads, self.out_dim, 
+                         device=feat.device)
         
-        # Initialize attention weights for return if needed
+        # Store attention weights if needed
         if return_attention_weights:
-            all_alpha = torch.zeros(num_edges, self.heads, device=x.device)
+            g.edata['a'] = torch.zeros(g.num_edges(), self.num_heads, 
+                                      device=feat.device)
         
-        # Process edges in chunks
-        for i in range(0, num_edges, chunk_size):
-            end_idx = min(i + chunk_size, num_edges)
-            chunk_row, chunk_col = row[i:end_idx], col[i:end_idx]
+        # Process nodes in chunks
+        for i in range(0, num_nodes, chunk_size):
+            end_idx = min(i + chunk_size, num_nodes)
+            chunk_nodes = list(range(i, end_idx))
             
-            # Get features for this chunk
-            x_i, x_j = x[chunk_row], x[chunk_col]
+            # Create subgraph with these nodes
+            sg = g.subgraph(chunk_nodes, store_ids=True)
             
-            # Compute attention scores for this chunk
-            alpha = torch.cat([x_i, x_j], dim=-1)
-            alpha = (alpha * self.att).sum(dim=-1)
-            alpha = F.leaky_relu(alpha, self.negative_slope)
+            # Compute message function for subgraph
+            sg.apply_edges(self._message_func)
             
-            # We need to normalize across all edges of each source node
-            # This requires looking outside the chunk, so we use a custom function
-            unique_rows, inverse_rows = torch.unique(chunk_row, return_inverse=True)
+            # Apply softmax to attention weights
+            sg.edata['a'] = dgl.ops.edge_softmax(sg, sg.edata['e'])
             
-            # Initialize normalization values
-            row_sums = torch.zeros(unique_rows.size(0), self.heads, device=x.device)
+            # Message passing in subgraph
+            sg.update_all(fn.u_mul_e('ft', 'a', 'm'), fn.sum('m', 'ft'))
             
-            # Sum attention scores for each source node
-            for h in range(self.heads):
-                row_sums.index_add_(0, inverse_rows, alpha[:, h].unsqueeze(1))
+            # Copy results back to original graph
+            out[sg.ndata[dgl.NID]] = sg.ndata['ft']
             
-            # Normalize using computed sums
-            normalized_alpha = alpha.clone()
-            eps = 1e-8  # Prevent division by zero
-            
-            for h in range(self.heads):
-                normalized_alpha[:, h] = alpha[:, h] / (row_sums[inverse_rows, h].squeeze() + eps)
-            
-            # Apply dropout
-            normalized_alpha = F.dropout(normalized_alpha, p=self.dropout, training=self.training)
-            
-            # Save for return if needed
+            # Store attention weights if needed
             if return_attention_weights:
-                all_alpha[i:end_idx] = normalized_alpha
-            
-            # Apply weighted aggregation for this chunk
-            for h in range(self.heads):
-                for j in range(end_idx - i):
-                    src_idx = chunk_row[j].item()
-                    tgt_idx = chunk_col[j].item()
-                    weight = normalized_alpha[j, h]
-                    
-                    # Add weighted features
-                    if self.concat:
-                        out[src_idx, h * self.out_channels:(h + 1) * self.out_channels] += \
-                            weight * x_j[j, h]
-                    else:
-                        out[src_idx] += weight * x_j[j, h]
+                g.edata['a'][sg.edata[dgl.EID]] = sg.edata['a']
         
-        # Add bias
-        if self.bias is not None:
-            out = out + self.bias
+        # Reshape for output
+        h_out = out.view(-1, self.num_heads * self.out_dim)
+        
+        # Apply residual connection if specified
+        if self.residual:
+            if self.res_fc is not None:
+                resval = self.res_fc(feat)
+            else:
+                resval = feat
+            h_out = h_out + resval
         
         # Return with attention weights if requested
         if return_attention_weights:
-            all_alpha = all_alpha.view(-1, self.heads, 1)
-            return out, (edge_index, all_alpha)
+            return h_out, g.edata['a']
         else:
-            return out
+            return h_out
 
 
-class PositionalGATConv(MessagePassing):
+class PositionalGATLayer(nn.Module):
     """
     Position-enhanced Graph Attention Layer optimized for memory efficiency
     """
     def __init__(
         self, 
-        in_channels: int, 
-        out_channels: int, 
-        heads: int = 1, 
+        in_dim: int, 
+        out_dim: int, 
+        num_heads: int = 1, 
         pos_dim: int = 16,
-        concat: bool = True, 
-        negative_slope: float = 0.2, 
-        dropout: float = 0.0, 
-        bias: bool = True
+        feat_drop: float = 0.0, 
+        residual: bool = True
     ):
-        super().__init__(aggr='add', node_dim=0)
+        super().__init__()
         
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.heads = heads
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.num_heads = num_heads
         self.pos_dim = pos_dim
-        self.concat = concat
-        self.negative_slope = negative_slope
-        self.dropout = dropout
+        self.feat_drop = feat_drop
+        self.residual = residual
         
-        # Main transformation
-        self.lin = nn.Linear(in_channels, heads * out_channels, bias=False)
+        # Input feature transformation
+        # Adjust for positional information already in input
+        content_dim = in_dim - pos_dim
+        self.fc = nn.Linear(content_dim, out_dim * num_heads, bias=False)
         
         # Attention weights for content
-        self.att = nn.Parameter(torch.Tensor(1, heads, 2 * out_channels))
+        self.attn_src = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
+        self.attn_dst = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
         
-        # Positional attention component
-        # Calculate positional component size
-        pos_input_size = in_channels - pos_dim  # Input size without positional part
+        # Attention weights for positional information
+        self.pos_attn_src = nn.Parameter(torch.FloatTensor(1, num_heads, pos_dim))
+        self.pos_attn_dst = nn.Parameter(torch.FloatTensor(1, num_heads, pos_dim))
         
-        # Attention weights for spatial positions
-        self.pos_att = nn.Parameter(torch.Tensor(1, heads, 2 * pos_dim))
-        
-        # Bias
-        if bias and concat:
-            self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
-        elif bias and not concat:
-            self.bias = nn.Parameter(torch.Tensor(out_channels))
+        # Residual connection
+        if residual:
+            if in_dim != out_dim * num_heads:
+                self.res_fc = nn.Linear(in_dim, out_dim * num_heads, bias=False)
+            else:
+                self.res_fc = None
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter('res_fc', None)
         
-        self._init_weights()
+        # Initialize weights
+        self.reset_parameters()
     
-    def _init_weights(self):
-        """Initialize weights"""
-        nn.init.xavier_uniform_(self.lin.weight)
-        nn.init.xavier_uniform_(self.att)
-        nn.init.xavier_uniform_(self.pos_att)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
+    def reset_parameters(self):
+        """Initialize weights with Xavier uniform"""
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.xavier_uniform_(self.attn_src)
+        nn.init.xavier_uniform_(self.attn_dst)
+        nn.init.xavier_uniform_(self.pos_attn_src)
+        nn.init.xavier_uniform_(self.pos_attn_dst)
+        if self.res_fc is not None:
+            nn.init.xavier_uniform_(self.res_fc.weight)
     
-    def forward(self, x, edge_index, return_attention_weights=False):
-        """Forward pass with optional attention weights return"""
-        # Add self-loops
-        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+    def forward(self, g, feat, return_attention_weights=False):
+        """
+        Forward computation
         
+        Args:
+            g: DGL graph or batched graph
+            feat: Input node features with positional encoding appended
+            return_attention_weights: Whether to return attention weights
+            
+        Returns:
+            Updated node features or tuple of (features, attention weights)
+        """
         # Split input into content and positional parts
-        content_x = x[:, :-self.pos_dim]
-        pos_x = x[:, -self.pos_dim:]
+        content = feat[:, :-self.pos_dim]
+        pos = feat[:, -self.pos_dim:]
         
-        # Linear transformation for content
-        content = self.lin(content_x).view(-1, self.heads, self.out_channels)
+        # Content transformation
+        h_content = self.fc(content).view(-1, self.num_heads, self.out_dim)
         
-        # Extract node indices
-        row, col = edge_index
-        src_content, dst_content = content[row], content[col]
-        src_pos, dst_pos = pos_x[row], pos_x[col]
+        # Apply feature dropout
+        h_content = F.dropout(h_content, p=self.feat_drop, training=self.training)
         
-        # Compute content attention component
-        alpha_content = torch.cat([src_content, dst_content], dim=-1)
-        alpha_content = (alpha_content * self.att).sum(dim=-1)
+        # Store transformed features and positional info
+        g.ndata['ft'] = h_content
+        g.ndata['pos'] = pos
         
-        # Compute positional attention component
-        alpha_pos = torch.cat([
-            src_pos.unsqueeze(1).repeat(1, self.heads, 1),
-            dst_pos.unsqueeze(1).repeat(1, self.heads, 1)
-        ], dim=-1)
-        alpha_pos = (alpha_pos * self.pos_att).sum(dim=-1)
+        # Custom message function that computes content and positional attention
+        def message_func(edges):
+            # Content attention
+            src_attn = (edges.src['ft'] * self.attn_src).sum(dim=-1)
+            dst_attn = (edges.dst['ft'] * self.attn_dst).sum(dim=-1)
+            content_e = src_attn + dst_attn
+            
+            # Positional attention
+            src_pos_attn = (edges.src['pos'].unsqueeze(1) * self.pos_attn_src).sum(dim=-1)
+            dst_pos_attn = (edges.dst['pos'].unsqueeze(1) * self.pos_attn_dst).sum(dim=-1)
+            pos_e = src_pos_attn + dst_pos_attn
+            
+            # Combine content and positional attention
+            e = content_e + pos_e
+            e = F.leaky_relu(e, negative_slope=0.2)
+            
+            return {'m': edges.src['ft'], 'e': e}
         
-        # Combine attentions
-        alpha = alpha_content + alpha_pos
+        # Apply message function to edges
+        g.apply_edges(message_func)
         
-        # Apply LeakyReLU
-        alpha = F.leaky_relu(alpha, self.negative_slope)
+        # Apply softmax to attention weights
+        g.edata['a'] = dgl.ops.edge_softmax(g, g.edata['e'])
         
-        # Normalize attention weights
-        alpha = softmax(alpha, row, num_nodes=x.size(0))
+        # Message passing
+        g.update_all(fn.u_mul_e('ft', 'a', 'm'), fn.sum('m', 'ft'))
         
-        # Apply dropout
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        # Get the updated features
+        h = g.ndata['ft']
         
-        # Apply weighted aggregation for messages
-        out = self.propagate(edge_index, x=content, alpha=alpha, size=None)
+        # Reshape for output
+        h = h.view(-1, self.num_heads * self.out_dim)
         
-        # Apply concat/mean
-        if self.concat:
-            out = out.view(-1, self.heads * self.out_channels)
-        else:
-            out = out.mean(dim=1)
-        
-        # Apply bias
-        if self.bias is not None:
-            out = out + self.bias
+        # Apply residual connection if specified
+        if self.residual:
+            if self.res_fc is not None:
+                resval = self.res_fc(feat)
+            else:
+                resval = feat
+            h = h + resval
         
         # Return with attention weights if requested
         if return_attention_weights:
-            return out, (edge_index, alpha)
+            return h, g.edata['a']
         else:
-            return out
-    
-    def message(self, x_j, alpha):
-        """Message function for aggregation"""
-        # x_j: [E, heads, out_channels], alpha: [E, heads]
-        alpha = alpha.unsqueeze(-1)
-        return x_j * alpha
-    
-    def aggregate(self, inputs, index, dim_size=None):
-        """Aggregate messages using sum"""
-        return scatter_add(inputs, index, dim=0, dim_size=dim_size)
+            return h
 
 
-# processmine/models/gnn/architectures.py (UPDATED CLASS)
-
-class DiverseGATConv(MessagePassing):
+class DiverseGATLayer(nn.Module):
     """
     GAT layer with attention diversity loss to avoid attention collapse
     """
     def __init__(
         self, 
-        in_channels: int, 
-        out_channels: int, 
-        heads: int = 4, 
-        concat: bool = True, 
+        in_dim: int, 
+        out_dim: int, 
+        num_heads: int = 4, 
         diversity_weight: float = 0.1, 
-        negative_slope: float = 0.2, 
-        dropout: float = 0.0, 
-        bias: bool = True
+        feat_drop: float = 0.0, 
+        residual: bool = True
     ):
-        super().__init__(aggr='add', node_dim=0)
+        super().__init__()
         
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.heads = heads
-        self.concat = concat
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.num_heads = num_heads
         self.diversity_weight = diversity_weight
-        self.negative_slope = negative_slope
-        self.dropout = dropout
+        self.feat_drop = feat_drop
+        self.residual = residual
         
-        # Main transformation
-        self.lin = nn.Linear(in_channels, heads * out_channels, bias=False)
+        # Input feature transformation
+        self.fc = nn.Linear(in_dim, out_dim * num_heads, bias=False)
         
         # Attention weights
-        self.att = nn.Parameter(torch.Tensor(1, heads, 2 * out_channels))
+        self.attn_src = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
+        self.attn_dst = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
         
-        # Bias
-        if bias and concat:
-            self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
-        elif bias and not concat:
-            self.bias = nn.Parameter(torch.Tensor(out_channels))
+        # Residual connection
+        if residual:
+            if in_dim != out_dim * num_heads:
+                self.res_fc = nn.Linear(in_dim, out_dim * num_heads, bias=False)
+            else:
+                self.res_fc = None
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter('res_fc', None)
         
-        self._init_weights()
+        # Initialize weights
+        self.reset_parameters()
     
-    def _init_weights(self):
+    def reset_parameters(self):
         """Initialize weights with Xavier uniform"""
-        nn.init.xavier_uniform_(self.lin.weight)
-        nn.init.xavier_uniform_(self.att)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.xavier_uniform_(self.attn_src)
+        nn.init.xavier_uniform_(self.attn_dst)
+        if self.res_fc is not None:
+            nn.init.xavier_uniform_(self.res_fc.weight)
     
-    def forward(self, x, edge_index, return_attention=False):
+    def forward(self, g, feat, return_attention=False):
         """
         Forward pass with improved diversity loss
         
         Args:
-            x: Node features [N, in_channels]
-            edge_index: Edge indices [2, E]
+            g: DGL graph or batched graph
+            feat: Input node features
             return_attention: Whether to return attention weights and diversity loss
             
         Returns:
             If return_attention=False:
-                Tuple of (node_embeddings, diversity_loss)
+                Updated node features
             If return_attention=True:
-                Tuple of (node_embeddings, diversity_loss, attention_weights)
+                Tuple of (node features, diversity_loss, attention_weights)
         """
-        # Add self-loops for better message passing
-        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+        # Feature transformation
+        h = self.fc(feat).view(-1, self.num_heads, self.out_dim)
         
-        # Linear transformation to get node embeddings
-        x = self.lin(x).view(-1, self.heads, self.out_channels)
+        # Apply feature dropout
+        h = F.dropout(h, p=self.feat_drop, training=self.training)
         
-        # Extract node features for source and target nodes
-        row, col = edge_index
-        x_i, x_j = x[row], x[col]
+        # Store transformed features
+        g.ndata['ft'] = h
         
         # Compute attention scores
-        alpha = torch.cat([x_i, x_j], dim=-1)
-        alpha = (alpha * self.att).sum(dim=-1)
+        def message_func(edges):
+            src_attn = (edges.src['ft'] * self.attn_src).sum(dim=-1)
+            dst_attn = (edges.dst['ft'] * self.attn_dst).sum(dim=-1)
+            e = src_attn + dst_attn
+            e = F.leaky_relu(e, negative_slope=0.2)
+            return {'e': e}
         
-        # Apply LeakyReLU
-        alpha = F.leaky_relu(alpha, self.negative_slope)
+        g.apply_edges(message_func)
         
-        # Normalize attention weights
-        alpha = softmax(alpha, row, num_nodes=x.size(0))
+        # Apply softmax to attention weights
+        g.edata['a'] = dgl.ops.edge_softmax(g, g.edata['e'])
         
-        # Calculate diversity loss with improved method
-        diversity_loss = self._calculate_diversity_loss(alpha, row, x.size(0))
-        
-        # Apply dropout
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
-        
-        # Apply weighted aggregation
-        out = self.propagate(edge_index, x=x, alpha=alpha, size=None)
-        
-        # Apply concat/mean
-        if self.concat:
-            out = out.view(-1, self.heads * self.out_channels)
+        # Compute diversity loss if in training mode
+        if self.training or return_attention:
+            diversity_loss = self._calculate_diversity_loss(g)
         else:
-            out = out.mean(dim=1)
+            diversity_loss = torch.tensor(0.0, device=feat.device)
         
-        # Apply bias
-        if self.bias is not None:
-            out = out + self.bias
+        # Message passing
+        g.update_all(fn.u_mul_e('ft', 'a', 'm'), fn.sum('m', 'ft'))
         
-        # Return with attention weights if requested
+        # Get the updated features
+        h = g.ndata['ft']
+        
+        # Reshape for output
+        h = h.view(-1, self.num_heads * self.out_dim)
+        
+        # Apply residual connection if specified
+        if self.residual:
+            if self.res_fc is not None:
+                resval = self.res_fc(feat)
+            else:
+                resval = feat
+            h = h + resval
+        
+        # Return with diversity loss and attention weights if requested
         if return_attention:
-            return out, diversity_loss, alpha
+            return h, diversity_loss, g.edata['a']
         else:
-            return out, diversity_loss
+            return h, diversity_loss
     
-    def _calculate_diversity_loss(self, alpha, row, num_nodes):
+    def _calculate_diversity_loss(self, g):
         """
         Calculate diversity loss to encourage different attention patterns
         
         Args:
-            alpha: Attention weights [E, heads]
-            row: Row indices [E]
-            num_nodes: Number of nodes
+            g: DGL graph with attention weights in edata['a']
             
         Returns:
             Diversity loss tensor
         """
-        # Create a node-level view of attention weights
-        # For each node, gather attention distributions from all heads
+        if self.num_heads <= 1:
+            return torch.tensor(0.0, device=g.device)
         
-        # Step 1: Compute head attention correlations
-        head_correlations = torch.zeros(self.heads, self.heads, device=alpha.device)
+        # Step 1: Compute head correlations
+        # Get attention weights: [E, num_heads]
+        attn = g.edata['a']
         
-        for i in range(self.heads):
-            for j in range(i+1, self.heads):
-                # Get attention weights for each head
-                alpha_i = alpha[:, i]
-                alpha_j = alpha[:, j]
+        # Calculate pairwise cosine similarity between attention heads
+        head_sim = torch.zeros(self.num_heads, self.num_heads, device=g.device)
+        
+        for i in range(self.num_heads):
+            for j in range(i+1, self.num_heads):
+                # Extract attention weights for each head
+                a_i = attn[:, i]
+                a_j = attn[:, j]
                 
                 # Normalize for numerical stability
-                alpha_i = F.normalize(alpha_i, p=2, dim=0)
-                alpha_j = F.normalize(alpha_j, p=2, dim=0)
+                a_i = F.normalize(a_i, p=2, dim=0)
+                a_j = F.normalize(a_j, p=2, dim=0)
                 
-                # Compute cosine similarity between attention distributions
-                sim = torch.sum(alpha_i * alpha_j)
+                # Compute cosine similarity
+                sim = torch.sum(a_i * a_j)
                 
                 # Store similarity (symmetrically)
-                head_correlations[i, j] = sim
-                head_correlations[j, i] = sim
+                head_sim[i, j] = sim
+                head_sim[j, i] = sim
         
-        # Step 2: Calculate node-level diversity
-        node_diversity = torch.zeros(num_nodes, device=alpha.device)
+        # Step 2: Calculate global head similarity
+        # (exclude diagonal elements)
+        mask = ~torch.eye(self.num_heads, dtype=torch.bool, device=g.device)
+        global_similarity = head_sim[mask].mean()
         
-        for node in range(num_nodes):
-            # Find edges where this node is the source
-            mask = (row == node)
+        # Step 3: Calculate node-level diversity
+        node_diversity = torch.zeros(1, device=g.device)
+        
+        # For each node, calculate entropy of attention distribution
+        for ntype in g.ntypes:
+            # Get nodes of this type
+            nodes = g.nodes(ntype)
             
-            # If node has edges
-            if mask.sum() > 0:
-                # Get normalized attention weights for this node's outgoing edges
-                node_alpha = alpha[mask]
+            # Skip if no nodes
+            if len(nodes) == 0:
+                continue
+            
+            # Get incoming edges for these nodes
+            in_edges = g.in_edges(nodes, form='eid')
+            
+            if len(in_edges) == 0:
+                continue
+            
+            # Get attention weights for these edges
+            edge_attn = g.edata['a'][in_edges]
+            
+            # Calculate entropy for each head's attention distribution
+            entropy = torch.zeros(self.num_heads, device=g.device)
+            
+            for h in range(self.num_heads):
+                # Get normalized attention weights
+                head_attn = F.normalize(edge_attn[:, h], p=1, dim=0)
                 
-                # Calculate pairwise cosine similarity between heads
-                head_sims = torch.zeros(self.heads, self.heads, device=alpha.device)
-                
-                for h1 in range(self.heads):
-                    for h2 in range(h1+1, self.heads):
-                        a1 = F.normalize(node_alpha[:, h1], p=2, dim=0)
-                        a2 = F.normalize(node_alpha[:, h2], p=2, dim=0)
-                        
-                        # Compute cosine similarity if vectors are non-zero
-                        if torch.norm(a1) > 1e-8 and torch.norm(a2) > 1e-8:
-                            sim = torch.sum(a1 * a2)
-                            head_sims[h1, h2] = sim
-                            head_sims[h2, h1] = sim
-                
-                # Node diversity is average pairwise similarity
-                if self.heads > 1:
-                    node_diversity[node] = head_sims.sum() / (self.heads * (self.heads - 1))
-        
-        # Step 3: Compute weighted diversity loss
-        # Higher similarity means less diversity, so we want to minimize this
-        global_diversity_loss = head_correlations.sum() / (self.heads * (self.heads - 1)) if self.heads > 1 else 0
-        node_diversity_loss = node_diversity.mean()
+                # Calculate entropy (avoid log(0) by adding epsilon)
+                epsilon = 1e-10
+                head_entropy = -torch.sum(head_attn * torch.log(head_attn + epsilon))
+                entropy[h] = head_entropy
+            
+            # Node diversity is the negative of average entropy
+            # (negative because we want to maximize entropy = maximize diversity)
+            node_diversity = -entropy.mean()
         
         # Combine global and node-level diversities
-        combined_loss = (global_diversity_loss + node_diversity_loss) / 2
+        # Higher similarity and lower entropy (higher node_diversity) mean less diversity
+        diversity_loss = (global_similarity * 0.7 + node_diversity * 0.3) * self.diversity_weight
         
-        # Apply weight and return
-        return combined_loss * self.diversity_weight
-    
-    def message(self, x_j, alpha):
-        """Message function for aggregation"""
-        # x_j: [E, heads, out_channels], alpha: [E, heads]
-        alpha = alpha.unsqueeze(-1)
-        return x_j * alpha
-    
-    def aggregate(self, inputs, index, dim_size=None):
-        """Aggregate messages using sum"""
-        from torch_scatter import scatter_add
-        return scatter_add(inputs, index, dim=0, dim_size=dim_size)
+        return diversity_loss
 
-# processmine/models/gnn/architectures.py (UPDATED CLASS)
 
-class CombinedGATConv(MessagePassing):
+class CombinedGATLayer(nn.Module):
     """
     Combined GAT layer with position-aware diverse attention
     """
     def __init__(
         self, 
-        in_channels: int, 
-        out_channels: int, 
-        heads: int = 4, 
-        concat: bool = True, 
+        in_dim: int, 
+        out_dim: int, 
+        num_heads: int = 4, 
         pos_dim: int = 16,
         diversity_weight: float = 0.1, 
         pos_weight: float = 0.5,
-        negative_slope: float = 0.2, 
-        dropout: float = 0.0, 
-        bias: bool = True
+        feat_drop: float = 0.0, 
+        residual: bool = True
     ):
-        super().__init__(aggr='add', node_dim=0)
+        super().__init__()
         
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.heads = heads
-        self.concat = concat
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.num_heads = num_heads
         self.pos_dim = pos_dim
         self.diversity_weight = diversity_weight
         self.pos_weight = pos_weight
-        self.negative_slope = negative_slope
-        self.dropout = dropout
+        self.feat_drop = feat_drop
+        self.residual = residual
         
         # Content features dimension (excluding position)
-        content_dim = in_channels - pos_dim
+        content_dim = in_dim - pos_dim
         
         # Main transformation for content features
-        self.content_lin = nn.Linear(content_dim, heads * out_channels, bias=False)
+        self.content_fc = nn.Linear(content_dim, out_dim * num_heads, bias=False)
         
         # Transformation for positional features
-        self.pos_lin = nn.Linear(pos_dim, heads * out_channels // 4, bias=False)
+        self.pos_fc = nn.Linear(pos_dim, out_dim // 4 * num_heads, bias=False)
         
-        # Attention weights for content and position
-        self.content_att = nn.Parameter(torch.Tensor(1, heads, 2 * out_channels))
-        self.pos_att = nn.Parameter(torch.Tensor(1, heads, 2 * (out_channels // 4)))
+        # Attention weights for content
+        self.attn_src = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
+        self.attn_dst = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
+        
+        # Attention weights for position
+        self.pos_attn_src = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim // 4))
+        self.pos_attn_dst = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim // 4))
         
         # Weights to combine attention components
-        self.att_combination = nn.Parameter(torch.Tensor(heads, 2))
+        self.att_combination = nn.Parameter(torch.FloatTensor(num_heads, 2))
         
-        # Bias
-        if bias and concat:
-            self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
-        elif bias and not concat:
-            self.bias = nn.Parameter(torch.Tensor(out_channels))
+        # Residual connection
+        if residual:
+            if in_dim != out_dim * num_heads:
+                self.res_fc = nn.Linear(in_dim, out_dim * num_heads, bias=False)
+            else:
+                self.res_fc = None
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter('res_fc', None)
         
-        self._init_weights()
+        # Initialize weights
+        self.reset_parameters()
     
-    def _init_weights(self):
+    def reset_parameters(self):
         """Initialize weights with Xavier uniform"""
-        nn.init.xavier_uniform_(self.content_lin.weight)
-        nn.init.xavier_uniform_(self.pos_lin.weight)
-        nn.init.xavier_uniform_(self.content_att)
-        nn.init.xavier_uniform_(self.pos_att)
+        nn.init.xavier_uniform_(self.content_fc.weight)
+        nn.init.xavier_uniform_(self.pos_fc.weight)
+        nn.init.xavier_uniform_(self.attn_src)
+        nn.init.xavier_uniform_(self.attn_dst)
+        nn.init.xavier_uniform_(self.pos_attn_src)
+        nn.init.xavier_uniform_(self.pos_attn_dst)
         
         # Initialize combination weights to balance content and position
         nn.init.constant_(self.att_combination, 0.5)
         
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
+        if self.res_fc is not None:
+            nn.init.xavier_uniform_(self.res_fc.weight)
     
-    def forward(self, x, edge_index, return_attention=False):
+    def forward(self, g, feat, return_attention=False):
         """
         Forward pass with combined positional and diverse attention
         
         Args:
-            x: Node features [N, in_channels] including positional features
-            edge_index: Edge indices [2, E]
+            g: DGL graph or batched graph
+            feat: Input node features including positional features
             return_attention: Whether to return attention weights and diversity loss
             
         Returns:
             If return_attention=False:
-                Tuple of (node_embeddings, diversity_loss)
+                Updated node features
             If return_attention=True:
-                Tuple of (node_embeddings, diversity_loss, attention_weights)
+                Tuple of (node features, diversity_loss, attention_weights)
         """
-        # Add self-loops for better message passing
-        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
-        
         # Split features into content and position
-        content_features = x[:, :-self.pos_dim]
-        pos_features = x[:, -self.pos_dim:]
+        content = feat[:, :-self.pos_dim]
+        pos = feat[:, -self.pos_dim:]
         
         # Transform features
-        transformed_content = self.content_lin(content_features).view(-1, self.heads, self.out_channels)
-        transformed_pos = self.pos_lin(pos_features).view(-1, self.heads, self.out_channels // 4)
+        h_content = self.content_fc(content).view(-1, self.num_heads, self.out_dim)
+        h_pos = self.pos_fc(pos).view(-1, self.num_heads, self.out_dim // 4)
         
-        # Extract node features for source and target nodes
-        row, col = edge_index
+        # Apply feature dropout
+        h_content = F.dropout(h_content, p=self.feat_drop, training=self.training)
+        h_pos = F.dropout(h_pos, p=self.feat_drop, training=self.training)
         
-        # Content features
-        content_i, content_j = transformed_content[row], transformed_content[col]
+        # Store transformed features
+        g.ndata['content'] = h_content
+        g.ndata['pos'] = h_pos
         
-        # Positional features
-        pos_i, pos_j = transformed_pos[row], transformed_pos[col]
+        # Custom message function that computes combined attention
+        def message_func(edges):
+            # Content attention
+            src_attn = (edges.src['content'] * self.attn_src).sum(dim=-1)
+            dst_attn = (edges.dst['content'] * self.attn_dst).sum(dim=-1)
+            content_e = src_attn + dst_attn
+            
+            # Positional attention
+            src_pos_attn = (edges.src['pos'] * self.pos_attn_src).sum(dim=-1)
+            dst_pos_attn = (edges.dst['pos'] * self.pos_attn_dst).sum(dim=-1)
+            pos_e = src_pos_attn + dst_pos_attn
+            
+            # Combine attention components with learned weights
+            combined_e = (
+                content_e * self.att_combination[:, 0].unsqueeze(0) + 
+                pos_e * self.att_combination[:, 1].unsqueeze(0)
+            )
+            
+            combined_e = F.leaky_relu(combined_e, negative_slope=0.2)
+            
+            return {'m': edges.src['content'], 'e': combined_e}
         
-        # Compute content attention
-        alpha_content = torch.cat([content_i, content_j], dim=-1)
-        alpha_content = (alpha_content * self.content_att).sum(dim=-1)
+        # Apply message function to edges
+        g.apply_edges(message_func)
         
-        # Compute positional attention
-        alpha_pos = torch.cat([pos_i, pos_j], dim=-1)
-        alpha_pos = (alpha_pos * self.pos_att).sum(dim=-1)
+        # Apply softmax to attention weights
+        g.edata['a'] = dgl.ops.edge_softmax(g, g.edata['e'])
         
-        # Combine attention components with learned weights
-        alpha_combined = alpha_content * self.att_combination[:, 0].view(1, -1) + \
-                        alpha_pos * self.att_combination[:, 1].view(1, -1)
-        
-        # Apply LeakyReLU
-        alpha = F.leaky_relu(alpha_combined, self.negative_slope)
-        
-        # Normalize attention weights
-        alpha = softmax(alpha, row, num_nodes=x.size(0))
-        
-        # Calculate diversity loss
-        diversity_loss = self._calculate_diversity_loss(alpha, row, x.size(0))
-        
-        # Apply dropout
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
-        
-        # Propagate with combined embeddings (mainly content)
-        out = self.propagate(edge_index, x=transformed_content, alpha=alpha, size=None)
-        
-        # Apply concat/mean
-        if self.concat:
-            out = out.view(-1, self.heads * self.out_channels)
+        # Compute diversity loss if in training mode
+        if self.training or return_attention:
+            diversity_loss = self._calculate_diversity_loss(g)
         else:
-            out = out.mean(dim=1)
+            diversity_loss = torch.tensor(0.0, device=feat.device)
         
-        # Apply bias
-        if self.bias is not None:
-            out = out + self.bias
+        # Message passing
+        g.update_all(fn.u_mul_e('content', 'a', 'm'), fn.sum('m', 'ft'))
         
-        # Return with attention weights if requested
+        # Get the updated features
+        h = g.ndata['ft']
+        
+        # Reshape for output
+        h = h.view(-1, self.num_heads * self.out_dim)
+        
+        # Apply residual connection if specified
+        if self.residual:
+            if self.res_fc is not None:
+                resval = self.res_fc(feat)
+            else:
+                resval = feat
+            h = h + resval
+        
+        # Return with diversity loss and attention weights if requested
         if return_attention:
-            return out, diversity_loss, alpha
+            return h, diversity_loss, g.edata['a']
         else:
-            return out, diversity_loss
+            return h, diversity_loss
     
-    def _calculate_diversity_loss(self, alpha, row, num_nodes):
+    def _calculate_diversity_loss(self, g):
         """
         Calculate diversity loss with improved implementation
         
         Args:
-            alpha: Attention weights [E, heads]
-            row: Row indices [E]
-            num_nodes: Number of nodes
+            g: DGL graph with attention weights in edata['a']
             
         Returns:
             Diversity loss tensor
         """
-        if self.heads <= 1:
-            return torch.tensor(0.0, device=alpha.device)
+        if self.num_heads <= 1:
+            return torch.tensor(0.0, device=g.device)
         
-        # Step 1: Calculate pairwise head similarity
-        sims = torch.zeros(self.heads, self.heads, device=alpha.device)
+        # Step 1: Compute head correlations
+        # Get attention weights: [E, num_heads]
+        attn = g.edata['a']
         
-        for h1 in range(self.heads):
-            for h2 in range(h1+1, self.heads):
-                # Get attention for each head
-                a1 = alpha[:, h1]
-                a2 = alpha[:, h2]
+        # Calculate pairwise cosine similarity between attention heads
+        head_sim = torch.zeros(self.num_heads, self.num_heads, device=g.device)
+        
+        for i in range(self.num_heads):
+            for j in range(i+1, self.num_heads):
+                # Extract attention weights for each head
+                a_i = attn[:, i]
+                a_j = attn[:, j]
+                
+                # Normalize for numerical stability
+                a_i = F.normalize(a_i, p=2, dim=0)
+                a_j = F.normalize(a_j, p=2, dim=0)
                 
                 # Compute cosine similarity
-                sim = F.cosine_similarity(a1, a2, dim=0)
+                sim = torch.sum(a_i * a_j)
                 
                 # Store similarity (symmetrically)
-                sims[h1, h2] = sim
-                sims[h2, h1] = sim
+                head_sim[i, j] = sim
+                head_sim[j, i] = sim
         
-        # Step 2: Compute node-level diversity
-        node_diversity = torch.zeros(num_nodes, device=alpha.device)
+        # Step 2: Calculate global head similarity
+        # (exclude diagonal elements)
+        mask = ~torch.eye(self.num_heads, dtype=torch.bool, device=g.device)
+        global_similarity = head_sim[mask].mean()
         
-        for node in range(num_nodes):
-            # Find edges where this node is the source
-            node_edges_mask = (row == node)
+        # Step 3: Calculate node-level diversity
+        # For each node, calculate entropy of attention distribution
+        entropy_per_node = []
+        
+        # Get source nodes for each edge
+        src_nodes = g.edges()[0]
+        
+        # Convert to numpy for faster computation if tensor is large
+        if len(src_nodes) > 10000:
+            src_nodes_np = src_nodes.cpu().numpy()
+            unique_nodes, inverse_indices = np.unique(src_nodes_np, return_inverse=True)
+            unique_nodes = torch.tensor(unique_nodes, device=g.device)
+        else:
+            unique_nodes, inverse_indices = torch.unique(src_nodes, return_inverse=True)
+        
+        # For each unique source node
+        for node_idx in range(len(unique_nodes)):
+            # Find edges with this source node
+            edge_mask = (inverse_indices == node_idx)
             
-            # If node has edges
-            if node_edges_mask.sum() > 1:  # Need at least 2 edges for diversity
-                # Get attention distribution for this node
-                node_alpha = alpha[node_edges_mask]
+            # Get attention for these edges
+            node_attn = attn[edge_mask]
+            
+            # Skip if no edges
+            if len(node_attn) <= 1:
+                continue
+            
+            # Calculate entropy for each head
+            for h in range(self.num_heads):
+                head_attn = node_attn[:, h]
                 
-                # Calculate entropy of attention distribution for each head
-                # Higher entropy = more diverse attention
-                entropy_per_head = torch.zeros(self.heads, device=alpha.device)
+                # Normalize
+                head_attn = F.normalize(head_attn, p=1, dim=0)
                 
-                for h in range(self.heads):
-                    # Get normalized attention weights
-                    head_alpha = F.normalize(node_alpha[:, h], p=1, dim=0)
-                    
-                    # Avoid log(0) by adding epsilon
-                    epsilon = 1e-10
-                    entropy = -torch.sum(head_alpha * torch.log(head_alpha + epsilon))
-                    entropy_per_head[h] = entropy
-                
-                # Node diversity is average attention entropy
-                node_diversity[node] = entropy_per_head.mean()
+                # Calculate entropy (avoid log(0) by adding epsilon)
+                epsilon = 1e-10
+                entropy = -torch.sum(head_attn * torch.log(head_attn + epsilon))
+                entropy_per_node.append(entropy.item())
         
-        # Step 3: Compute final diversity loss
-        # Maximize entropy (diversity) and minimize similarity between heads
-        head_similarity = sims.sum() / (self.heads * (self.heads - 1))
-        avg_node_diversity = -node_diversity.mean()  # Negative as we want to maximize entropy
+        # Calculate average entropy (higher is better)
+        avg_entropy = torch.tensor(
+            sum(entropy_per_node) / len(entropy_per_node) if entropy_per_node else 0.0,
+            device=g.device
+        )
         
-        # Combined loss - balance head similarity and node diversity
-        diversity_loss = (head_similarity * 0.7 + avg_node_diversity * 0.3) * self.diversity_weight
+        # Combine metrics - balance head similarity and node diversity
+        # Higher similarity and lower entropy mean less diversity
+        diversity_loss = (global_similarity * 0.7 - avg_entropy * 0.3) * self.diversity_weight
         
         return diversity_loss
-    
-    def message(self, x_j, alpha):
-        """Message function for aggregation"""
-        # x_j: [E, heads, out_channels], alpha: [E, heads]
-        alpha = alpha.unsqueeze(-1)
-        return x_j * alpha
-    
-    def aggregate(self, inputs, index, dim_size=None):
-        """Aggregate messages using sum"""
-        from torch_scatter import scatter_add
-        return scatter_add(inputs, index, dim=0, dim_size=dim_size)
-
-# Utility functions for attention and message passing
-def softmax(src, index, num_nodes=None):
-    """
-    Softmax aggregation with memory-efficient implementation
-    """
-    num_nodes = index.max().item() + 1 if num_nodes is None else num_nodes
-    
-    # Subtract max for numerical stability (groupwise)
-    from torch_scatter import scatter_max
-    max_value = scatter_max(src, index, dim=0, dim_size=num_nodes)[0]
-    max_value = max_value.index_select(0, index)
-    
-    # Apply exp and normalization
-    src = torch.exp(src - max_value)
-    
-    # Compute normalization constant (sum over source nodes)
-    from torch_scatter import scatter_add
-    norm = scatter_add(src, index, dim=0, dim_size=num_nodes)
-    norm = norm.index_select(0, index)
-    
-    # Return normalized values
-    return src / (norm + 1e-10)  # Add epsilon for numerical stability
-
-def scatter_add(src, index, dim=-1, dim_size=None):
-    """
-    Efficient scatter_add implementation
-    """
-    if dim_size is None:
-        dim_size = index.max().item() + 1
-    
-    size = list(src.size())
-    size[dim] = dim_size
-    out = torch.zeros(size, dtype=src.dtype, device=src.device)
-    
-    # Use PyTorch's native scatter_add_ operation for efficiency
-    return out.scatter_add_(dim, index.unsqueeze(-1).expand_as(src), src)

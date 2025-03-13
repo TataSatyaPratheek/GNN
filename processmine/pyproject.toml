@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "processmine"
-version = "0.1.0"
-description = "Memory-efficient process mining with GNN, LSTM, and RL"
+version = "0.2.0"
+description = "Memory-efficient process mining with DGL, LSTM, and RL"
 authors = [{name = "ERP.AI", email = "info@erp.ai"}]
 readme = "README.md"
 license = {text = "Apache License 2.0"}
@@ -30,8 +30,11 @@ dependencies = [
 
 [project.optional-dependencies]
 gnn = [
-    "torch-geometric>=2.0.0",
+    "dgl>=2.4.0",
     "networkx>=2.6.0",
+]
+gpu = [
+    "dgl-cu124>=2.4.0",
 ]
 viz = [
     "matplotlib>=3.4.0",
@@ -42,7 +45,16 @@ ml = [
     "xgboost>=1.5.0",
 ]
 all = [
-    "torch-geometric>=2.0.0",
+    "dgl>=2.4.0",
+    "networkx>=2.6.0",
+    "matplotlib>=3.4.0",
+    "seaborn>=0.11.0",
+    "plotly>=5.0.0",
+    "xgboost>=1.5.0",
+    "pm4py>=2.2.0",
+]
+gpu-all = [
+    "dgl-cu124>=2.4.0",
     "networkx>=2.6.0",
     "matplotlib>=3.4.0",
     "seaborn>=0.11.0",

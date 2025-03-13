@@ -1,6 +1,7 @@
 """
 Core runner functions for analysis, training, and optimization workflows.
 These functions provide a programmatic API for ProcessMine functionality independent of the CLI.
+Updated to use DGL for graph operations.
 """
 
 import logging
@@ -9,6 +10,7 @@ import torch
 import os
 import json
 import numpy as np
+import dgl
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, Tuple
 
@@ -276,7 +278,7 @@ def run_training(
     **kwargs
 ) -> Dict[str, Any]:
     """
-    Run model training workflow
+    Run model training workflow, now using DGL for graph-based models
     
     Args:
         data_path: Path to process data CSV file
@@ -301,6 +303,9 @@ def run_training(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     
+    # Set DGL random seed
+    dgl.random.seed(seed)
+    
     # Set up device if provided as string
     if device is not None and isinstance(device, str):
         device = torch.device(device)
@@ -323,6 +328,9 @@ def run_training(
             create_lr_scheduler, compute_class_weights
         )
         from processmine.models.factory import create_model, get_model_config
+        
+        # Import DGL-specific data loader
+        from processmine.utils.dataloader import get_graph_dataloader
         
         # Load data if not provided from analysis
         if analysis_results is None or "df" not in analysis_results:
@@ -349,8 +357,8 @@ def run_training(
         model_config.update(kwargs)
         
         if model in ["gnn", "enhanced_gnn"]:
-            # Build graph data
-            logger.info("Building graph data...")
+            # Build graph data using DGL
+            logger.info("Building graph data with DGL...")
             graphs = build_graph_data(
                 df,
                 enhanced=(model == "enhanced_gnn"),
@@ -368,9 +376,7 @@ def run_training(
                 **model_config
             )
             
-            # Create data loaders
-            from torch_geometric.loader import DataLoader
-            
+            # Create DGL data loaders
             # Split indices
             indices = np.arange(len(graphs))
             np.random.shuffle(indices)
@@ -380,28 +386,31 @@ def run_training(
             
             # Create data loaders with memory efficiency in mind
             num_workers = kwargs.get('num_workers', 0) if not mem_efficient else 0
-            pin_memory = device.type != "cpu" and not mem_efficient
             
-            train_loader = DataLoader(
-                [graphs[i] for i in train_idx],
+            # Get train/val/test graphs
+            from processmine.utils.dataloader import get_batch_graphs_from_indices
+            train_graphs = get_batch_graphs_from_indices(graphs, train_idx)
+            val_graphs = get_batch_graphs_from_indices(graphs, val_idx)
+            test_graphs = get_batch_graphs_from_indices(graphs, test_idx)
+            
+            # Create DGL DataLoaders
+            train_loader = get_graph_dataloader(
+                train_graphs,
                 batch_size=batch_size,
                 shuffle=True,
-                num_workers=num_workers,
-                pin_memory=pin_memory
+                num_workers=num_workers
             )
             
-            val_loader = DataLoader(
-                [graphs[i] for i in val_idx],
+            val_loader = get_graph_dataloader(
+                val_graphs,
                 batch_size=batch_size,
-                num_workers=num_workers,
-                pin_memory=pin_memory
+                num_workers=num_workers
             )
             
-            test_loader = DataLoader(
-                [graphs[i] for i in test_idx],
+            test_loader = get_graph_dataloader(
+                test_graphs,
                 batch_size=batch_size,
-                num_workers=num_workers,
-                pin_memory=pin_memory
+                num_workers=num_workers
             )
             
             logger.info(f"Created data loaders with {len(train_idx)} train, " +
@@ -691,6 +700,7 @@ def run_full_pipeline(
     if seed is not None:
         np.random.seed(seed)
         torch.manual_seed(seed)
+        dgl.random.seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
     

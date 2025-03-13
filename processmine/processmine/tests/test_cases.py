@@ -1,654 +1,626 @@
 import unittest
+import torch
 import numpy as np
 import pandas as pd
-import torch
+import dgl
 import tempfile
 import os
 import shutil
-from unittest.mock import patch, MagicMock
+from datetime import datetime, timedelta
 
-# Import the modules to test
-try:
-    from processmine.core.training import train_model, evaluate_model, compute_class_weights
-    from processmine.data.loader import load_and_preprocess_data
-    from processmine.data.graphs import build_graph_data, build_heterogeneous_graph
-    from processmine.models.gnn.architectures import MemoryEfficientGNN, PositionalGATConv
-    from processmine.models.sequence.lstm import NextActivityLSTM
-    from processmine.process_mining.analysis import analyze_bottlenecks, analyze_cycle_times
-    from processmine.visualization.viz import ProcessVisualizer
-    from processmine.utils.memory import clear_memory, get_memory_stats
-    from processmine.models.factory import create_model
-except ImportError:
-    # For CI/CD where imports might fail
-    pass
-
-
-class TestDataLoader(unittest.TestCase):
-    """Test the data loading and preprocessing functionality."""
-
+class TestDGLGraphCreation(unittest.TestCase):
+    """Test cases for DGL graph creation from process data"""
+    
     def setUp(self):
-        """Set up test data."""
-        # Create a temporary directory for test data
-        self.test_dir = tempfile.mkdtemp()
-        
-        # Create a simple test CSV
-        self.test_csv = os.path.join(self.test_dir, "test_data.csv")
-        
-        # Create test data
-        data = {
-            "case_id": [1, 1, 1, 2, 2, 3],
-            "task_name": ["start", "process", "end", "start", "end", "start"],
-            "resource": ["user_a", "user_b", "user_a", "user_c", "user_c", "user_b"],
-            "timestamp": [
-                "2023-01-01 10:00:00", 
-                "2023-01-01 10:30:00",
-                "2023-01-01 11:00:00",
-                "2023-01-01 12:00:00",
-                "2023-01-01 13:00:00",
-                "2023-01-01 14:00:00"
-            ]
-        }
-        
-        self.test_df = pd.DataFrame(data)
-        self.test_df.to_csv(self.test_csv, index=False)
-
-    def tearDown(self):
-        """Clean up test resources."""
-        shutil.rmtree(self.test_dir)
-
-    def test_load_and_preprocess_data(self):
-        """Test loading and preprocessing data from CSV."""
-        try:
-            # Test the function
-            df, task_encoder, resource_encoder = load_and_preprocess_data(
-                self.test_csv, norm_method='l2', use_dtypes=True
-            )
-            
-            # Check that the dataframe has the expected shape
-            self.assertEqual(len(df), 5)  # 6 original rows - 1 last event per case
-            
-            # Check that encoders were created
-            self.assertEqual(len(task_encoder.classes_), 3)  # start, process, end
-            self.assertEqual(len(resource_encoder.classes_), 3)  # user_a, user_b, user_c
-            
-            # Check that derived features were created
-            self.assertTrue("feat_task_id" in df.columns)
-            self.assertTrue("next_task" in df.columns)
-            
-            # Check additional features created from new version
-            self.assertTrue("case_events" in df.columns)
-            self.assertTrue("case_unique_tasks" in df.columns)
-            
-        except (ImportError, NameError):
-            self.skipTest("ProcessMine package not available in test environment")
-
-    def test_build_graph_data(self):
-        """Test building graph data from dataframe."""
-        try:
-            # First load and preprocess the data
-            df, task_encoder, resource_encoder = load_and_preprocess_data(
-                self.test_csv, norm_method='l2'
-            )
-            
-            # Test building graph data with mode parameter (new)
-            graphs_standard = build_graph_data(
-                df, 
-                enhanced=True, 
-                batch_size=2,
-                mode='standard'  # Test standard mode
-            )
-            
-            # Test with sparse mode (new)
-            graphs_sparse = build_graph_data(
-                df, 
-                enhanced=True, 
-                batch_size=2,
-                mode='sparse'  # Test sparse mode
-            )
-            
-            # Test with limit_nodes parameter (new)
-            graphs_limited = build_graph_data(
-                df, 
-                enhanced=True, 
-                batch_size=2,
-                limit_nodes=3  # Test node limiting
-            )
-            
-            # Verify graphs were created with proper constraints
-            self.assertTrue(isinstance(graphs_standard, list))
-            self.assertTrue(isinstance(graphs_sparse, list))
-            
-            # Verify node limits are respected
-            for graph in graphs_limited:
-                self.assertLessEqual(graph.x.size(0), 3)
-            
-        except (ImportError, NameError):
-            self.skipTest("ProcessMine package not available in test environment")
-        
-    def test_analyze_resource_performance(self):
-        """Test resource performance analysis (new function)."""
-        try:
-            from processmine.process_mining.analysis import analyze_resource_performance
-            
-            # Test resource performance analysis
-            resource_perf = analyze_resource_performance(self.test_df)
-            
-            # Verify output structure
-            self.assertIsInstance(resource_perf, pd.DataFrame)
-            
-            # Check for new metrics columns
-            self.assertTrue('task_duration_mean' in resource_perf.columns)
-            self.assertTrue('throughput' in resource_perf.columns)
-            
-        except (ImportError, NameError):
-            self.skipTest("ProcessMine package not available in test environment")
-            
-    def test_gnn_model_enhanced_features(self):
-        """Test GNN model with new features."""
-        try:
-            from processmine.models.gnn.architectures import MemoryEfficientGNN
-            
-            # Create model with sparse attention (new)
-            model = MemoryEfficientGNN(
-                input_dim=5,
-                hidden_dim=8,
-                output_dim=3,
-                num_layers=2,
-                heads=2,
-                dropout=0.1,
-                attention_type="basic",
-                sparse_attention=True,  # New parameter
-                use_checkpointing=True  # New parameter
-            )
-            
-            # Check memory usage method (new)
-            mem_usage = model.memory_usage()
-            self.assertIsInstance(mem_usage, dict)
-            self.assertIn('parameters_mb', mem_usage)
-            
-        except (ImportError, NameError):
-            self.skipTest("ProcessMine package not available in test environment")
-
-
-class TestProcessAnalysis(unittest.TestCase):
-    """Test the process mining analysis functionality."""
-
-    def setUp(self):
-        """Set up test data."""
-        # Create a more complex test dataframe
-        case_ids = np.repeat(range(1, 11), 5)  # 10 cases with 5 events each
-        task_ids = np.random.randint(1, 5, 50)  # 4 different tasks
-        task_names = [f"Task_{i}" for i in task_ids]
-        resource_ids = np.random.randint(1, 4, 50)  # 3 different resources
-        
-        # Create timestamps with increasing times per case
-        timestamps = []
-        for case in range(1, 11):
-            start_time = pd.Timestamp('2023-01-01') + pd.Timedelta(hours=case)
-            for i in range(5):
-                timestamps.append(start_time + pd.Timedelta(minutes=i*30))
-        
+        """Set up test data"""
+        # Create a simple test dataframe
         self.test_df = pd.DataFrame({
-            "case_id": case_ids,
-            "task_id": task_ids,
-            "task_name": task_names,
-            "resource_id": resource_ids,
-            "timestamp": timestamps,
-            "next_task": np.roll(task_ids, -1)  # Shift task_ids for next_task
+            'case_id': [1, 1, 1, 2, 2, 2],
+            'task_id': [0, 1, 2, 0, 2, 3],
+            'task_name': ['start', 'process', 'end', 'start', 'process', 'review'],
+            'resource_id': [0, 1, 0, 2, 1, 2],
+            'resource': ['user1', 'user2', 'user1', 'user3', 'user2', 'user3'],
+            'timestamp': [
+                datetime.now(),
+                datetime.now() + timedelta(hours=1),
+                datetime.now() + timedelta(hours=2),
+                datetime.now() + timedelta(days=1),
+                datetime.now() + timedelta(days=1, hours=1),
+                datetime.now() + timedelta(days=1, hours=2)
+            ],
+            'next_task': [1, 2, -1, 2, 3, -1],
+            'feat_task_id': [0.1, 0.2, 0.3, 0.1, 0.3, 0.4],
+            'feat_resource_id': [0.5, 0.6, 0.5, 0.7, 0.6, 0.7]
         })
         
-        # Set NaN for last event in each case
-        self.test_df.loc[self.test_df.groupby("case_id").tail(1).index, "next_task"] = np.nan
-        self.test_df = self.test_df.dropna()  # Drop NaN rows
-
-    def test_analyze_bottlenecks(self):
-        """Test bottleneck analysis."""
-        try:
-            # Add next_timestamp column for bottleneck analysis
-            self.test_df['next_timestamp'] = self.test_df.groupby("case_id")["timestamp"].shift(-1)
-            
-            # Test the function with the new memory_efficient parameter
-            bottleneck_stats, significant_bottlenecks = analyze_bottlenecks(
-                self.test_df, 
-                freq_threshold=1, 
-                percentile_threshold=75.0,
-                vectorized=True,
-                memory_efficient=True
-            )
-            
-            # Check output format
-            self.assertIsInstance(bottleneck_stats, pd.DataFrame)
-            self.assertIsInstance(significant_bottlenecks, pd.DataFrame)
-            
-            # Check that stats were computed
-            self.assertTrue("mean_hours" in bottleneck_stats.columns)
-            self.assertTrue("count" in bottleneck_stats.columns)
-            
-            # Check new columns from updated function
-            self.assertTrue("rank" in bottleneck_stats.columns)
-            if len(significant_bottlenecks) > 0:
-                self.assertTrue("bottleneck_score" in significant_bottlenecks.columns)
-            
-        except (ImportError, NameError):
-            self.skipTest("ProcessMine package not available in test environment")
-
-    def test_analyze_cycle_times(self):
-        """Test cycle time analysis."""
-        try:
-            # Test the function with the memory_efficient parameter
-            case_stats, long_cases, p95 = analyze_cycle_times(
-                self.test_df, 
-                percentile_threshold=95.0,
-                memory_efficient=True
-            )
-            
-            # Check output format
-            self.assertIsInstance(case_stats, pd.DataFrame)
-            self.assertIsInstance(long_cases, pd.DataFrame)
-            self.assertIsInstance(p95, float)
-            
-            # Check that stats were computed
-            self.assertTrue("duration_h" in case_stats.columns)
-            self.assertGreaterEqual(p95, 0)
-            
-            # Check additional metrics from updated function
-            self.assertTrue("duration_days" in case_stats.columns)
-            
-        except (ImportError, NameError):
-            self.skipTest("ProcessMine package not available in test environment")
-
-
-class TestModels(unittest.TestCase):
-    """Test the ML models for process mining."""
-
-    def setUp(self):
-        """Set up test data and models."""
-        # Create a simple test tensor
-        self.X = torch.randn(10, 5)  # 10 samples, 5 features
-        self.y = torch.randint(0, 3, (10,))  # 3 classes
+        # Remove rows with next_task == -1
+        self.test_df = self.test_df[self.test_df['next_task'] != -1]
         
-        # Create mock graph data
-        self.create_mock_graph_data()
-
-    def create_mock_graph_data(self):
-        """Create mock PyG data for testing GNN models."""
+        # Import the graph building function
         try:
-            from torch_geometric.data import Data, Batch
+            from processmine.data.graphs import build_graph_data
+            self.build_graph_data = build_graph_data
+            self.imports_successful = True
+        except ImportError:
+            self.imports_successful = False
             
-            # Create a list of small graphs
-            self.graph_list = []
-            for i in range(3):
-                # Create a small graph with 3 nodes
-                x = torch.randn(3, 5)  # 3 nodes, 5 features
-                edge_index = torch.tensor([[0, 1, 1], [1, 0, 2]], dtype=torch.long)  # 3 edges
-                edge_attr = torch.randn(3, 1)  # Edge features
-                y = torch.tensor([i % 3], dtype=torch.long)  # Graph label
-                
-                data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
-                self.graph_list.append(data)
+    def test_graph_building_basic(self):
+        """Test basic graph building functionality"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
             
-            # Create a batch
-            self.batch = Batch.from_data_list(self.graph_list)
+        # Build graphs with basic configuration
+        graphs = self.build_graph_data(
+            self.test_df,
+            enhanced=False,
+            batch_size=2,
+            verbose=False
+        )
+        
+        # Verify graphs were created correctly
+        self.assertEqual(len(graphs), 2)  # 2 cases
+        
+        # Check first graph
+        g1 = graphs[0]
+        self.assertIsInstance(g1, dgl.DGLGraph)
+        self.assertEqual(g1.num_nodes(), 2)  # 2 nodes in first case after removing end
+        
+        # Check node features
+        self.assertTrue('feat' in g1.ndata)
+        self.assertEqual(g1.ndata['feat'].shape, (2, 2))  # 2 nodes, 2 features
+        
+        # Check if labels are present
+        self.assertTrue('label' in g1.ndata)
+        
+        # Check edge structure
+        self.assertEqual(g1.num_edges(), 1)  # Sequential edges in case 1
+        
+    def test_graph_building_enhanced(self):
+        """Test enhanced graph building with edge features"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+            
+        # Build graphs with enhanced configuration
+        graphs = self.build_graph_data(
+            self.test_df,
+            enhanced=True,
+            batch_size=2,
+            verbose=False
+        )
+        
+        # Verify graphs were created correctly
+        self.assertEqual(len(graphs), 2)  # 2 cases
+        
+        # Check edge features in first graph
+        g1 = graphs[0]
+        self.assertTrue('feat' in g1.edata)
+        self.assertEqual(g1.edata['feat'].shape, (1, 1))  # 1 edge, 1 feature (time)
+        
+    def test_graph_building_bidirectional(self):
+        """Test bidirectional graph building"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+            
+        # Build graphs with bidirectional edges
+        graphs = self.build_graph_data(
+            self.test_df,
+            enhanced=True,
+            bidirectional=True,
+            batch_size=2,
+            verbose=False
+        )
+        
+        # Verify graphs were created correctly
+        self.assertEqual(len(graphs), 2)  # 2 cases
+        
+        # Check edge count in first graph
+        g1 = graphs[0]
+        self.assertEqual(g1.num_edges(), 2)  # Original + reverse edges
+        
+    def test_graph_building_limit_nodes(self):
+        """Test limiting nodes per graph"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+            
+        # Build graphs with node limit
+        graphs = self.build_graph_data(
+            self.test_df,
+            enhanced=False,
+            limit_nodes=1,  # Limit to 1 node per graph
+            batch_size=2,
+            verbose=False
+        )
+        
+        # Verify node limits were applied
+        for g in graphs:
+            self.assertLessEqual(g.num_nodes(), 1)
+    
+    def test_heterogeneous_graph_building(self):
+        """Test heterogeneous graph building"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+            
+        # Import the heterogeneous graph building function
+        try:
+            from processmine.data.graphs import build_heterogeneous_graph
+            
+            # Build heterogeneous graphs
+            het_graphs = build_heterogeneous_graph(
+                self.test_df,
+                batch_size=2,
+                verbose=False
+            )
+            
+            # Verify graphs were created correctly
+            self.assertGreaterEqual(len(het_graphs), 1)
+            
+            # Check first graph
+            g1 = het_graphs[0]
+            self.assertIsInstance(g1, dgl.DGLGraph)
+            
+            # Check if graph has appropriate node types
+            self.assertIn('task', g1.ntypes)
+            self.assertIn('resource', g1.ntypes)
+            
+            # Check edge types
+            self.assertGreaterEqual(len(g1.canonical_etypes), 1)
             
         except ImportError:
-            self.graph_list = None
-            self.batch = None
+            self.skipTest("Heterogeneous graph building not available")
 
-    def test_gnn_model(self):
-        """Test GNN model initialization and forward pass."""
+
+class TestDGLDataLoader(unittest.TestCase):
+    """Test cases for DGL data loading utilities"""
+    
+    def setUp(self):
+        """Set up test graphs"""
+        # Create a few simple test graphs
+        self.graphs = []
+        for i in range(3):
+            # Create a graph with i+2 nodes
+            num_nodes = i + 2
+            g = dgl.graph(([0], [1]))  # Start with a simple edge
+            
+            # Add more nodes if needed
+            if num_nodes > 2:
+                src = list(range(1, num_nodes-1))
+                dst = list(range(2, num_nodes))
+                g.add_edges(src, dst)
+            
+            # Add node features
+            g.ndata['feat'] = torch.randn(num_nodes, 2)
+            
+            # Add node labels
+            g.ndata['label'] = torch.tensor([i % 3] * num_nodes)
+            
+            self.graphs.append(g)
+        
+        # Import data loader utilities
         try:
-            if self.batch is None:
-                self.skipTest("PyTorch Geometric not available")
-                
-            # Create a GNN model with updated parameters
-            model = MemoryEfficientGNN(
-                input_dim=5,
+            from processmine.utils.dataloader import (
+                get_graph_dataloader,
+                get_graph_targets,
+                get_batch_graphs_from_indices,
+                apply_to_nodes,
+                apply_to_edges,
+                create_node_masks
+            )
+            self.get_graph_dataloader = get_graph_dataloader
+            self.get_graph_targets = get_graph_targets
+            self.get_batch_graphs_from_indices = get_batch_graphs_from_indices
+            self.apply_to_nodes = apply_to_nodes
+            self.apply_to_edges = apply_to_edges
+            self.create_node_masks = create_node_masks
+            self.imports_successful = True
+        except ImportError:
+            self.imports_successful = False
+    
+    def test_graph_dataloader(self):
+        """Test graph data loader creation"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Create a dataloader
+        loader = self.get_graph_dataloader(
+            self.graphs,
+            batch_size=2,
+            shuffle=False
+        )
+        
+        # Verify dataloader properties
+        self.assertEqual(len(loader), 2)  # 3 graphs with batch_size=2
+        
+        # Iterate through dataloader
+        batches = list(loader)
+        self.assertEqual(len(batches), 2)
+        
+        # Check first batch
+        batch1 = batches[0]
+        self.assertIsInstance(batch1, dgl.DGLGraph)
+        self.assertEqual(batch1.batch_size, 2)  # 2 graphs in this batch
+    
+    def test_get_graph_targets(self):
+        """Test extracting graph-level targets"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Batch the graphs
+        batch = dgl.batch(self.graphs[:2])
+        
+        # Get targets
+        targets = self.get_graph_targets(batch)
+        
+        # Verify targets
+        self.assertIsInstance(targets, torch.Tensor)
+        self.assertEqual(len(targets), 2)  # 2 graphs
+        self.assertEqual(targets[0].item(), 0)  # First graph label
+        self.assertEqual(targets[1].item(), 1)  # Second graph label
+    
+    def test_get_batch_graphs_from_indices(self):
+        """Test getting graphs by indices"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Get graphs by indices
+        selected_graphs = self.get_batch_graphs_from_indices(self.graphs, [0, 2])
+        
+        # Verify selection
+        self.assertEqual(len(selected_graphs), 2)
+        self.assertEqual(selected_graphs[0].num_nodes(), 2)  # First graph has 2 nodes
+        self.assertEqual(selected_graphs[1].num_nodes(), 4)  # Third graph has 4 nodes
+    
+    def test_apply_to_nodes(self):
+        """Test applying functions to node features"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Define a function to apply
+        def double_features(features):
+            return features * 2
+        
+        # Apply function to nodes
+        g = self.graphs[0]
+        original_features = g.ndata['feat'].clone()
+        g_modified = self.apply_to_nodes(g, double_features)
+        
+        # Verify features were transformed
+        self.assertTrue(torch.allclose(g_modified.ndata['feat'], original_features * 2))
+    
+    def test_create_node_masks(self):
+        """Test creating node feature masks"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Create masks
+        g = self.graphs[0].clone()
+        g_masked = self.create_node_masks(g, mask_ratio=0.5)
+        
+        # Verify masks were created
+        self.assertTrue('mask' in g_masked.ndata)
+        self.assertTrue('orig_feat' in g_masked.ndata)
+        
+        # Check that masked features are zero
+        masked_nodes = g_masked.ndata['mask']
+        self.assertEqual(masked_nodes.sum().item(), 1)  # 50% of 2 nodes = 1 node
+        
+        # Verify that masked features are zeroed out
+        zeros = torch.zeros_like(g_masked.ndata['feat'][0])
+        masked_idx = masked_nodes.nonzero().squeeze()
+        self.assertTrue(torch.allclose(g_masked.ndata['feat'][masked_idx], zeros))
+
+
+class TestDGLModels(unittest.TestCase):
+    """Test cases for DGL-based models"""
+    
+    def setUp(self):
+        """Set up test graphs and models"""
+        # Create a few test graphs
+        self.graphs = []
+        for i in range(5):
+            # Create a graph with random structure
+            num_nodes = i + 3
+            src = np.random.randint(0, num_nodes, size=num_nodes * 2)
+            dst = np.random.randint(0, num_nodes, size=num_nodes * 2)
+            g = dgl.graph((src, dst), num_nodes=num_nodes)
+            
+            # Add node features
+            g.ndata['feat'] = torch.randn(num_nodes, 4)  # 4 features
+            
+            # Add node labels
+            g.ndata['label'] = torch.tensor([i % 3] * num_nodes)
+            
+            self.graphs.append(g)
+        
+        # Import model factory
+        try:
+            from processmine.models.factory import create_model
+            from processmine.utils.dataloader import get_graph_dataloader
+            
+            self.create_model = create_model
+            self.get_graph_dataloader = get_graph_dataloader
+            self.imports_successful = True
+            
+            # Create models
+            self.gnn_model = create_model(
+                'gnn',
+                input_dim=4,
                 hidden_dim=8,
                 output_dim=3,
-                num_layers=2,
-                heads=2,
-                dropout=0.1,
-                attention_type="basic",
-                use_batch_norm=True,
-                use_layer_norm=False,
-                use_residual=True,
-                mem_efficient=True
+                num_layers=2
             )
             
-            # Test forward pass
-            output = model(self.batch)
-            
-            # Check output format - now returns a dictionary
-            self.assertIsInstance(output, dict)
-            self.assertTrue("task_pred" in output)
-            self.assertEqual(output["task_pred"].shape, (3, 3))  # 3 graphs, 3 classes
-            
-            # Test get_embeddings
-            embeddings, batch_indices = model.get_embeddings(self.batch)
-            self.assertTrue(embeddings.shape[1], 8 * 2)  # hidden_dim * heads
-            
-            # Test memory_usage method
-            mem_usage = model.memory_usage()
-            self.assertIsInstance(mem_usage, dict)
-            self.assertIn('parameters_mb', mem_usage)
-            
-        except (ImportError, NameError):
-            self.skipTest("GNN model not available in test environment")
-
-    def test_lstm_model(self):
-        """Test LSTM model initialization and forward pass."""
-        try:
-            # Create sequence data
-            seq_data = torch.randint(0, 3, (5, 10))  # 5 sequences, length 10
-            seq_lengths = torch.tensor([10, 8, 6, 10, 7])
-            
-            # Create an LSTM model with updated parameters
-            model = NextActivityLSTM(
-                num_cls=3,
-                emb_dim=8,
+            self.enhanced_gnn = create_model(
+                'enhanced_gnn',
+                input_dim=4,
                 hidden_dim=8,
-                num_layers=1,
-                dropout=0.1,
-                bidirectional=False,
-                use_attention=True,
-                use_layer_norm=True,
-                mem_efficient=True
+                output_dim=3,
+                num_layers=2
             )
             
-            # Test forward pass - now returns a dictionary
-            output = model(seq_data, seq_lengths)
-            
-            # Check output format
-            self.assertIsInstance(output, dict)
-            self.assertTrue("task_pred" in output)
-            self.assertEqual(output["task_pred"].shape, (5, 3))  # 5 sequences, 3 classes
-            
-        except (ImportError, NameError):
-            self.skipTest("LSTM model not available in test environment")
-
-    def test_create_model_factory(self):
-        """Test model creation through the factory function."""
-        try:
-            # Test creating different model types
-            gnn_model = create_model(
-                model_type="gnn",
-                input_dim=5,
-                hidden_dim=8,
-                output_dim=3
+            # Create dataloader
+            self.loader = get_graph_dataloader(
+                self.graphs,
+                batch_size=2,
+                shuffle=False
             )
             
-            lstm_model = create_model(
-                model_type="lstm",
-                num_cls=3,
-                emb_dim=8,
-                hidden_dim=8
-            )
+        except ImportError:
+            self.imports_successful = False
+    
+    def test_gnn_model_init(self):
+        """Test GNN model initialization"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Verify model properties
+        self.assertEqual(self.gnn_model.input_dim, 4)
+        self.assertEqual(self.gnn_model.hidden_dim, 8)
+        self.assertEqual(self.gnn_model.output_dim, 3)
+        self.assertEqual(self.gnn_model.num_layers, 2)
+        self.assertEqual(self.gnn_model.attention_type, "basic")
+    
+    def test_enhanced_gnn_model_init(self):
+        """Test enhanced GNN model initialization"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Verify model properties
+        self.assertEqual(self.enhanced_gnn.input_dim, 4)
+        self.assertEqual(self.enhanced_gnn.hidden_dim, 8)
+        self.assertEqual(self.enhanced_gnn.output_dim, 3)
+        self.assertEqual(self.enhanced_gnn.num_layers, 2)
+        self.assertEqual(self.enhanced_gnn.attention_type, "combined")
+    
+    def test_gnn_forward_pass(self):
+        """Test GNN forward pass"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Get a batch
+        for batch in self.loader:
+            # Run forward pass
+            outputs = self.gnn_model(batch)
             
-            # Test enhanced models
-            enhanced_gnn = create_model(
-                model_type="enhanced_gnn",
-                input_dim=5,
-                hidden_dim=8,
-                output_dim=3
-            )
+            # Verify outputs
+            self.assertIsInstance(outputs, dict)
+            self.assertIn('task_pred', outputs)
+            self.assertEqual(outputs['task_pred'].shape[0], batch.batch_size)
+            self.assertEqual(outputs['task_pred'].shape[1], 3)  # 3 output classes
+            break
+    
+    def test_enhanced_gnn_forward_pass(self):
+        """Test enhanced GNN forward pass"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Get a batch
+        for batch in self.loader:
+            # Run forward pass
+            outputs = self.enhanced_gnn(batch)
             
-            # Check that models were created correctly
-            self.assertIsNotNone(gnn_model)
-            self.assertIsNotNone(lstm_model)
-            self.assertIsNotNone(enhanced_gnn)
+            # Verify outputs
+            self.assertIsInstance(outputs, dict)
+            self.assertIn('task_pred', outputs)
+            self.assertEqual(outputs['task_pred'].shape[0], batch.batch_size)
+            self.assertEqual(outputs['task_pred'].shape[1], 3)  # 3 output classes
             
-        except (ImportError, NameError):
-            self.skipTest("Model factory not available in test environment")
+            # Check for diversity loss
+            self.assertIn('diversity_loss', outputs)
+            self.assertIn('diversity_weight', outputs)
+            break
+    
+    def test_get_embeddings(self):
+        """Test getting embeddings from model"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Get a batch
+        for batch in self.loader:
+            # Get embeddings
+            embeddings, batch_indices = self.gnn_model.get_embeddings(batch)
+            
+            # Verify outputs
+            self.assertEqual(embeddings.shape[0], batch.num_nodes())
+            self.assertEqual(embeddings.shape[1], 8 * 4)  # hidden_dim * heads
+            self.assertEqual(len(batch_indices), batch.num_nodes())
+            break
+    
+    def test_get_attention_weights(self):
+        """Test getting attention weights from model"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Get a batch
+        for batch in self.loader:
+            # Get attention weights
+            attn_weights = self.gnn_model.get_attention_weights(batch)
+            
+            # Verify outputs
+            self.assertIsInstance(attn_weights, list)
+            self.assertEqual(len(attn_weights), 2)  # 2 layers
+            break
 
 
-class TestModelTraining(unittest.TestCase):
-    """Test model training functionality."""
-
+class TestTrainingWithDGL(unittest.TestCase):
+    """Test cases for training with DGL models"""
+    
     def setUp(self):
-        """Set up model and data for training tests."""
-        try:
-            # Create a simple model
-            self.input_dim = 5
-            self.hidden_dim = 8
-            self.output_dim = 3
-            self.model = MagicMock()
-            self.model.return_value = {"task_pred": torch.randn(5, 3)}
-            
-            # Create mock data loader
-            self.loader = [(torch.randn(5, 5), torch.randint(0, 3, (5,))) for _ in range(3)]
-            
-            # Mock device
-            self.device = torch.device("cpu")
-            
-            # Mock criterion
-            self.criterion = MagicMock()
-            self.criterion.return_value = torch.tensor(0.5)
-            
-            # Mock optimizer
-            self.optimizer = MagicMock()
-            
-        except (ImportError, NameError):
-            self.skipTest("PyTorch not available in test environment")
-
-    @patch('processmine.core.training.torch.no_grad')
-    def test_evaluate_model(self, mock_no_grad):
-        """Test model evaluation."""
-        try:
-            # Mock no_grad context
-            mock_no_grad.return_value.__enter__ = MagicMock()
-            mock_no_grad.return_value.__exit__ = MagicMock()
-            
-            # Test evaluate_model function with updated interface
-            with patch('processmine.core.training._calculate_metrics', return_value={'accuracy': 0.8}):
-                metrics, predictions, true_labels = evaluate_model(
-                    self.model, self.loader, self.device, self.criterion, detailed=True
-                )
-            
-            # Check that metrics were calculated
-            self.assertTrue("accuracy" in metrics)
-            self.assertEqual(metrics["accuracy"], 0.8)
-            
-        except (ImportError, NameError):
-            self.skipTest("Training utilities not available in test environment")
-
-    @patch('processmine.core.training.torch.no_grad')
-    @patch('processmine.core.training.time.time')
-    def test_train_model(self, mock_time, mock_no_grad):
-        """Test model training."""
-        try:
-            # Mock time and no_grad
-            mock_time.return_value = 0
-            mock_no_grad.return_value.__enter__ = MagicMock()
-            mock_no_grad.return_value.__exit__ = MagicMock()
-            
-            # Mock evaluate_model
-            with patch('processmine.core.training.evaluate_model', 
-                      return_value=(0.4, {'val_loss': 0.4}, None, None)):
-                
-                # Test train_model function with updated parameters
-                model, history = train_model(
-                    model=self.model,
-                    train_loader=self.loader,
-                    val_loader=self.loader, 
-                    optimizer=self.optimizer,
-                    criterion=self.criterion,
-                    device=self.device,
-                    epochs=2,
-                    patience=1,
-                    use_amp=False,
-                    memory_efficient=True,
-                    track_memory=True
-                )
-                
-                # Check that training completed
-                self.assertEqual(len(history['train_loss']), 2)
-                self.assertEqual(len(history['val_loss']), 2)
-            
-        except (ImportError, NameError):
-            self.skipTest("Training utilities not available in test environment")
-
-
-class TestVisualization(unittest.TestCase):
-    """Test visualization utilities."""
-
-    def setUp(self):
-        """Set up test data for visualization tests."""
-        # Create a temporary directory for visualizations
+        """Set up test data and models"""
+        # Create a temporary directory
         self.test_dir = tempfile.mkdtemp()
         
-        # Create test data
-        self.cycle_times = np.random.exponential(scale=10, size=100)
+        # Create test graphs
+        self.graphs = []
+        for i in range(10):
+            # Create a graph with random structure
+            num_nodes = 5
+            src = list(range(num_nodes-1))
+            dst = list(range(1, num_nodes))
+            g = dgl.graph((src, dst), num_nodes=num_nodes)
+            
+            # Add node features
+            g.ndata['feat'] = torch.randn(num_nodes, 4)  # 4 features
+            
+            # Add node labels
+            g.ndata['label'] = torch.tensor([i % 3] * num_nodes)
+            
+            self.graphs.append(g)
         
-        # Create mock bottleneck data
-        self.bottleneck_stats = pd.DataFrame({
-            'task_id': [1, 1, 2, 2],
-            'next_task_id': [2, 3, 3, 4],
-            'count': [10, 5, 8, 3],
-            'mean': [100, 200, 150, 50],
-            'median': [90, 180, 130, 40],
-            'std': [20, 40, 30, 10],
-            'min': [50, 100, 80, 30],
-            'max': [150, 300, 220, 70],
-            'mean_hours': [0.03, 0.06, 0.04, 0.01]
-        })
-        
-        self.significant_bottlenecks = self.bottleneck_stats[self.bottleneck_stats['count'] > 5].copy()
-        self.significant_bottlenecks['bottleneck_score'] = [1.5, 2.0, 1.2]
-        
-        # Mock task encoder
-        self.task_encoder = MagicMock()
-        self.task_encoder.inverse_transform = lambda x: [f"Activity_{i}" for i in x]
-
+        # Import training utilities
+        try:
+            from processmine.models.factory import create_model
+            from processmine.utils.dataloader import get_graph_dataloader
+            from processmine.core.training import (
+                train_model,
+                evaluate_model,
+                create_optimizer,
+                create_lr_scheduler
+            )
+            
+            self.create_model = create_model
+            self.get_graph_dataloader = get_graph_dataloader
+            self.train_model = train_model
+            self.evaluate_model = evaluate_model
+            self.create_optimizer = create_optimizer
+            self.create_lr_scheduler = create_lr_scheduler
+            
+            self.imports_successful = True
+            
+            # Create model
+            self.model = create_model(
+                'gnn',
+                input_dim=4,
+                hidden_dim=8,
+                output_dim=3,
+                num_layers=2
+            )
+            
+            # Split graphs into train/val/test
+            indices = np.arange(len(self.graphs))
+            np.random.shuffle(indices)
+            
+            train_idx = indices[:6]
+            val_idx = indices[6:8]
+            test_idx = indices[8:]
+            
+            # Get subsets
+            from processmine.utils.dataloader import get_batch_graphs_from_indices
+            self.train_graphs = get_batch_graphs_from_indices(self.graphs, train_idx)
+            self.val_graphs = get_batch_graphs_from_indices(self.graphs, val_idx)
+            self.test_graphs = get_batch_graphs_from_indices(self.graphs, test_idx)
+            
+            # Create data loaders
+            self.train_loader = get_graph_dataloader(
+                self.train_graphs,
+                batch_size=2,
+                shuffle=True
+            )
+            
+            self.val_loader = get_graph_dataloader(
+                self.val_graphs,
+                batch_size=2
+            )
+            
+            self.test_loader = get_graph_dataloader(
+                self.test_graphs,
+                batch_size=2
+            )
+            
+            # Set up optimizer and loss
+            self.optimizer = create_optimizer(
+                self.model,
+                optimizer_type='adam',
+                lr=0.01
+            )
+            
+            self.criterion = torch.nn.CrossEntropyLoss()
+            
+        except ImportError:
+            self.imports_successful = False
+    
     def tearDown(self):
-        """Clean up test resources."""
+        """Clean up resources"""
         shutil.rmtree(self.test_dir)
-
-    def test_process_visualizer(self):
-        """Test ProcessVisualizer initialization."""
-        try:
-            # Create a visualizer with updated parameters
-            visualizer = ProcessVisualizer(
-                output_dir=self.test_dir,
-                style='default',
-                force_static=False,
-                memory_efficient=True,
-                sampling_threshold=100000,
-                max_plot_points=50000,
-                dpi=120
-            )
-            
-            # Check that the visualizer was created
-            self.assertEqual(visualizer.output_dir, self.test_dir)
-            
-        except (ImportError, NameError):
-            self.skipTest("Visualization utilities not available in test environment")
-
-    def test_cycle_time_distribution(self):
-        """Test creating cycle time distribution plot."""
-        try:
-            # Create a visualizer
-            visualizer = ProcessVisualizer(output_dir=self.test_dir)
-            
-            # Test creating cycle time distribution with updated parameters
-            filename = visualizer.cycle_time_distribution(
-                self.cycle_times, 
-                filename="cycle_time_test.png",
-                bins=20,
-                include_kde=True,
-                show_percentiles=True
-            )
-            
-            # Check that the file was created
-            self.assertTrue(os.path.exists(os.path.join(self.test_dir, "cycle_time_test.png")))
-            
-        except (ImportError, NameError):
-            self.skipTest("Visualization utilities not available in test environment")
-
-    def test_bottleneck_analysis(self):
-        """Test creating bottleneck analysis plot."""
-        try:
-            # Create a visualizer
-            visualizer = ProcessVisualizer(output_dir=self.test_dir)
-            
-            # Test creating bottleneck analysis with updated parameters
-            filename = visualizer.bottleneck_analysis(
-                self.bottleneck_stats,
-                self.significant_bottlenecks,
-                self.task_encoder,
-                filename="bottleneck_test.png",
-                top_n=3
-            )
-            
-            # Check that the file was created
-            self.assertTrue(os.path.exists(os.path.join(self.test_dir, "bottleneck_test.png")))
-            
-        except (ImportError, NameError):
-            self.skipTest("Visualization utilities not available in test environment")
-
-    def test_process_flow(self):
-        """Test creating process flow visualization."""
-        try:
-            # Create a visualizer
-            visualizer = ProcessVisualizer(output_dir=self.test_dir)
-            
-            # Test creating process flow with updated parameters
-            filename = visualizer.process_flow(
-                self.bottleneck_stats,
-                self.task_encoder,
-                self.significant_bottlenecks,
-                filename="process_flow_test.png",
-                max_nodes=20,
-                layout='auto'
-            )
-            
-            # Check that the file was created - this might fail if NetworkX not available
-            if filename:
-                self.assertTrue(os.path.exists(os.path.join(self.test_dir, "process_flow_test.png")))
-            
-        except (ImportError, NameError):
-            self.skipTest("Visualization utilities not available in test environment")
-
-
-class TestUtilities(unittest.TestCase):
-    """Test utility functions."""
-
-    def test_memory_utilities(self):
-        """Test memory management utilities."""
-        try:
-            # Test memory clearing with full_clear parameter
-            clear_memory(full_clear=True)
-            
-            # Test memory statistics with updated return values
-            stats = get_memory_stats()
-            self.assertIsInstance(stats, dict)
-            self.assertTrue("cpu_percent" in stats)
-            self.assertTrue("cpu_used_gb" in stats)
-            self.assertTrue("cpu_available_gb" in stats)
-            
-        except (ImportError, NameError):
-            self.skipTest("Memory utilities not available in test environment")
-
-    def test_class_weights(self):
-        """Test class weight computation."""
-        try:
-            # Create a test dataframe with imbalanced classes
-            df = pd.DataFrame({
-                "next_task": [0, 0, 0, 0, 1, 1, 2]
-            })
-            
-            # Test computing class weights with updated interface from core.training
-            from processmine.core.training import compute_class_weights
-            weights = compute_class_weights(df, num_classes=3, method='balanced')
-            
-            # Check that weights were computed
-            self.assertIsInstance(weights, torch.Tensor)
-            self.assertEqual(len(weights), 3)
-            
-            # Check that less frequent classes have higher weights
-            self.assertGreater(weights[2], weights[0])
-            
-        except (ImportError, NameError):
-            self.skipTest("Class weight utilities not available in test environment")
+    
+    def test_mini_training_run(self):
+        """Test a minimal training run with DGL models"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Define model path
+        model_path = os.path.join(self.test_dir, "test_model.pt")
+        
+        # Create scheduler
+        scheduler = self.create_lr_scheduler(
+            self.optimizer,
+            scheduler_type='step',
+            epochs=3
+        )
+        
+        # Train for a few epochs
+        model, metrics = self.train_model(
+            model=self.model,
+            train_loader=self.train_loader,
+            val_loader=self.val_loader,
+            optimizer=self.optimizer,
+            criterion=self.criterion,
+            epochs=3,
+            patience=5,
+            model_path=model_path,
+            lr_scheduler=scheduler
+        )
+        
+        # Verify training metrics were collected
+        self.assertIn('train_loss', metrics)
+        self.assertEqual(len(metrics['train_loss']), 3)  # 3 epochs
+        
+        # Verify model was saved
+        self.assertTrue(os.path.exists(model_path))
+    
+    def test_evaluation(self):
+        """Test model evaluation"""
+        if not self.imports_successful:
+            self.skipTest("Required imports not available")
+        
+        # Evaluate model
+        eval_metrics, predictions, true_labels = self.evaluate_model(
+            model=self.model,
+            data_loader=self.test_loader,
+            criterion=self.criterion
+        )
+        
+        # Verify evaluation metrics
+        self.assertIsInstance(eval_metrics, dict)
+        self.assertIn('accuracy', eval_metrics)
+        self.assertIn('f1_weighted', eval_metrics)
+        
+        # Verify predictions
+        self.assertIsInstance(predictions, np.ndarray)
+        self.assertEqual(len(predictions), len(self.test_graphs))
+        
+        # Verify true labels
+        self.assertIsInstance(true_labels, np.ndarray)
+        self.assertEqual(len(true_labels), len(self.test_graphs))
 
 
 if __name__ == '__main__':

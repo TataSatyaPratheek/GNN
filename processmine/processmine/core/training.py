@@ -1,6 +1,6 @@
 """
-High-performance training utilities with mixed precision training, gradient accumulation,
-memory-optimized batching, and systematic CUDA management.
+High-performance training utilities adapted for DGL with mixed precision training,
+gradient accumulation, memory-optimized batching, and systematic CUDA management.
 """
 import torch
 import os
@@ -8,6 +8,7 @@ import numpy as np
 import time
 import logging
 import gc
+import dgl
 from typing import Dict, Any, Optional, Union, Tuple, List, Callable
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score, 
@@ -116,7 +117,7 @@ def train_model(
     early_stopping_threshold: float = 0.0001
 ) -> Tuple[torch.nn.Module, Dict[str, Any]]:
     """
-    Unified training function with advanced optimization features
+    Unified training function with advanced optimization features, adapted for DGL models
     
     Args:
         model: PyTorch model to train
@@ -219,9 +220,14 @@ def train_model(
         # Reset accumulated gradients
         accumulated_loss = 0.0
         
-        for batch_idx, batch in enumerate(train_iter):
+        for batch_idx, batch_graphs in enumerate(train_iter):
             # Move batch to device with memory optimization
-            batch = _move_to_device(batch, device)
+            batch_graphs = batch_graphs.to(device)
+            
+            # Get labels from the graph
+            # Import our utility function to get labels
+            from processmine.utils.dataloader import get_graph_targets
+            labels = get_graph_targets(batch_graphs)
             
             # Calculate loss normalization factor for accumulation
             accumulation_factor = 1.0 / gradient_accumulation_steps
@@ -229,8 +235,26 @@ def train_model(
             if use_amp and scaler is not None:
                 # Forward pass with AMP
                 with autocast():
-                    outputs = model(batch)
-                    loss = _compute_loss(outputs, batch, criterion)
+                    outputs = model(batch_graphs)
+                    
+                    # Handle dictionary outputs
+                    if isinstance(outputs, dict):
+                        logits = outputs.get("task_pred", next(iter(outputs.values())))
+                        
+                        # Check for diversity loss
+                        diversity_loss = outputs.get("diversity_loss", 0.0)
+                        diversity_weight = outputs.get("diversity_weight", 0.1)
+                        
+                        # Compute task loss
+                        loss = criterion(logits, labels)
+                        
+                        # Add diversity loss if available
+                        if torch.is_tensor(diversity_loss) and diversity_loss.numel() > 0:
+                            loss = loss + diversity_loss * diversity_weight
+                    else:
+                        # Normal output
+                        loss = criterion(outputs, labels)
+                    
                     loss = loss * accumulation_factor  # Scale for accumulation
                 
                 # Backward pass with gradient scaling
@@ -252,7 +276,7 @@ def train_model(
                     optimizer.zero_grad(set_to_none=True)
                     
                     # Track loss
-                    batch_size = _get_batch_size(batch)
+                    batch_size = batch_graphs.batch_size
                     train_loss += accumulated_loss * batch_size
                     train_samples += batch_size
                     accumulated_loss = 0.0
@@ -264,8 +288,26 @@ def train_model(
                     global_step += 1
             else:
                 # Standard forward and backward pass
-                outputs = model(batch)
-                loss = _compute_loss(outputs, batch, criterion)
+                outputs = model(batch_graphs)
+                
+                # Handle dictionary outputs
+                if isinstance(outputs, dict):
+                    logits = outputs.get("task_pred", next(iter(outputs.values())))
+                    
+                    # Check for diversity loss
+                    diversity_loss = outputs.get("diversity_loss", 0.0)
+                    diversity_weight = outputs.get("diversity_weight", 0.1)
+                    
+                    # Compute task loss
+                    loss = criterion(logits, labels)
+                    
+                    # Add diversity loss if available
+                    if torch.is_tensor(diversity_loss) and diversity_loss.numel() > 0:
+                        loss = loss + diversity_loss * diversity_weight
+                else:
+                    # Normal output
+                    loss = criterion(outputs, labels)
+                    
                 loss = loss * accumulation_factor  # Scale for accumulation
                 loss.backward()
                 
@@ -282,7 +324,7 @@ def train_model(
                     optimizer.zero_grad(set_to_none=True)
                     
                     # Track loss
-                    batch_size = _get_batch_size(batch)
+                    batch_size = batch_graphs.batch_size
                     train_loss += accumulated_loss * batch_size
                     train_samples += batch_size
                     accumulated_loss = 0.0
@@ -437,223 +479,14 @@ def train_model(
     # Return model and metrics
     return model, metrics_history
 
-def _evaluate_during_training(model, val_loader, criterion, device, memory_efficient, mem_tracker):
-    """Evaluate model during training with memory optimization"""
-    model.eval()
-    val_loss = 0.0
-    val_samples = 0
-    y_true = []
-    y_pred = []
-    
-    # Clear memory before validation
-    if memory_efficient:
-        clear_memory()
-    
-    val_iter = _get_progress_bar(
-        val_loader, "Validation", 
-        total=len(val_loader)
-    )
-    
-    with torch.no_grad():
-        for batch in val_iter:
-            batch = _move_to_device(batch, device)
-            outputs = model(batch)
-            loss = _compute_loss(outputs, batch, criterion)
-            
-            # Track loss
-            batch_size = _get_batch_size(batch)
-            val_loss += loss.item() * batch_size
-            val_samples += batch_size
-            
-            # Extract predictions for metrics
-            if isinstance(outputs, dict):
-                logits = outputs.get("task_pred", next(iter(outputs.values())))
-            elif isinstance(outputs, tuple):
-                logits = outputs[0]
-            else:
-                logits = outputs
-            
-            _, preds = torch.max(logits, dim=1)
-            
-            # Get targets for metrics
-            if hasattr(batch, 'y'):
-                targets = batch.y
-            elif hasattr(batch, 'batch') and hasattr(batch, 'y'):
-                targets = _get_graph_targets(batch.y, batch.batch)
-            else:
-                # Try to infer targets from batch
-                targets = batch[1] if isinstance(batch, tuple) and len(batch) > 1 else None
-            
-            if targets is not None:
-                y_true.extend(targets.cpu().numpy())
-                y_pred.extend(preds.cpu().numpy())
-                
-            # Update progress bar
-            if hasattr(val_iter, 'set_postfix'):
-                val_iter.set_postfix({'loss': f"{loss.item():.4f}"})
-            
-            # Memory tracking
-            if mem_tracker is not None:
-                mem_tracker.step()
-                
-            # Free batch memory for very large models
-            if memory_efficient:
-                del outputs, loss
-    
-    # Calculate average validation loss
-    avg_val_loss = val_loss / max(val_samples, 1)
-    
-    # Calculate additional metrics if we have predictions
-    val_metrics = {}
-    if y_true and y_pred:
-        y_true = np.array(y_true)
-        y_pred = np.array(y_pred)
-        
-        val_metrics['accuracy'] = accuracy_score(y_true, y_pred)
-        val_metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
-        val_metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-    
-    # Force memory cleanup
-    if memory_efficient:
-        clear_memory()
-    
-    return avg_val_loss, val_metrics
-
-def _compute_loss(outputs, batch, criterion):
-    """
-    Compute loss based on model outputs and batch data.
-    Handles different output formats (tensor, dict, tuple).
-    """
-    # Handle dictionary outputs (e.g., from diverse attention models)
-    if isinstance(outputs, dict):
-        if "task_pred" in outputs:
-            # Get predictions and targets
-            preds = outputs["task_pred"]
-            
-            # Get graph-level targets efficiently
-            if hasattr(batch, 'batch') and hasattr(batch, 'y'):
-                targets = _get_graph_targets(batch.y, batch.batch)
-            else:
-                targets = batch.y if hasattr(batch, 'y') else batch[1]
-            
-            # Compute task loss
-            task_loss = criterion(preds, targets)
-            
-            # Add diversity loss if available
-            if "diversity_loss" in outputs:
-                return task_loss + outputs["diversity_loss"] * outputs.get("diversity_weight", 0.1)
-            
-            return task_loss
-    
-    # Handle tuple outputs (e.g., output and auxiliary loss)
-    elif isinstance(outputs, tuple) and len(outputs) == 2:
-        preds, aux_loss = outputs
-        if hasattr(batch, 'batch') and hasattr(batch, 'y'):
-            targets = _get_graph_targets(batch.y, batch.batch)
-        elif hasattr(batch, 'y'):
-            targets = batch.y
-        else:
-            targets = batch[1] if isinstance(batch, tuple) else batch[-1]
-        
-        return criterion(preds, targets) + aux_loss
-    
-    # Standard case (direct output tensor)
-    else:
-        if hasattr(batch, 'batch') and hasattr(batch, 'y'):
-            targets = _get_graph_targets(batch.y, batch.batch)
-        elif hasattr(batch, 'y'):
-            targets = batch.y
-        else:
-            targets = batch[1] if isinstance(batch, tuple) else batch[-1]
-        
-        return criterion(outputs, targets)
-
-def _get_graph_targets(node_targets, batch_indices):
-    """
-    Extract graph-level targets from node-level targets efficiently
-    
-    Args:
-        node_targets: Node-level targets
-        batch_indices: Batch assignment indices
-        
-    Returns:
-        Graph-level targets
-    """
-    # Get unique graphs
-    unique_graphs = torch.unique(batch_indices)
-    graph_targets = []
-    
-    # Extract most common target for each graph
-    for g in unique_graphs:
-        # Get targets for this graph
-        graph_mask = (batch_indices == g)
-        graph_node_targets = node_targets[graph_mask]
-        
-        # Find most common target (mode)
-        if len(graph_node_targets) > 0:
-            values, counts = torch.unique(graph_node_targets, return_counts=True)
-            mode_idx = torch.argmax(counts)
-            graph_targets.append(values[mode_idx])
-        else:
-            # Fallback if no targets (should not happen)
-            graph_targets.append(torch.tensor(0, device=node_targets.device))
-    
-    # Convert to tensor
-    return torch.stack(graph_targets)
-
-def _get_batch_size(batch):
-    """Extract batch size from different batch formats"""
-    if hasattr(batch, 'batch'):
-        # PyG batch - use unique batch indices
-        return torch.unique(batch.batch).size(0)
-    elif hasattr(batch, 'size') and isinstance(batch.size(), tuple):
-        # Regular tensor batch - use first dimension
-        return batch.size(0)
-    elif isinstance(batch, tuple) and hasattr(batch[0], 'size'):
-        # Tuple of tensors - use first dimension of first tensor
-        return batch[0].size(0)
-    else:
-        # Fallback
-        return 1
-
-def _move_to_device(batch, device):
-    """Move batch to device with optimized memory transfer"""
-    if hasattr(batch, 'to'):
-        # PyG data or tensor - use to() method
-        return batch.to(device, non_blocking=True)
-    elif isinstance(batch, tuple):
-        # Tuple of tensors - move each element
-        return tuple(x.to(device, non_blocking=True) if hasattr(x, 'to') else x for x in batch)
-    elif isinstance(batch, list):
-        # List of tensors - move each element
-        return [x.to(device, non_blocking=True) if hasattr(x, 'to') else x for x in batch]
-    elif isinstance(batch, dict):
-        # Dictionary of tensors - move each value
-        return {k: v.to(device, non_blocking=True) if hasattr(v, 'to') else v for k, v in batch.items()}
-    else:
-        # Fallback - return as is
-        return batch
-
-def _get_progress_bar(iterable, desc, total=None):
-    """Get progress bar for iteration with fallback"""
-    try:
-        from tqdm import tqdm
-        return tqdm(iterable, desc=desc, leave=False, total=total)
-    except ImportError:
-        # Simple fallback - just return iterable
-        print(f"{desc}...")
-        return iterable
-
-# processmine/core/training.py (UPDATED FUNCTION)
-
 def evaluate_model(
     model: torch.nn.Module,
     data_loader: Any,
-    device: Optional[torch.device] = None,
     criterion: Optional[Any] = None,
+    device: Optional[torch.device] = None,
     detailed: bool = True,
     memory_efficient: bool = True,
-    is_during_training: bool = False  # New parameter to handle training evaluation
+    is_during_training: bool = False
 ) -> Union[Tuple[Dict[str, Any], np.ndarray, np.ndarray], Tuple[float, Dict[str, Any]]]:
     """
     Evaluate model on test data with memory optimization.
@@ -662,8 +495,8 @@ def evaluate_model(
     Args:
         model: PyTorch model to evaluate
         data_loader: Test data loader
-        device: Computing device
         criterion: Loss function (optional)
+        device: Computing device
         detailed: Whether to compute detailed metrics
         memory_efficient: Whether to use memory-efficient evaluation
         is_during_training: Whether this is being called during training
@@ -690,6 +523,9 @@ def evaluate_model(
     test_loss = 0.0 if criterion is not None else None
     test_samples = 0
     
+    # Import utility function for getting graph targets
+    from processmine.utils.dataloader import get_graph_targets
+    
     # Clear memory before evaluation
     if memory_efficient and torch.cuda.is_available():
         clear_memory()
@@ -699,40 +535,38 @@ def evaluate_model(
     
     # Evaluate without gradient tracking
     with torch.no_grad():
-        for batch in progress_bar:
+        for batch_graphs in progress_bar:
             # Move batch to device
-            batch = _move_to_device(batch, device)
+            batch_graphs = batch_graphs.to(device)
+            
+            # Get labels from the graph
+            labels = get_graph_targets(batch_graphs)
             
             # Forward pass
-            outputs = model(batch)
+            outputs = model(batch_graphs)
+            
+            # Handle dictionary outputs
+            if isinstance(outputs, dict):
+                logits = outputs.get("task_pred", next(iter(outputs.values())))
+            elif isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
             
             # Calculate loss if criterion provided
-            if criterion is not None:
-                loss = _compute_loss(outputs, batch, criterion)
-                batch_size = _get_batch_size(batch)
+            if criterion is not None and labels is not None:
+                loss = criterion(logits, labels)
+                batch_size = batch_graphs.batch_size
                 test_loss += loss.item() * batch_size
                 test_samples += batch_size
             
-            # Extract predictions
-            if isinstance(outputs, dict):
-                outputs = outputs.get("task_pred", next(iter(outputs.values())))
-            elif isinstance(outputs, tuple):
-                outputs = outputs[0]
-            
             # Get predicted classes
-            _, preds = torch.max(outputs, dim=1)
-            
-            # Get targets
-            if hasattr(batch, 'batch') and hasattr(batch, 'y'):
-                targets = _get_graph_targets(batch.y, batch.batch)
-            elif hasattr(batch, 'y'):
-                targets = batch.y
-            else:
-                targets = batch[1] if isinstance(batch, tuple) else batch[-1]
+            _, preds = torch.max(logits, dim=1)
             
             # Collect predictions and labels
             all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(targets.cpu().numpy())
+            if labels is not None:
+                all_labels.extend(labels.cpu().numpy())
             
             # Free batch memory for very large models
             if memory_efficient:
@@ -818,6 +652,85 @@ def _calculate_metrics(true_labels, predictions, detailed=True):
             metrics['confusion_matrix'] = confusion_matrix(true_labels, predictions).tolist()
     
     return metrics
+
+def _get_progress_bar(iterable, desc, total=None):
+    """Get progress bar for iteration with fallback"""
+    try:
+        from tqdm import tqdm
+        return tqdm(iterable, desc=desc, leave=False, total=total)
+    except ImportError:
+        # Simple fallback - just return iterable
+        print(f"{desc}...")
+        return iterable
+
+def compute_class_weights(df, num_classes, method='balanced'):
+    """
+    Compute class weights to handle imbalanced datasets with improved vectorization
+    
+    Args:
+        df: Process data dataframe
+        num_classes: Number of classes
+        method: Weight calculation method ('balanced', 'log', 'sqrt', 'effective')
+        
+    Returns:
+        Tensor of class weights
+    """
+    from sklearn.utils.class_weight import compute_class_weight as sk_compute_class_weight
+    
+    # Extract labels efficiently
+    labels = df["next_task"].values
+    
+    # Get unique classes
+    unique_classes = np.unique(labels)
+    
+    # Create weight array (default to 1.0)
+    weights = np.ones(num_classes, dtype=np.float32)
+    
+    # Compute class counts
+    class_counts = np.bincount(labels, minlength=num_classes)
+    total_samples = len(labels)
+    
+    # Compute weights based on method
+    if method == 'balanced':
+        # Use sklearn's balanced method
+        class_weights = sk_compute_class_weight('balanced', classes=unique_classes, y=labels)
+        weights[unique_classes] = class_weights
+    
+    elif method == 'log':
+        # Log-based weighting (less aggressive than balanced)
+        valid_counts = class_counts[class_counts > 0]
+        
+        # Log-based inverse weighting
+        for cls in unique_classes:
+            count = class_counts[cls]
+            weights[cls] = np.log(total_samples / max(count, 1))
+        
+        # Normalize weights
+        weights = weights / np.min(weights[weights > 0])
+    
+    elif method == 'sqrt':
+        # Square root based weighting (even less aggressive)
+        for cls in unique_classes:
+            count = class_counts[cls]
+            weights[cls] = np.sqrt(total_samples / max(count, 1))
+        
+        # Normalize weights
+        weights = weights / np.min(weights[weights > 0])
+    
+    elif method == 'effective':
+        # Effective number of samples weighting (works well for severe imbalance)
+        beta = 0.9999
+        for cls in unique_classes:
+            count = class_counts[cls]
+            # Effective number formula: (1 - beta^n) / (1 - beta)
+            effective_num = (1.0 - beta ** count) / (1.0 - beta)
+            weights[cls] = 1.0 / effective_num
+        
+        # Normalize weights
+        weights = weights / np.min(weights[weights > 0])
+    
+    # Convert to tensor
+    return torch.tensor(weights, dtype=torch.float32)
 
 def create_optimizer(
     model: torch.nn.Module, 
@@ -1010,75 +923,6 @@ def create_lr_scheduler(
     else:
         raise ValueError(f"Unknown scheduler type: {scheduler_type}")
 
-def compute_class_weights(df, num_classes, method='balanced'):
-    """
-    Compute class weights to handle imbalanced datasets with improved vectorization
-    
-    Args:
-        df: Process data dataframe
-        num_classes: Number of classes
-        method: Weight calculation method ('balanced', 'log', 'sqrt', 'effective')
-        
-    Returns:
-        Tensor of class weights
-    """
-    from sklearn.utils.class_weight import compute_class_weight as sk_compute_class_weight
-    
-    # Extract labels efficiently
-    labels = df["next_task"].values
-    
-    # Get unique classes
-    unique_classes = np.unique(labels)
-    
-    # Create weight array (default to 1.0)
-    weights = np.ones(num_classes, dtype=np.float32)
-    
-    # Compute class counts
-    class_counts = np.bincount(labels, minlength=num_classes)
-    total_samples = len(labels)
-    
-    # Compute weights based on method
-    if method == 'balanced':
-        # Use sklearn's balanced method
-        class_weights = sk_compute_class_weight('balanced', classes=unique_classes, y=labels)
-        weights[unique_classes] = class_weights
-    
-    elif method == 'log':
-        # Log-based weighting (less aggressive than balanced)
-        valid_counts = class_counts[class_counts > 0]
-        
-        # Log-based inverse weighting
-        for cls in unique_classes:
-            count = class_counts[cls]
-            weights[cls] = np.log(total_samples / max(count, 1))
-        
-        # Normalize weights
-        weights = weights / np.min(weights[weights > 0])
-    
-    elif method == 'sqrt':
-        # Square root based weighting (even less aggressive)
-        for cls in unique_classes:
-            count = class_counts[cls]
-            weights[cls] = np.sqrt(total_samples / max(count, 1))
-        
-        # Normalize weights
-        weights = weights / np.min(weights[weights > 0])
-    
-    elif method == 'effective':
-        # Effective number of samples weighting (works well for severe imbalance)
-        beta = 0.9999
-        for cls in unique_classes:
-            count = class_counts[cls]
-            # Effective number formula: (1 - beta^n) / (1 - beta)
-            effective_num = (1.0 - beta ** count) / (1.0 - beta)
-            weights[cls] = 1.0 / effective_num
-        
-        # Normalize weights
-        weights = weights / np.min(weights[weights > 0])
-    
-    # Convert to tensor
-    return torch.tensor(weights, dtype=torch.float32)
-
 def set_seed(seed: int) -> None:
     """
     Set random seed for reproducibility across libraries
@@ -1108,5 +952,8 @@ def set_seed(seed: int) -> None:
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
+    
+    # DGL deterministic operations
+    dgl.random.seed(seed)
     
     logger.info(f"Random seed set to {seed}")
