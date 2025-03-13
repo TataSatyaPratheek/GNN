@@ -249,7 +249,7 @@ class NextActivityLSTM(BaseModel):
     
     def _process_dgl_graph(self, g):
         """
-        Process DGL graph by extracting case-level sequences
+        Process DGL graph by extracting case-level sequences with DGL-optimized approach
         
         Args:
             g: DGL graph or batched graph
@@ -265,20 +265,20 @@ class NextActivityLSTM(BaseModel):
         seq_lengths = []
         
         if is_batched:
-            # Get number of nodes per graph
+            # Get number of nodes per graph using DGL's batch API
             batch_num_nodes = g.batch_num_nodes()
             
             # Process each graph in the batch
             node_offset = 0
             for graph_idx, num_nodes in enumerate(batch_num_nodes):
-                # Extract nodes for this graph
-                graph_nodes = g.ndata['feat'][node_offset:node_offset+num_nodes]
+                # Extract nodes for this graph using DGL's slice operations
+                graph_node_features = g.ndata['feat'][node_offset:node_offset+num_nodes]
                 
-                # Extract task IDs - assume first column contains task ID if multiple features
-                if graph_nodes.size(1) > 1:
-                    task_ids = graph_nodes[:, 0].long()
+                # Extract task IDs - first column is typically task ID if multiple features
+                if graph_node_features.size(1) > 1:
+                    task_ids = graph_node_features[:, 0].long()
                 else:
-                    task_ids = graph_nodes.squeeze(-1).long()
+                    task_ids = graph_node_features.squeeze(-1).long()
                 
                 # Handle possible negative or out-of-range IDs
                 task_ids = torch.clamp(task_ids, min=0, max=self.num_cls-1)
@@ -291,13 +291,13 @@ class NextActivityLSTM(BaseModel):
                 node_offset += num_nodes
         else:
             # Single graph - just extract the sequence
-            graph_nodes = g.ndata['feat']
+            graph_node_features = g.ndata['feat']
             
-            # Extract task IDs - assume first column contains task ID if multiple features
-            if graph_nodes.size(1) > 1:
-                task_ids = graph_nodes[:, 0].long()
+            # Extract task IDs - handle both multi-feature and single-feature cases
+            if graph_node_features.size(1) > 1:
+                task_ids = graph_node_features[:, 0].long()
             else:
-                task_ids = graph_nodes.squeeze(-1).long()
+                task_ids = graph_node_features.squeeze(-1).long()
             
             # Handle possible negative or out-of-range IDs
             task_ids = torch.clamp(task_ids, min=0, max=self.num_cls-1)
@@ -306,7 +306,7 @@ class NextActivityLSTM(BaseModel):
             sequences.append(task_ids)
             seq_lengths.append(len(task_ids))
         
-        # Process extracted sequences
+        # Process extracted sequences - we'll use DGL's efficient batch tensor processing
         return self._process_sequence_list(sequences, seq_lengths)
     
     def _process_graph_data(self, data):

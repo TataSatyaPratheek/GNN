@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-MLP models for process mining
+MLP models for process mining with DGL support
 Basic neural network baseline for comparison with more advanced models
 """
 
@@ -12,21 +12,22 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import logging
+import dgl
 from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional, Union, Any
 
-from processmine.models.base import ProcessMiningModel
+from processmine.models.base import ProcessModel
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
 
-class BasicMLP(ProcessMiningModel):
+class BasicMLP(ProcessModel):
     """
-    Basic MLP model for process mining
+    Basic MLP model for process mining with DGL compatibility
     """
     def __init__(self, input_dim, hidden_dims, output_dim, dropout=0.3,
-                 activation=F.relu):
+                 activation=F.relu, use_layer_norm=True):
         """
         Initialize MLP model
         
@@ -36,6 +37,7 @@ class BasicMLP(ProcessMiningModel):
             output_dim: Output dimension
             dropout: Dropout probability
             activation: Activation function
+            use_layer_norm: Whether to use layer normalization
         """
         super().__init__()
         self.input_dim = input_dim
@@ -43,6 +45,7 @@ class BasicMLP(ProcessMiningModel):
         self.output_dim = output_dim
         self.dropout = dropout
         self.activation = activation
+        self.use_layer_norm = use_layer_norm
         
         # Create layers
         layers = []
@@ -50,57 +53,142 @@ class BasicMLP(ProcessMiningModel):
         
         for h_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, h_dim))
-            layers.append(nn.BatchNorm1d(h_dim))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(h_dim))
             layers.append(nn.Dropout(dropout))
             prev_dim = h_dim
         
         self.hidden_layers = nn.ModuleList(layers)
         self.output_layer = nn.Linear(prev_dim, output_dim)
-    
+        
+        # Xavier initialization for better gradient flow
+        nn.init.xavier_uniform_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
+
     def forward(self, x):
         """
-        Forward pass
+        Forward pass with DGL support
         
         Args:
-            x: Input tensor [batch_size, input_dim] or PyG Data
+            x: Input tensor [batch_size, input_dim] or DGL/PyG graph
             
         Returns:
-            Output logits [batch_size, output_dim]
+            Output logits [batch_size, num_classes] or dict with task_pred
         """
-        # Handle PyG Data objects
-        if hasattr(x, 'x') and hasattr(x, 'batch'):
-            # Extract node features and perform pooling
-            node_x = x.x
-            batch = x.batch
-            
-            # Apply hidden layers to nodes
-            for i in range(0, len(self.hidden_layers), 3):
-                node_x = self.hidden_layers[i](node_x)  # Linear
-                node_x = self.hidden_layers[i+1](node_x)  # BatchNorm
-                node_x = self.activation(node_x)  # Activation
-                node_x = self.hidden_layers[i+2](node_x)  # Dropout
-            
-            # Global mean pooling
-            from torch_geometric.nn import global_mean_pool
-            x = global_mean_pool(node_x, batch)
-        else:
-            # Standard tensor processing
-            for i in range(0, len(self.hidden_layers), 3):
-                x = self.hidden_layers[i](x)  # Linear
-                x = self.hidden_layers[i+1](x)  # BatchNorm
-                x = self.activation(x)  # Activation
-                x = self.hidden_layers[i+2](x)  # Dropout
+        # Handle DGL graph objects
+        if hasattr(x, 'ndata') and 'feat' in x.ndata:
+            return self._process_dgl_graph(x)
+        
+        # Handle PyG Data objects for backward compatibility
+        elif hasattr(x, 'x') and hasattr(x, 'batch'):
+            return self._process_graph_data(x)
+        
+        # Standard tensor processing
+        for i in range(0, len(self.hidden_layers), 3):
+            x = self.hidden_layers[i](x)  # Linear
+            if self.use_layer_norm:
+                x = self.hidden_layers[i+1](x)  # LayerNorm
+            x = self.activation(x)  # Activation
+            x = self.hidden_layers[i+2](x)  # Dropout
         
         # Apply output layer
         logits = self.output_layer(x)
         
-        return logits
+        return {"task_pred": logits}
+    
+    def _process_dgl_graph(self, g):
+        """
+        Process DGL graph data
+        
+        Args:
+            g: DGL graph or batched graph
+            
+        Returns:
+            Dict with task_pred tensor
+        """
+        # Extract node features
+        node_features = g.ndata['feat']
+        
+        # Apply hidden layers to node features
+        h = node_features
+        for i in range(0, len(self.hidden_layers), 3):
+            h = self.hidden_layers[i](h)  # Linear
+            if self.use_layer_norm:
+                h = self.hidden_layers[i+1](h)  # BatchNorm/LayerNorm
+            h = self.activation(h)  # Activation
+            h = self.hidden_layers[i+2](h)  # Dropout
+        
+        # Global graph-level pooling
+        if g.batch_size > 1:
+            # Batched graph - apply readout to get graph-level features
+            g.ndata['h'] = h
+            readout = dgl.readout_nodes(g, 'h', op='mean')
+        else:
+            # Single graph - simple mean pooling
+            readout = h.mean(dim=0, keepdim=True)
+        
+        # Apply output layer
+        logits = self.output_layer(readout)
+        
+        return {"task_pred": logits}
+    
+    def _process_graph_data(self, data):
+        """
+        Process PyG Data for backward compatibility
+        
+        Args:
+            data: PyG Data object
+            
+        Returns:
+            Dict with task_pred tensor
+        """
+        x, batch = data.x, data.batch
+        
+        # Apply model to node features
+        h = x
+        for i in range(0, len(self.hidden_layers), 3):
+            h = self.hidden_layers[i](h)  # Linear
+            if self.use_layer_norm:
+                h = self.hidden_layers[i+1](h)  # BatchNorm/LayerNorm
+            h = self.activation(h)  # Activation
+            h = self.hidden_layers[i+2](h)  # Dropout
+        
+        # Global pooling
+        from torch_scatter import scatter_mean
+        readout = scatter_mean(h, batch, dim=0)
+        
+        # Apply output layer
+        logits = self.output_layer(readout)
+        
+        return {"task_pred": logits}
+    
+    def predict(self, g):
+        """
+        Make predictions with a consistent interface
+        
+        Args:
+            g: Input data, graph or tensor
+            
+        Returns:
+            Prediction tensor
+        """
+        self.eval()
+        with torch.no_grad():
+            outputs = self.forward(g)
+            # Handle different output formats
+            if isinstance(outputs, dict):
+                logits = outputs.get("task_pred", next(iter(outputs.values())))
+            else:
+                logits = outputs
+            
+            _, predictions = torch.max(logits, dim=1)
+            return predictions
 
 
 def train_mlp_model(model, train_loader, val_loader, criterion, optimizer, 
-                 device, num_epochs=20, patience=5, model_path=None):
+                  device, num_epochs=20, patience=5, model_path=None):
     """
-    Train MLP model with early stopping
+    Train MLP model with early stopping and DGL support
     
     Args:
         model: MLP model
@@ -114,7 +202,7 @@ def train_mlp_model(model, train_loader, val_loader, criterion, optimizer,
         model_path: Path to save best model
         
     Returns:
-        Trained model
+        Trained model and training history
     """
     logger.info(f"Training MLP model for {num_epochs} epochs (patience={patience})")
     
@@ -122,6 +210,9 @@ def train_mlp_model(model, train_loader, val_loader, criterion, optimizer,
     patience_counter = 0
     train_losses = []
     val_losses = []
+    
+    # Import utility for getting graph targets
+    from processmine.utils.dataloader import get_graph_targets
     
     # Training loop
     for epoch in range(1, num_epochs + 1):
@@ -134,34 +225,35 @@ def train_mlp_model(model, train_loader, val_loader, criterion, optimizer,
             # Move batch to device
             if hasattr(batch, 'to'):
                 batch = batch.to(device)
-            elif isinstance(batch, dict):
-                batch = {k: v.to(device) if hasattr(v, 'to') else v 
-                         for k, v in batch.items()}
             
-            # Extract features and targets
-            if hasattr(batch, 'x') and hasattr(batch, 'y'):
-                # PyG Data batch
-                x = batch
-                y = batch.y
-            elif isinstance(batch, dict):
-                # Dictionary batch
-                x = batch['x']
-                y = batch['y']
+            # Extract targets using DGL utility for DGL graphs
+            if hasattr(batch, 'ndata') and 'label' in batch.ndata:
+                # DGL graph - extract targets
+                targets = get_graph_targets(batch)
+            elif hasattr(batch, 'y'):
+                # PyG Data (backward compatibility)
+                targets = batch.y
             else:
-                # Tuple/list batch
-                x, y = batch
-            
+                # Assume tensor inputs with separate targets
+                batch, targets = batch
+                
             # Forward pass
             optimizer.zero_grad()
-            outputs = model(x)
+            outputs = model(batch)
             
-            # Handle different output and target formats
-            if hasattr(y, 'shape') and len(y.shape) > 1 and y.shape[1] > 1:
+            # Handle different output formats
+            if isinstance(outputs, dict):
+                logits = outputs.get("task_pred", next(iter(outputs.values())))
+            else:
+                logits = outputs
+            
+            # Handle different target formats
+            if hasattr(targets, 'shape') and len(targets.shape) > 1 and targets.shape[1] > 1:
                 # Multi-dimensional targets
-                loss = criterion(outputs, y)
+                loss = criterion(logits, targets)
             else:
                 # Class indices
-                loss = criterion(outputs, y.long())
+                loss = criterion(logits, targets.long())
             
             # Backward pass and optimize
             loss.backward()
@@ -184,33 +276,34 @@ def train_mlp_model(model, train_loader, val_loader, criterion, optimizer,
                 # Move batch to device
                 if hasattr(batch, 'to'):
                     batch = batch.to(device)
-                elif isinstance(batch, dict):
-                    batch = {k: v.to(device) if hasattr(v, 'to') else v 
-                             for k, v in batch.items()}
                 
-                # Extract features and targets
-                if hasattr(batch, 'x') and hasattr(batch, 'y'):
-                    # PyG Data batch
-                    x = batch
-                    y = batch.y
-                elif isinstance(batch, dict):
-                    # Dictionary batch
-                    x = batch['x']
-                    y = batch['y']
+                # Extract targets using DGL utility for DGL graphs
+                if hasattr(batch, 'ndata') and 'label' in batch.ndata:
+                    # DGL graph - extract targets
+                    targets = get_graph_targets(batch)
+                elif hasattr(batch, 'y'):
+                    # PyG Data (backward compatibility)
+                    targets = batch.y
                 else:
-                    # Tuple/list batch
-                    x, y = batch
+                    # Assume tensor inputs with separate targets
+                    batch, targets = batch
                 
                 # Forward pass
-                outputs = model(x)
+                outputs = model(batch)
                 
-                # Handle different output and target formats
-                if hasattr(y, 'shape') and len(y.shape) > 1 and y.shape[1] > 1:
+                # Handle different output formats
+                if isinstance(outputs, dict):
+                    logits = outputs.get("task_pred", next(iter(outputs.values())))
+                else:
+                    logits = outputs
+                
+                # Handle different target formats
+                if hasattr(targets, 'shape') and len(targets.shape) > 1 and targets.shape[1] > 1:
                     # Multi-dimensional targets
-                    loss = criterion(outputs, y)
+                    loss = criterion(logits, targets)
                 else:
                     # Class indices
-                    loss = criterion(outputs, y.long())
+                    loss = criterion(logits, targets.long())
                 
                 # Track loss
                 val_loss += loss.item()
@@ -221,8 +314,8 @@ def train_mlp_model(model, train_loader, val_loader, criterion, optimizer,
         
         # Print epoch summary
         logger.info(f"Epoch {epoch}/{num_epochs}: "
-                    f"train_loss={avg_train_loss:.4f}, "
-                    f"val_loss={avg_val_loss:.4f}")
+                   f"train_loss={avg_train_loss:.4f}, "
+                   f"val_loss={avg_val_loss:.4f}")
         
         # Check for improvement for early stopping
         if avg_val_loss < best_val_loss:
@@ -252,57 +345,87 @@ def train_mlp_model(model, train_loader, val_loader, criterion, optimizer,
     return model, {'train_losses': train_losses, 'val_losses': val_losses}
 
 
-def evaluate_mlp_model(model, test_loader, device):
+def evaluate_mlp_model(model, test_loader, device, criterion=None):
     """
-    Evaluate MLP model on test data
+    Evaluate MLP model on test data with DGL support
     
     Args:
         model: MLP model
         test_loader: Test data loader
         device: Torch device
+        criterion: Optional loss function
         
     Returns:
-        Tuple of (accuracy, predictions, true_labels)
+        Tuple of (metrics, predictions, true_labels)
     """
     model.eval()
     all_preds = []
     all_labels = []
+    test_loss = 0.0 if criterion else None
+    
+    # Import utility for getting graph targets
+    from processmine.utils.dataloader import get_graph_targets
     
     with torch.no_grad():
         for batch in test_loader:
             # Move batch to device
             if hasattr(batch, 'to'):
                 batch = batch.to(device)
-            elif isinstance(batch, dict):
-                batch = {k: v.to(device) if hasattr(v, 'to') else v 
-                         for k, v in batch.items()}
             
-            # Extract features and targets
-            if hasattr(batch, 'x') and hasattr(batch, 'y'):
-                # PyG Data batch
-                x = batch
-                y = batch.y
-            elif isinstance(batch, dict):
-                # Dictionary batch
-                x = batch['x']
-                y = batch['y']
+            # Extract targets using DGL utility for DGL graphs
+            if hasattr(batch, 'ndata') and 'label' in batch.ndata:
+                # DGL graph - extract targets
+                targets = get_graph_targets(batch)
+            elif hasattr(batch, 'y'):
+                # PyG Data (backward compatibility)
+                targets = batch.y
             else:
-                # Tuple/list batch
-                x, y = batch
+                # Assume tensor inputs with separate targets
+                batch, targets = batch
             
             # Forward pass
-            outputs = model(x)
+            outputs = model(batch)
+            
+            # Handle different output formats
+            if isinstance(outputs, dict):
+                logits = outputs.get("task_pred", next(iter(outputs.values())))
+            else:
+                logits = outputs
+            
+            # Calculate loss if criterion provided
+            if criterion is not None:
+                if hasattr(targets, 'shape') and len(targets.shape) > 1 and targets.shape[1] > 1:
+                    loss = criterion(logits, targets)
+                else:
+                    loss = criterion(logits, targets.long())
+                test_loss += loss.item()
             
             # Get predictions
-            _, preds = torch.max(outputs, 1)
+            _, preds = torch.max(logits, dim=1)
             
             # Collect results
             all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(y.cpu().numpy())
+            all_labels.extend(targets.cpu().numpy())
     
-    # Calculate accuracy
-    correct = sum(1 for pred, label in zip(all_preds, all_labels) if pred == label)
-    total = len(all_labels)
-    accuracy = correct / total if total > 0 else 0
+    # Calculate metrics
+    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, matthews_corrcoef
     
-    return accuracy, np.array(all_preds), np.array(all_labels)
+    metrics = {
+        'accuracy': accuracy_score(all_labels, all_preds),
+        'f1_macro': f1_score(all_labels, all_preds, average='macro', zero_division=0),
+        'f1_weighted': f1_score(all_labels, all_preds, average='weighted', zero_division=0),
+        'precision': precision_score(all_labels, all_preds, average='macro', zero_division=0),
+        'recall': recall_score(all_labels, all_preds, average='macro', zero_division=0)
+    }
+    
+    # Add MCC for binary and multiclass (not multilabel)
+    try:
+        metrics['mcc'] = matthews_corrcoef(all_labels, all_preds)
+    except:
+        pass
+    
+    # Add test loss if calculated
+    if test_loss is not None:
+        metrics['test_loss'] = test_loss / len(test_loader)
+    
+    return metrics, np.array(all_preds), np.array(all_labels)

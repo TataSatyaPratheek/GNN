@@ -1554,6 +1554,7 @@ class PositionalEncoding(nn.Module):
 class ExpressiveGATConv(nn.Module):
     """
     More expressive GAT convolution with DGL-optimized implementation
+    based on the improvement plan for enhanced graph representation
     """
     def __init__(
         self, 
@@ -1564,6 +1565,9 @@ class ExpressiveGATConv(nn.Module):
         attn_drop=0.0, 
         negative_slope=0.2,
         residual=True,
+        use_edge_features=True,
+        pos_dim=16,
+        diversity_weight=0.1,
         allow_zero_in_degree=False
     ):
         super().__init__()
@@ -1575,12 +1579,22 @@ class ExpressiveGATConv(nn.Module):
         self.negative_slope = negative_slope
         self.residual = residual
         self.allow_zero_in_degree = allow_zero_in_degree
+        self.use_edge_features = use_edge_features
+        self.pos_dim = pos_dim
+        self.diversity_weight = diversity_weight
         
         # Multi-head attention
         self.fc = nn.Linear(in_dim, out_dim * num_heads, bias=False)
         self.attn_l = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
         self.attn_r = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
-        self.attn_e = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
+        
+        # Additional attention for edge features
+        self.attn_e = nn.Parameter(torch.FloatTensor(1, num_heads, 1))
+        
+        # Position-aware attention
+        if pos_dim > 0:
+            self.pos_encoder = nn.Linear(2, pos_dim)
+            self.pos_attn = nn.Parameter(torch.FloatTensor(1, num_heads, pos_dim))
         
         # Additional expressive components from improvement plan
         self.gate = nn.Linear(in_dim, num_heads)
@@ -1596,8 +1610,8 @@ class ExpressiveGATConv(nn.Module):
             self.register_buffer('res_fc', None)
         
         # Dropout
-        self.feat_drop = nn.Dropout(feat_drop)
-        self.attn_drop = nn.Dropout(attn_drop)
+        self.feat_drop_layer = nn.Dropout(feat_drop)
+        self.attn_drop_layer = nn.Dropout(attn_drop)
         
         # Activation
         self.leaky_relu = nn.LeakyReLU(negative_slope)
@@ -1615,87 +1629,166 @@ class ExpressiveGATConv(nn.Module):
         nn.init.xavier_normal_(self.attn_e, gain=gain)
         nn.init.xavier_normal_(self.gate.weight, gain=gain)
         
+        if hasattr(self, 'pos_encoder'):
+            nn.init.xavier_normal_(self.pos_encoder.weight, gain=gain)
+            nn.init.xavier_normal_(self.pos_attn, gain=gain)
+        
         if isinstance(self.res_fc, nn.Linear):
             nn.init.xavier_normal_(self.res_fc.weight, gain=gain)
     
-    def forward(self, graph, feat, edge_feat=None, get_attention=False):
+    def forward(self, graph, feat, edge_feat=None, pos=None, get_attention=False):
         """
-        Forward computation with DGL
+        Forward computation with DGL-optimized implementation
         
         Args:
             graph: DGL graph object
             feat: Node features
             edge_feat: Edge features (optional)
+            pos: Node positions (optional)
             get_attention: Whether to return attention weights
             
         Returns:
             Updated node features or tuple of (features, attention weights)
         """
         with graph.local_scope():
-            # Feature dropout
-            h_src = h_dst = self.feat_drop(feat)
+            # Apply feature dropout
+            h_src = h_dst = self.feat_drop_layer(feat)
             
-            # Feature transformation
+            # Feature transformation for attention mechanism
             feat_src = feat_dst = self.fc(h_src).view(-1, self.num_heads, self.out_dim)
             
-            # Additional feature projection (more expressive)
+            # Additional feature projection from improvement plan
             feat_proj = self.feat_proj(h_src).view(-1, self.num_heads, self.out_dim)
             
             # Gating mechanism for feature importance
             gate = torch.sigmoid(self.gate(h_src)).view(-1, self.num_heads, 1)
             feat_proj = feat_proj * gate
             
-            # Prepare for attention
-            el = (feat_src * self.attn_l).sum(dim=-1).unsqueeze(-1)
-            er = (feat_dst * self.attn_r).sum(dim=-1).unsqueeze(-1)
+            # Position-aware attention component
+            if hasattr(self, 'pos_encoder') and pos is not None:
+                # Process position information
+                pos_enc = self.pos_encoder(pos)
+                pos_enc = pos_enc.view(-1, self.pos_dim)
+                
+                # Position-based attention
+                pos_attn = (pos_enc.unsqueeze(1) * self.pos_attn).sum(dim=-1, keepdim=True)
+                
+                # Store in graph
+                graph.ndata['pos_attn'] = pos_attn
+            
+            # Prepare for standard attention mechanism
+            el = (feat_src * self.attn_l).sum(dim=-1, keepdim=True)
+            er = (feat_dst * self.attn_r).sum(dim=-1, keepdim=True)
             
             # Add to graph
             graph.srcdata.update({'ft': feat_src, 'el': el, 'proj': feat_proj})
             graph.dstdata.update({'er': er})
             
             # Handle edge features if provided
-            if edge_feat is not None:
+            if self.use_edge_features and edge_feat is not None:
                 if edge_feat.dim() != 3:
-                    # Reshape edge features to [num_edges, num_heads, out_dim]
+                    # Reshape edge features to [num_edges, num_heads, 1]
                     edge_feat = edge_feat.view(-1, 1, 1).expand(-1, self.num_heads, 1)
                 graph.edata.update({'ee': edge_feat})
                 
                 # Define custom message function with edge features
                 def message_func(edges):
                     # Combine source, destination, and edge attention
-                    ee = (edges.data['ee'] * self.attn_e).sum(dim=-1).unsqueeze(-1)
-                    a = self.leaky_relu(edges.src['el'] + edges.dst['er'] + ee)
-                    a = self.attn_drop(a)
+                    a = self.leaky_relu(edges.src['el'] + edges.dst['er'])
+                    
+                    # Add edge attention if available
+                    if 'ee' in edges.data:
+                        ee = (edges.data['ee'] * self.attn_e)
+                        a = a + ee
+                    
+                    # Add position attention if available
+                    if 'pos_attn' in graph.ndata:
+                        a = a + edges.src['pos_attn'] + edges.dst['pos_attn']
+                    
+                    # Apply dropout
+                    a = self.attn_drop_layer(a)
+                    
                     return {'a': a, 'm': edges.src['ft'] + edges.src['proj']}
             else:
                 # Standard message function without edge features
                 def message_func(edges):
                     a = self.leaky_relu(edges.src['el'] + edges.dst['er'])
-                    a = self.attn_drop(a)
+                    
+                    # Add position attention if available
+                    if 'pos_attn' in graph.ndata:
+                        a = a + edges.src['pos_attn'] + edges.dst['pos_attn']
+                    
+                    # Apply dropout
+                    a = self.attn_drop_layer(a)
+                    
                     return {'a': a, 'm': edges.src['ft'] + edges.src['proj']}
             
             # Apply edge softmax using DGL's optimized function
             graph.apply_edges(message_func)
             graph.edata['a'] = dgl.nn.functional.edge_softmax(graph, graph.edata['a'])
             
-            # Define reduce function
-            def reduce_func(nodes):
-                alpha = nodes.mailbox['a']
-                h = torch.sum(alpha * nodes.mailbox['m'], dim=1)
-                return {'h': h}
+            # Compute diversity loss for attention heads
+            diversity_loss = None
+            if self.training and self.diversity_weight > 0:
+                diversity_loss = self._calculate_diversity_loss(graph)
             
-            # Update all nodes
-            graph.update_all(fn.src_mul_edge('proj', 'a', 'm'), fn.sum('m', 'h'))
+            # Update all nodes - optimized message passing
+            graph.update_all(fn.u_mul_e('ft', 'a', 'm'), fn.sum('m', 'h'))
             
             # Get updated features
             h = graph.dstdata['h']
             
             # Apply residual connection if specified
             if self.residual:
-                h = h + self.res_fc(feat)
+                h_res = self.res_fc(feat)
+                h = h + h_res
             
-            # Return attention weights if requested
+            # Return attention weights and diversity loss if requested
             if get_attention:
-                return h, graph.edata['a']
+                if diversity_loss is not None:
+                    return h, diversity_loss, graph.edata['a']
+                else:
+                    return h, graph.edata['a']
             else:
-                return h
+                if diversity_loss is not None:
+                    return h, diversity_loss
+                else:
+                    return h
+    
+    def _calculate_diversity_loss(self, graph):
+        """
+        Calculate diversity loss to encourage different attention patterns across heads
+        
+        Args:
+            graph: DGL graph with attention weights in edata['a']
+            
+        Returns:
+            Diversity loss tensor
+        """
+        if self.num_heads <= 1:
+            return torch.tensor(0.0, device=graph.device)
+        
+        # Get attention weights [E, num_heads, 1]
+        attn = graph.edata['a']
+        
+        # Reshape to [E, num_heads]
+        attn = attn.squeeze(-1)
+        
+        # Calculate pairwise cosine similarity between heads
+        attn_t = attn.transpose(0, 1)  # [num_heads, E]
+        
+        # Normalize each head's attention weights
+        attn_norm = F.normalize(attn_t, p=2, dim=1)  # [num_heads, E]
+        
+        # Calculate cosine similarity matrix
+        cos_sim = torch.mm(attn_norm, attn_norm.t())  # [num_heads, num_heads]
+        
+        # Remove diagonal (self-similarity)
+        mask = ~torch.eye(self.num_heads, dtype=torch.bool, device=cos_sim.device)
+        cos_sim = cos_sim[mask].view(self.num_heads, self.num_heads-1)
+        
+        # Sum similarities (higher similarity = less diversity)
+        diversity_loss = cos_sim.mean() * self.diversity_weight
+        
+        return diversity_loss            
+

@@ -11,6 +11,71 @@ from typing import Dict, Any, Optional, Union
 
 logger = logging.getLogger(__name__)
 
+
+def optimize_dgl_graph_memory(g, inplace=True):
+    """
+    Optimize memory usage for a DGL graph
+    
+    Args:
+        g: DGL graph or batched graph
+        inplace: Whether to modify the graph in-place
+        
+    Returns:
+        Optimized DGL graph
+    """
+    import dgl
+    import torch
+    
+    # Create a new graph if not in-place
+    if not inplace:
+        g = g.clone()
+    
+    # 1. Consolidate feature tensors to contiguous memory
+    for ndata_key in g.ndata:
+        tensor = g.ndata[ndata_key]
+        if isinstance(tensor, torch.Tensor) and not tensor.is_contiguous():
+            g.ndata[ndata_key] = tensor.contiguous()
+    
+    for edata_key in g.edata:
+        tensor = g.edata[edata_key]
+        if isinstance(tensor, torch.Tensor) and not tensor.is_contiguous():
+            g.edata[edata_key] = tensor.contiguous()
+    
+    # 2. Convert float64 to float32 to save memory
+    for ndata_key in g.ndata:
+        tensor = g.ndata[ndata_key]
+        if isinstance(tensor, torch.Tensor) and tensor.dtype == torch.float64:
+            g.ndata[ndata_key] = tensor.to(torch.float32)
+    
+    for edata_key in g.edata:
+        tensor = g.edata[edata_key]
+        if isinstance(tensor, torch.Tensor) and tensor.dtype == torch.float64:
+            g.edata[edata_key] = tensor.to(torch.float32)
+    
+    # 3. Use int32 for indices where possible
+    if hasattr(g, 'get_csr_format'):
+        try:
+            # For large graphs, force CSR format which is more memory-efficient
+            g.get_csr_format()
+        except:
+            pass
+    
+    # 4. Eliminate unnecessary features
+    # (Only if you're sure these aren't needed downstream)
+    # Example: remove temporary edge weights or other intermediate data
+    # if 'temp_weight' in g.edata:
+    #     del g.edata['temp_weight']
+    
+    # Force on-device consolidation
+    if torch.cuda.is_available() and g.device.type == 'cuda':
+        curr_device = g.device
+        # Using to() forces memory re-allocation
+        g = g.to(curr_device)
+
+    return g
+
+
+
 def clear_memory(full_clear=False):
     """
     Free up memory by clearing caches and forcing garbage collection
@@ -300,3 +365,4 @@ class MemoryTracker:
                     parts[-1] += f" ({snap['gpu_diff_gb']:+.2f} GB)"
             
             print(f"  [{snap['timestamp']:.2f}s] {snap['label']}: {' | '.join(parts)}")
+            
