@@ -2,6 +2,9 @@
 Data loading and processing utilities for DGL-based graph models.
 """
 
+import psutil
+import gc
+from random import random
 import torch
 import dgl
 import numpy as np
