@@ -54,37 +54,52 @@ def compute_class_weights(df, num_classes):
     # Keep weights on CPU initially - will be moved to device in setup_optimizer_and_loss if needed
     return torch.tensor(class_weights, dtype=torch.float32)
 
-def get_graph_targets(node_targets, batch):
+def get_graph_targets(g):
     """
-    Convert node-level targets to graph-level targets.
+    Extract graph-level targets from a DGL graph or batched graph
     
     Args:
-        node_targets: Node-level target tensor
-        batch: Batch assignment tensor
+        g: DGL graph or batched graph
         
     Returns:
         Graph-level target tensor
     """
-    # Use the most common target for each graph
-    unique_graphs = torch.unique(batch)
-    graph_targets = []
-    
-    for g in unique_graphs:
-        # Get targets for this graph
-        graph_mask = (batch == g)
-        graph_node_targets = node_targets[graph_mask]
+    if 'label' in g.ndata:
+        # Get node labels
+        node_labels = g.ndata['label']
         
-        # Find most common target (mode)
-        if len(graph_node_targets) > 0:
-            values, counts = torch.unique(graph_node_targets, return_counts=True)
-            mode_idx = torch.argmax(counts)
-            graph_targets.append(values[mode_idx])
+        if hasattr(g, 'batch_size') and g.batch_size > 1:
+            # For batched graph, extract one label per graph
+            batch_num_nodes = g.batch_num_nodes()
+            graph_labels = []
+            
+            node_offset = 0
+            for num_nodes in batch_num_nodes:
+                # Get labels for this graph
+                graph_node_labels = node_labels[node_offset:node_offset + num_nodes]
+                
+                # Use mode (most common label) as graph label
+                if len(graph_node_labels) > 0:
+                    values, counts = torch.unique(graph_node_labels, return_counts=True)
+                    mode_idx = torch.argmax(counts)
+                    graph_labels.append(values[mode_idx])
+                else:
+                    # Fallback if no labels
+                    graph_labels.append(torch.tensor(0, device=node_labels.device))
+                
+                # Update offset
+                node_offset += num_nodes
+            
+            return torch.stack(graph_labels)
         else:
-            # Fallback if no targets (should not happen)
-            graph_targets.append(torch.tensor(0, device=node_targets.device))
+            # For single graph, use mode of node labels
+            values, counts = torch.unique(node_labels, return_counts=True)
+            mode_idx = torch.argmax(counts)
+            return values[mode_idx].unsqueeze(0)
+    else:
+        # No labels found
+        return None
     
-    return torch.tensor(graph_targets, dtype=torch.long, device=node_targets.device)
-
 def evaluate_model(model, data_loader, criterion, device, is_neural=True):
     """
     Evaluate model performance with comprehensive metrics.
@@ -122,8 +137,8 @@ def evaluate_model(model, data_loader, criterion, device, is_neural=True):
                     # Standard forward pass
                     logits = model(batch_data)
                 
-                # Get graph-level targets
-                graph_targets = get_graph_targets(batch_data.y, batch_data.batch)
+                # Get graph-level targets using DGL approach
+                graph_targets = get_graph_targets(batch_data)
                 
                 # Compute loss
                 loss = criterion(logits, graph_targets)
@@ -146,8 +161,14 @@ def evaluate_model(model, data_loader, criterion, device, is_neural=True):
         X_test, y_true = [], []
         
         for batch_data in data_loader:
-            X_test.extend(batch_data.x.cpu().numpy())
-            y_true.extend(batch_data.y.cpu().numpy())
+            # Extract DGL graph features and convert to numpy
+            if hasattr(batch_data, 'ndata') and 'feat' in batch_data.ndata:
+                X_test.extend(batch_data.ndata['feat'].cpu().numpy())
+                
+            # Extract labels
+            if hasattr(batch_data, 'ndata') and 'label' in batch_data.ndata:
+                graph_targets = get_graph_targets(batch_data)
+                y_true.extend(graph_targets.cpu().numpy())
         
         # Convert to numpy arrays
         X_test = np.array(X_test)

@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 import numpy as np
 import torch
+import dgl
 import tempfile
 import shutil
 from contextlib import redirect_stdout, redirect_stderr

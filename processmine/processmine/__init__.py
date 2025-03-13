@@ -14,10 +14,10 @@ from processmine.core.runner import run_analysis, run_training, run_optimization
 from processmine.data.loader import load_and_preprocess_data
 from processmine.utils.memory import log_memory_usage, clear_memory, get_memory_stats
 
-# Import model factory
+# Import model 
 from processmine.models.factory import create_model, get_model_config
 
-# Process Mining Core
+# Process Mining Corefactory
 from processmine.process_mining.analysis import (
     analyze_bottlenecks,
     analyze_cycle_times,

@@ -197,6 +197,8 @@ class TestDGLDataLoader(unittest.TestCase):
         
         # Import data loader utilities
         try:
+            from dgl.dataloading import GraphDataLoader
+
             from processmine.utils.dataloader import (
                 get_graph_dataloader,
                 get_graph_targets,
