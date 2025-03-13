@@ -64,16 +64,7 @@ def train_mlp_model(model, train_loader, val_loader, criterion, optimizer,
             if hasattr(batch, 'to'):
                 batch = batch.to(device)
             
-            # Extract targets using DGL utility for DGL graphs
-            if hasattr(batch, 'ndata') and 'label' in batch.ndata:
-                # DGL graph - extract targets
-                targets = get_graph_targets(batch)
-            elif hasattr(batch, 'y'):
-                # PyG Data (backward compatibility)
-                targets = batch.y
-            else:
-                # Assume tensor inputs with separate targets
-                batch, targets = batch
+            targets = get_graph_targets(batch)
                 
             # Forward pass
             optimizer.zero_grad()
@@ -115,16 +106,7 @@ def train_mlp_model(model, train_loader, val_loader, criterion, optimizer,
                 if hasattr(batch, 'to'):
                     batch = batch.to(device)
                 
-                # Extract targets using DGL utility for DGL graphs
-                if hasattr(batch, 'ndata') and 'label' in batch.ndata:
-                    # DGL graph - extract targets
-                    targets = get_graph_targets(batch)
-                elif hasattr(batch, 'y'):
-                    # PyG Data (backward compatibility)
-                    targets = batch.y
-                else:
-                    # Assume tensor inputs with separate targets
-                    batch, targets = batch
+                targets = get_graph_targets(batch)
                 
                 # Forward pass
                 outputs = model(batch)
@@ -209,18 +191,9 @@ def evaluate_mlp_model(model, test_loader, device, criterion=None):
             # Move batch to device
             if hasattr(batch, 'to'):
                 batch = batch.to(device)
-            
-            # Extract targets using DGL utility for DGL graphs
-            if hasattr(batch, 'ndata') and 'label' in batch.ndata:
-                # DGL graph - extract targets
-                targets = get_graph_targets(batch)
-            elif hasattr(batch, 'y'):
-                # PyG Data (backward compatibility)
-                targets = batch.y
-            else:
-                # Assume tensor inputs with separate targets
-                batch, targets = batch
-            
+                
+            targets = get_graph_targets(batch) if hasattr(batch, 'ndata') and 'label' in batch.ndata else batch.y
+
             # Forward pass
             outputs = model(batch)
             

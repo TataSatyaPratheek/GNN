@@ -239,10 +239,10 @@ CLI_CONFIG = {
                     'applies_to': ["gnn", "enhanced_gnn"]
                 },
                 'dgl_sampling': {
-                    'help': "Graph sampling method for large graphs",
-                    'choices': ["neighbor", "random", "topk", "none"],
-                    'default': "neighbor",
-                    'applies_to': ["gnn", "enhanced_gnn"]
+                'help': "Graph sampling method for large graphs",
+                'choices': ["neighbor", "topk", "random", "none"],
+                'default': "neighbor",
+                'applies_to': ["gnn", "enhanced_gnn"]
                 },
                 'use_edge_features': {
                     'help': "Whether to use edge features in graph models",

@@ -105,17 +105,7 @@ def evaluate_model(model, data_loader, criterion=None, device=None, detailed=Tru
     
     # Evaluate without gradient tracking
     with torch.no_grad():
-        for batch_data in progress_bar:
-            # Check if this is a PyG format data (backwards compatibility)
-            if hasattr(batch_data, 'x') and hasattr(batch_data, 'edge_index'):
-                logger.warning("PyG format detected in evaluate_model. Convert to DGL for future compatibility.")
-                try:
-                    from processmine.utils.dataloader import convert_pyg_to_dgl
-                    batch_data = convert_pyg_to_dgl(batch_data)
-                except Exception as e:
-                    logger.error(f"Failed to convert PyG data to DGL: {e}")
-                    continue
-            
+        for batch_data in progress_bar:            
             # Move batch to device
             if isinstance(batch_data, list):
                 # List of graphs needs to be batched

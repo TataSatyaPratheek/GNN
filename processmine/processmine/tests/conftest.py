@@ -21,7 +21,7 @@ try:
 except ImportError as e:
     logger.warning(f"Could not import processmine package: {str(e)}")
 
-# Log available dependencies
+# The PyTorch Geometric import check is no longer needed
 try:
     import torch
     logger.info(f"PyTorch version: {torch.__version__}")
@@ -29,7 +29,7 @@ except ImportError:
     logger.warning("PyTorch not installed")
 
 try:
-    import torch_geometric
-    logger.info(f"PyTorch Geometric version: {torch_geometric.__version__}")
+    import dgl
+    logger.info(f"DGL version: {dgl.__version__}")
 except ImportError:
-    logger.warning("PyTorch Geometric not installed")
+    logger.warning("DGL not installed")

@@ -670,3 +670,74 @@ def apply_dgl_sampling(g, method='neighbor', fanout=10, k=16):
         import logging
         logging.getLogger(__name__).warning(f"DGL sampling failed: {e}")
         return g  # Return original graph on error
+    
+def create_dgl_batch_from_graphs(graphs):
+    """
+    Create a batched DGL graph from a list of graphs
+    
+    Args:
+        graphs: List of DGL graphs
+        
+    Returns:
+        Batched DGL graph
+    """
+    return dgl.batch(graphs)
+
+def split_dgl_batched_graph(batched_graph):
+    """
+    Split a batched DGL graph back into individual graphs
+    
+    Args:
+        batched_graph: Batched DGL graph
+        
+    Returns:
+        List of individual DGL graphs
+    """
+    return dgl.unbatch(batched_graph)
+
+def convert_networkx_to_dgl(nx_graph, node_attrs=None, edge_attrs=None):
+    """
+    Convert a NetworkX graph to a DGL graph
+    
+    Args:
+        nx_graph: NetworkX graph
+        node_attrs: List of node attributes to copy
+        edge_attrs: List of edge attributes to copy
+        
+    Returns:
+        DGL graph
+    """
+    return dgl.from_networkx(nx_graph, node_attrs=node_attrs, edge_attrs=edge_attrs)
+
+def sample_dgl_neighbor_graph(g, seeds, fanout, edge_dir='in'):
+    """
+    Sample a subgraph by randomly choosing neighbors
+    
+    Args:
+        g: Input DGL graph
+        seeds: Seed nodes
+        fanout: Number of neighbors to sample per node
+        edge_dir: Edge direction ('in', 'out', or 'both')
+        
+    Returns:
+        Sampled subgraph
+    """
+    return dgl.sampling.sample_neighbors(g, seeds, fanout, edge_dir=edge_dir)
+
+def sample_dgl_khop_subgraph(g, seeds, k, edge_dir='in'):
+    """
+    Extract k-hop subgraph for given seeds
+    
+    Args:
+        g: Input DGL graph
+        seeds: Seed nodes
+        k: Number of hops
+        edge_dir: Edge direction ('in', 'out', or 'both')
+        
+    Returns:
+        k-hop subgraph and nodes IDs
+    """
+    nodes, edges, inverse_index = dgl.sampling.sample_neighbors(
+        g, seeds, -1, edge_dir=edge_dir, return_edges=True
+    )
+    return dgl.node_subgraph(g, nodes), nodes

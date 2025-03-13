@@ -3,6 +3,7 @@ Memory-efficient visualization module with lazy loading, data sampling,
 and chunked rendering for handling large process mining datasets.
 """
 import os
+import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -693,37 +694,39 @@ class ProcessVisualizer:
                     mean_hours=row["mean_hours"],
                     weight=float(row["count"]))
         
-        # Use DGL sampling for better memory efficiency if available and requested
-        if has_dgl and use_dgl_sampling and len(G.nodes()) > max_nodes:
-            # Convert NetworkX graph to DGL for sampling
-            dgl_G = dgl.from_networkx(G, edge_attrs=['freq', 'mean_hours', 'weight'])
-            
-            # Sample important nodes using random walk to preserve graph structure
-            if has_dgl and hasattr(dgl, 'sampling'):
+            # Use DGL sampling for better memory efficiency if available and requested
+            if has_dgl and use_dgl_sampling and len(G.nodes()) > max_nodes:
+                # Convert NetworkX graph to DGL for sampling
+                dgl_G = dgl.from_networkx(G, edge_attrs=['freq', 'mean_hours', 'weight'])
+                
                 try:
-                    # Try to use DGL's sampling with fallbacks
+                    # Use modern DGL node sampling methods
                     if hasattr(dgl.sampling, 'select_topk'):
-                        # Select top-k nodes and edges by importance
+                        # Use topk sampling - now preferred in DGL
                         sampled_nodes = dgl.sampling.select_topk(dgl_G, max_nodes, 'weight')
                         subg = dgl_G.subgraph(sampled_nodes)
-                    elif hasattr(dgl.sampling, 'node_importance_sampling'):
-                        # Use importance sampling
-                        sampled_nodes = dgl.sampling.node_importance_sampling(
-                            dgl_G, max_nodes, weight='weight')
-                        subg = dgl_G.subgraph(sampled_nodes) 
                     else:
-                        # Fallback to random walks for sampling
-                        traces = dgl.sampling.random_walk(
+                        # Fall back to random walk sampling
+                        seeds = torch.arange(0, min(100, dgl_G.num_nodes()))
+                        traces, _ = dgl.sampling.random_walk(
                             dgl_G, 
-                            list(range(min(100, dgl_G.num_nodes()))),
-                            length=5,
-                            prob='weight'
+                            seeds,
+                            length=5
                         )
                         # Flatten and find unique nodes
-                        nodes = torch.unique(traces[0].flatten())
+                        nodes = torch.unique(traces.flatten())
+                        # Remove -1 values (which indicate invalid nodes in random walk)
+                        nodes = nodes[nodes >= 0]
                         sampled_nodes = nodes[:min(len(nodes), max_nodes)]
                         subg = dgl_G.subgraph(sampled_nodes)
                     
+                    # Convert back to NetworkX with proper attributes
+                    G = dgl.to_networkx(subg, edge_attrs=['freq', 'mean_hours', 'weight'])
+                    logger.info(f"Used DGL sampling to reduce graph from {dgl_G.num_nodes()} to {subg.num_nodes()} nodes")
+                except Exception as e:
+                    logger.warning(f"DGL sampling failed, falling back to NetworkX: {e}")
+                    
+                        
                     # Convert back to NetworkX
                     G = nx.DiGraph(dgl.to_networkx(subg, edge_attrs=['freq', 'mean_hours', 'weight']))
                     logger.info(f"Used DGL sampling to reduce graph from {dgl_G.num_nodes()} to {subg.num_nodes()} nodes")
