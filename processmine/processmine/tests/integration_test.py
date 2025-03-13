@@ -71,7 +71,7 @@ class ProcessMineIntegrationTests(unittest.TestCase):
         
         # Check if package is available
         try:
-            import processmine
+            import processmine.processmine as processmine
             cls.is_available = True
         except ImportError:
             cls.is_available = False
@@ -88,7 +88,7 @@ class ProcessMineIntegrationTests(unittest.TestCase):
             self.skipTest("ProcessMine package not available")
         
         # Import necessary modules
-        from processmine import create_model, run_analysis
+        from processmine.processmine import create_model, run_analysis
         from processmine.data.loader import load_and_preprocess_data
         from processmine.data.graph_builder import build_graph_data
         from processmine.core.training import train_model, evaluate_model
@@ -146,7 +146,7 @@ class ProcessMineIntegrationTests(unittest.TestCase):
             test_loader = DataLoader([graphs[i] for i in test_idx], batch_size=4)
             
             # Step 4: Create model
-            from processmine import create_model
+            from processmine.processmine import create_model
             
             model = create_model(
                 model_type="enhanced_gnn",
@@ -263,7 +263,7 @@ class ProcessMineIntegrationTests(unittest.TestCase):
     
     def test_cli_integration(self):
         """Test the command-line interface."""
-        from processmine.cli import main, parse_arguments
+        from processmine.processmine.cli import main, parse_arguments
         
         # Test with analyze mode
         test_args = [
@@ -305,7 +305,7 @@ class ProcessMineIntegrationTests(unittest.TestCase):
     
     def test_model_types_integration(self):
         """Test creating and using different model types."""
-        from processmine import create_model
+        from processmine.processmine import create_model
         
         # Load and preprocess data
         from processmine.data.loader import load_and_preprocess_data

@@ -5,7 +5,6 @@ Data processing utilities for process mining.
 from processmine.data.loader import (
     load_and_preprocess_data,
     create_sequence_dataset,
-    create_data_loader
 )
 
 from processmine.data.graphs import (

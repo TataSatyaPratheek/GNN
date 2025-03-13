@@ -402,7 +402,7 @@ class TestModelArchitectures(unittest.TestCase):
                 CombinedGATConv
             )
             from processmine.models.sequence.lstm import NextActivityLSTM, EnhancedProcessRNN
-            from processmine import create_model
+            from processmine.processmine import create_model
             
             cls.imports_successful = True
             
@@ -614,7 +614,7 @@ class TestModelArchitectures(unittest.TestCase):
     
     def test_model_factory(self):
         """Test model factory function."""
-        from processmine import create_model
+        from processmine.processmine import create_model
         
         # Test creating different model types
         models = []
@@ -682,7 +682,7 @@ class TestVisualizationComprehensive(unittest.TestCase):
             
             # Create significant bottlenecks
             cls.significant_bottlenecks = cls.bottleneck_stats[cls.bottleneck_stats['count'] > 8].copy()
-            cls.significant_bottlenecks['bottleneck_score'] = [2.0, 3.0, 1.5, 1.2, 1.0]
+            cls.significant_bottlenecks['bottleneck_score'] = [2.0, 3.0, 1.5, 1.2]
             
             # Create mock task encoder
             cls.task_encoder = MagicMock()
@@ -865,7 +865,7 @@ class TestCLIFunctionality(unittest.TestCase):
         
         # Import modules
         try:
-            import processmine.cli as cli
+            import processmine.processmine.cli as cli
             cls.imports_successful = True
         except ImportError:
             cls.imports_successful = False
@@ -883,7 +883,7 @@ class TestCLIFunctionality(unittest.TestCase):
     @patch('sys.argv')
     def test_cli_parse_arguments(self, mock_argv):
         """Test command-line argument parsing."""
-        import processmine.cli as cli
+        import processmine.processmine.cli as cli
         
         # Test analyze mode
         mock_argv.__getitem__.side_effect = lambda idx: [
@@ -894,7 +894,7 @@ class TestCLIFunctionality(unittest.TestCase):
             '--viz-format', 'static',
             '--seed', '42'
         ][idx]
-        mock_argv.__len__.return_value = 7
+        mock_argv.__len__.return_value = 8
         
         args = cli.parse_arguments()
         
@@ -908,7 +908,7 @@ class TestCLIFunctionality(unittest.TestCase):
     @patch('torch.cuda.is_available', return_value=False)
     def test_cli_setup_environment(self, mock_cuda):
         """Test environment setup."""
-        import processmine.cli as cli
+        import processmine.processmine.cli as cli
         
         # Create mock args
         args = MagicMock()
@@ -922,12 +922,12 @@ class TestCLIFunctionality(unittest.TestCase):
         
         # Verify setup
         self.assertEqual(device.type, 'cpu')
-        self.assertTrue(output_dir.startswith(self.test_dir))
+        self.assertTrue(str(output_dir).startswith(self.test_dir))
     
     @patch('processmine.core.runner.run_analysis')
     def test_cli_run_analysis(self, mock_run_analysis):
         """Test running analysis through CLI."""
-        import processmine.cli as cli
+        import processmine.processmine.cli as cli
         
         # Mock the analysis runner
         mock_run_analysis.return_value = {"result": "success"}

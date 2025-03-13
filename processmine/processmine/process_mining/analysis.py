@@ -119,6 +119,7 @@ def _create_transitions_efficient(df: pd.DataFrame, columns: List[str]) -> pd.Da
     transitions = transitions.dropna(subset=['next_task_id'])
     
     # Ensure proper data types to save memory
+    transitions = transitions.copy()  # Create explicit copy first
     transitions['next_task_id'] = transitions['next_task_id'].astype(np.int32)
     
     return transitions

@@ -164,7 +164,7 @@ class ProcessVisualizer:
             bbox_inches='tight', 
             dpi=self.dpi,
             # Use compression for PNG to reduce file size
-            optimize=True,
+            #optimize=True,
             transparent=False
         )
         

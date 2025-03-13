@@ -7,7 +7,6 @@ from processmine.utils.memory import (
     get_memory_stats,
     log_memory_usage,
     estimate_batch_size,
-    get_model_size
 )
 
 from processmine.utils.evaluation import (

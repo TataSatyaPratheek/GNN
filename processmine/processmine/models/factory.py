@@ -19,15 +19,15 @@ def create_model(model_type: str, **kwargs) -> Any:
         Model instance
     """
     if model_type == 'gnn':
-        from processmine.models.gnn.architectures import OptimizedGNN
-        return OptimizedGNN(
+        from processmine.models.gnn.architectures import MemoryEfficientGNN
+        return MemoryEfficientGNN(
             attention_type="basic",
             **kwargs
         )
     
     elif model_type == 'enhanced_gnn':
-        from processmine.models.gnn.architectures import OptimizedGNN
-        return OptimizedGNN(
+        from processmine.models.gnn.architectures import MemoryEfficientGNN
+        return MemoryEfficientGNN(
             attention_type="combined", 
             **kwargs
         )

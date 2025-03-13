@@ -415,7 +415,10 @@ def _preprocess_data_inplace(df: pd.DataFrame, norm_method: str = 'l2',
 
 def _normalize_features(features: np.ndarray, method: str = 'l2') -> np.ndarray:
     """Normalize features with different methods, optimized for memory efficiency"""
-    # Reuse the input array if possible
+    
+    if features.dtype.kind in 'iu':  # If integer type
+        features = features.astype(np.float32)
+    
     if method.lower() == 'l2':
         # L2 normalization - compute norms first
         norms = np.sqrt(np.sum(features**2, axis=1, keepdims=True))

@@ -17,7 +17,7 @@ try:
     from processmine.process_mining.analysis import analyze_bottlenecks, analyze_cycle_times
     from processmine.visualization.viz import ProcessVisualizer
     from processmine.utils.memory import clear_memory, get_memory_stats
-    from processmine import create_model
+    from processmine.processmine import create_model
 except ImportError:
     # For CI/CD where imports might fail
     pass
