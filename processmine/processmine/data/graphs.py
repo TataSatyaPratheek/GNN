@@ -426,7 +426,7 @@ def build_heterogeneous_graph(
     batch_size: int = 1000, 
     verbose: bool = True,
     use_edge_attr: bool = True
-) -> List[Dict]:
+) -> List[dgl.DGLGraph]:
     """
     Build heterogeneous graph data with optimized memory management
     
@@ -587,7 +587,8 @@ def build_heterogeneous_graph(
                     edge_srcs[edge_type] = src_nodes
                     edge_dsts[edge_type] = dst_nodes
                     
-                    if use_edge_attr and attrs:
+                    # FIX: Check properly if attrs has elements before converting to tensor
+                    if use_edge_attr and len(attrs) > 0:
                         edge_features[edge_type] = torch.tensor(attrs, dtype=torch.float32)
             
             # Create DGL heterogeneous graph
@@ -626,9 +627,10 @@ def build_heterogeneous_graph(
                             g.edges[e_type].data['feat'] = edge_features[e_type]
                     
                     # Add graph-level label
-                    g.ndata['label'] = {
-                        'task': torch.tensor(case_group["next_task"].values, dtype=torch.long)
-                    }
+                    if 'task' in g.ntypes and 'next_task' in df.columns:
+                        task_labels = torch.tensor(case_group["next_task"].values, dtype=torch.long)
+                        if len(task_labels) == g.number_of_nodes('task'):
+                            g.nodes['task'].data['label'] = task_labels
                     
                     # Add metadata
                     het_graphs.append(g)
@@ -643,7 +645,8 @@ def build_heterogeneous_graph(
                     # Add node features for task type
                     if "task" in node_features:
                         g.nodes['task'].data['feat'] = node_features["task"]
-                        g.nodes['task'].data['label'] = torch.tensor(case_group["next_task"].values, dtype=torch.long)
+                        if 'next_task' in case_group.columns:
+                            g.nodes['task'].data['label'] = torch.tensor(case_group["next_task"].values, dtype=torch.long)
                     
                     het_graphs.append(g)
             else:

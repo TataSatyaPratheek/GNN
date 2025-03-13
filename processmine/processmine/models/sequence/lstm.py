@@ -245,73 +245,85 @@ class NextActivityLSTM(BaseModel):
 
     def _process_graph_data(self, data):
         """
-        Process PyG Data by extracting case-level sequences with proper feature handling
+        Process DGL graph data by extracting case-level sequences with proper feature handling
         
         Args:
-            data: PyG Data object with batch information
+            data: DGL Graph object with batch information
                 
         Returns:
             Output logits [batch_size, num_classes]
         """
-        # Extract batch information
-        batch = data.batch
-        
-        # Get unique batch indices (cases)
-        unique_batches = torch.unique(batch)
-        batch_size = unique_batches.size(0)
+        # Extract batch information using DGL's API
+        if not hasattr(data, 'batch_num_nodes'):
+            # Single graph case
+            batch_num_nodes = [data.num_nodes()]
+            num_graphs = 1
+        else:
+            # Batched graph case
+            batch_num_nodes = data.batch_num_nodes()
+            num_graphs = len(batch_num_nodes)
         
         # Extract sequence for each case
         sequences = []
         seq_lengths = []
         
-        # Check if data has feature names for better feature selection
-        feature_indices = {}
-        if hasattr(data, 'feature_names') and len(data.feature_names) > 0:
-            # Find indices of useful features by name pattern
-            for i, name in enumerate(data.feature_names):
-                if 'task' in name.lower():
-                    feature_indices['task'] = i
-                elif 'resource' in name.lower():
-                    feature_indices['resource'] = i
-                elif 'time' in name.lower() or 'timestamp' in name.lower():
-                    feature_indices['time'] = i
+        # Process each graph in the batch
+        node_offset = 0
+        for i in range(num_graphs):
+            num_nodes = batch_num_nodes[i]
             
-            # Default to first column if no task feature found
-            if 'task' not in feature_indices:
-                feature_indices['task'] = 0
-        
-        # Process each case
-        for b in unique_batches:
-            # Get nodes for this case in order
-            mask = (batch == b)
-            case_idx = torch.where(mask)[0]
+            # Get nodes for this graph
+            node_indices = list(range(node_offset, node_offset + num_nodes))
             
-            # Check if position information is available
-            # PyG doesn't guarantee node order within a graph, so we try to reconstruct it
-            if hasattr(data, 'pos'):
-                # Sort nodes by position if available
-                pos = data.pos[mask]
-                # Sort by sequence position
-                sorted_order = torch.argsort(pos.view(-1))
-                case_idx = case_idx[sorted_order]
+            # Extract node features
+            if 'feat' in data.ndata:
+                case_nodes = data.ndata['feat'][node_indices]
+            else:
+                # Fallback to other node features if available
+                feature_keys = list(data.ndata.keys())
+                if feature_keys:
+                    case_nodes = data.ndata[feature_keys[0]][node_indices]
+                else:
+                    # No features available, create empty tensor
+                    case_nodes = torch.zeros(num_nodes, 1, device=data.device)
             
-            # Get case nodes in proper order
-            case_nodes = data.x[case_idx]
+            # Check if node order information is available from edge attributes
+            # In DGL, we can use edge weights for this if available
+            ordered_indices = node_indices
+            if 'time' in data.edata or 'weight' in data.edata:
+                # Try to get ordering from edge attributes
+                # This requires edges to have temporal information
+                try:
+                    # For simple cases, sort by incoming edge's time attribute
+                    u, v = data.in_edges(ordered_indices)
+                    if 'time' in data.edata:
+                        edge_times = data.edata['time'][data.edge_ids(u, v)]
+                        # Sort by edge time to get proper sequence
+                        _, sorted_order = torch.sort(edge_times)
+                        ordered_indices = [ordered_indices[i] for i in sorted_order]
+                except Exception as e:
+                    # Fall back to original order if sorting fails
+                    pass
+            
+            # Get ordered node features
+            ordered_features = case_nodes[ordered_indices - node_offset]
             
             # Extract task IDs using the appropriate feature
-            if case_nodes.size(1) > 1:
-                # Multi-feature nodes
-                if feature_indices:
-                    # Use identified task feature
-                    task_feature_idx = feature_indices['task']
-                else:
-                    # Assume first dimension contains task ID
-                    task_feature_idx = 0
-                    
-                task_ids = case_nodes[:, task_feature_idx].long()
+            if ordered_features.size(1) > 1:
+                # Determine which feature to use as task_id based on naming or position
+                task_feature_idx = 0  # Default to first feature
+                
+                # Try to find a better feature if feature names are available
+                if hasattr(data, 'feature_names') and len(data.feature_names) > 0:
+                    for i, name in enumerate(data.feature_names):
+                        if 'task' in name.lower():
+                            task_feature_idx = i
+                            break
+                
+                task_ids = ordered_features[:, task_feature_idx].long()
             else:
                 # Single feature node - use directly
-                task_ids = case_nodes.squeeze(-1).long()
+                task_ids = ordered_features.squeeze(-1).long()
             
             # Handle possible negative or out-of-range IDs
             task_ids = torch.clamp(task_ids, min=0, max=self.num_cls-1)
@@ -319,10 +331,13 @@ class NextActivityLSTM(BaseModel):
             # Store sequence and length
             sequences.append(task_ids)
             seq_lengths.append(len(task_ids))
+            
+            # Update offset
+            node_offset += num_nodes
         
         # Process extracted sequences
         return self._process_sequence_list(sequences, seq_lengths)
-    
+
     def get_embeddings(self, x, seq_lengths=None):
         """
         Extract sequence embeddings

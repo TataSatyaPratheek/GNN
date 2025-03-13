@@ -6,6 +6,7 @@ and optimized memory usage. Now using DGL for graph operations.
 import argparse
 import logging
 import time
+from dgl.data.utils import load_graphs, save_graphs
 import torch
 import os
 import sys
@@ -32,18 +33,24 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # Default configurations for different model types
 DEFAULT_CONFIGS = {
     'gnn': {
-        'hidden_dim': 64,
-        'num_layers': 2,
-        'heads': 4,
-        'dropout': 0.5,
-        'attention_type': 'basic',
-        'pos_dim': 16,
-        'diversity_weight': 0.1,
-        'pooling': 'mean',
-        'predict_time': False,
-        'use_batch_norm': True,
-        'use_residual': True,
-        'use_layer_norm': False
+    'hidden_dim': 64,
+    'num_layers': 2,
+    'heads': 4,
+    'dropout': 0.5,
+    'attention_type': 'basic',
+    'pos_dim': 16,
+    'diversity_weight': 0.1,
+    'pooling': 'mean',
+    'predict_time': False,
+    'use_batch_norm': True,
+    'use_residual': True,
+    'use_layer_norm': False,
+    # Added DGL-specific parameters
+    'sparse_attention': False,
+    'use_checkpointing': False,
+    'use_edge_features': True,
+    'node_embedding_dim': 32,
+    'dgl_sampling': 'neighbor'  # Options: 'neighbor', 'topk', 'random'
     },
     'enhanced_gnn': {
         'hidden_dim': 64,
@@ -57,7 +64,13 @@ DEFAULT_CONFIGS = {
         'predict_time': False,
         'use_batch_norm': True,
         'use_residual': True,
-        'use_layer_norm': False
+        'use_layer_norm': False,
+        # Added DGL-specific parameters
+        'sparse_attention': False,
+        'use_checkpointing': False,
+        'use_edge_features': True,
+        'node_embedding_dim': 32,
+        'dgl_sampling': 'neighbor'  # Options: 'neighbor', 'topk', 'random'
     },
     'lstm': {
         'hidden_dim': 64,
@@ -141,7 +154,7 @@ CLI_CONFIG = {
     # Mode-specific arguments
     'modes': {
         'analyze': {
-            'description': "Analyze process data",
+            'description': "Train a predictive model",
             'arguments': {
                 'bottleneck_threshold': {
                     'help': "Percentile threshold for bottleneck detection",
@@ -161,6 +174,41 @@ CLI_CONFIG = {
                 'skip_conformance': {
                     'help': "Skip conformance checking (faster)",
                     'action': "store_true"
+                },
+                'sparse_attention': {
+                'help': "Use sparse attention for large graphs (DGL optimization)",
+                'action': "store_true",
+                'applies_to': ["gnn", "enhanced_gnn"]
+                },
+                'use_checkpointing': {
+                    'help': "Use gradient checkpointing to save memory (DGL optimization)",
+                    'action': "store_true",
+                    'applies_to': ["gnn", "enhanced_gnn"]
+                },
+                'dgl_sampling': {
+                    'help': "Graph sampling method for large graphs",
+                    'choices': ["neighbor", "random", "topk", "none"],
+                    'default': "neighbor",
+                    'applies_to': ["gnn", "enhanced_gnn"]
+                },
+                'use_edge_features': {
+                    'help': "Whether to use edge features in graph models",
+                    'action': "store_true", 
+                    'applies_to': ["gnn", "enhanced_gnn"]
+                },
+                'node_embedding_dim': {
+                    'help': "Node embedding dimension for graph models",
+                    'type': int,
+                    'default': 32,
+                    'applies_to': ["gnn", "enhanced_gnn"]
+                },
+                'save_graphs': {
+                    'help': "Save processed DGL graphs to file for reuse",
+                    'action': "store_true"
+                },
+                'graphs_path': {
+                    'help': "Path to load/save processed DGL graphs",
+                    'type': str
                 }
             }
         },

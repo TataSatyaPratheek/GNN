@@ -640,10 +640,11 @@ class ProcessVisualizer:
         significant_bottlenecks: Optional[pd.DataFrame] = None,
         filename: str = "process_flow",
         max_nodes: int = 50,
-        layout: str = 'auto'
+        layout: str = 'auto',
+        use_dgl_sampling: bool = True  # New parameter to enable DGL sampling
     ) -> Optional[str]:
         """
-        Create process flow visualization with memory optimization
+        Create process flow visualization with DGL-optimized memory usage
         
         Args:
             bottleneck_stats: DataFrame with bottleneck statistics
@@ -652,19 +653,27 @@ class ProcessVisualizer:
             filename: Output filename
             max_nodes: Maximum number of nodes to display
             layout: Graph layout algorithm ('auto', 'spring', 'circular', 'kamada', 'spectral')
+            use_dgl_sampling: Whether to use DGL's graph sampling features
             
         Returns:
             Path to saved figure or None
         """
-        # Check NetworkX availability
+        # Check NetworkX and DGL availability
         if not self.has_networkx:
             logger.error("NetworkX is required for process flow visualization")
             return None
         
-        # Import NetworkX only when needed
+        # Import required libraries
         import networkx as nx
         
-        # Create graph
+        try:
+            # Try to import DGL for enhanced sampling
+            import dgl
+            has_dgl = True
+        except ImportError:
+            has_dgl = False
+        
+        # Create graph using NetworkX (for visualization compatibility)
         G = nx.DiGraph()
         
         # Limit to most important transitions for readability
@@ -680,11 +689,49 @@ class ProcessVisualizer:
             src = int(row["task_id"])
             dst = int(row["next_task_id"])
             G.add_edge(src, dst, 
-                      freq=int(row["count"]), 
-                      mean_hours=row["mean_hours"],
-                      weight=float(row["count"]))
+                    freq=int(row["count"]), 
+                    mean_hours=row["mean_hours"],
+                    weight=float(row["count"]))
         
-        # Simplify graph if too large
+        # Use DGL sampling for better memory efficiency if available and requested
+        if has_dgl and use_dgl_sampling and len(G.nodes()) > max_nodes:
+            # Convert NetworkX graph to DGL for sampling
+            dgl_G = dgl.from_networkx(G, edge_attrs=['freq', 'mean_hours', 'weight'])
+            
+            # Sample important nodes using random walk to preserve graph structure
+            if has_dgl and hasattr(dgl, 'sampling'):
+                try:
+                    # Try to use DGL's sampling with fallbacks
+                    if hasattr(dgl.sampling, 'select_topk'):
+                        # Select top-k nodes and edges by importance
+                        sampled_nodes = dgl.sampling.select_topk(dgl_G, max_nodes, 'weight')
+                        subg = dgl_G.subgraph(sampled_nodes)
+                    elif hasattr(dgl.sampling, 'node_importance_sampling'):
+                        # Use importance sampling
+                        sampled_nodes = dgl.sampling.node_importance_sampling(
+                            dgl_G, max_nodes, weight='weight')
+                        subg = dgl_G.subgraph(sampled_nodes) 
+                    else:
+                        # Fallback to random walks for sampling
+                        traces = dgl.sampling.random_walk(
+                            dgl_G, 
+                            list(range(min(100, dgl_G.num_nodes()))),
+                            length=5,
+                            prob='weight'
+                        )
+                        # Flatten and find unique nodes
+                        nodes = torch.unique(traces[0].flatten())
+                        sampled_nodes = nodes[:min(len(nodes), max_nodes)]
+                        subg = dgl_G.subgraph(sampled_nodes)
+                    
+                    # Convert back to NetworkX
+                    G = nx.DiGraph(dgl.to_networkx(subg, edge_attrs=['freq', 'mean_hours', 'weight']))
+                    logger.info(f"Used DGL sampling to reduce graph from {dgl_G.num_nodes()} to {subg.num_nodes()} nodes")
+                except Exception as e:
+                    logger.warning(f"DGL sampling failed, falling back to NetworkX: {e}")
+                    # Continue with NetworkX-based sampling below
+        
+        # Simplify graph if still too large (NetworkX fallback)
         if len(G.nodes()) > max_nodes:
             # Keep only most important nodes
             node_importance = {}
@@ -826,7 +873,7 @@ class ProcessVisualizer:
         ax.axis('off')
         
         return self._save_figure(fig, filename)
-    
+
     def _create_interactive_process_flow(
         self,
         G,

@@ -272,13 +272,17 @@ def run_training(
     batch_size: int = 32,
     lr: float = 0.001,
     seed: int = 42,
-    mem_efficient: bool = False,
+    mem_efficient: bool = True,
     cache_dir: Optional[str] = None,
     analysis_results: Optional[Dict[str, Any]] = None,
+    graphs_path: Optional[str] = None,
+    save_graphs: bool = False,
+    dgl_sampling: str = "neighbor",
+    use_edge_features: bool = True,
     **kwargs
 ) -> Dict[str, Any]:
     """
-    Run model training workflow, now using DGL for graph-based models
+    Run model training workflow with enhanced DGL integration
     
     Args:
         data_path: Path to process data CSV file
@@ -292,6 +296,10 @@ def run_training(
         mem_efficient: Whether to use memory-efficient mode
         cache_dir: Directory to cache processed data
         analysis_results: Optional results from analysis step
+        graphs_path: Path to load/save processed DGL graphs
+        save_graphs: Whether to save processed DGL graphs
+        dgl_sampling: Graph sampling method for large graphs
+        use_edge_features: Whether to use edge features
         **kwargs: Additional model-specific arguments
         
     Returns:
@@ -317,6 +325,10 @@ def run_training(
         output_dir = Path(output_dir)
         os.makedirs(output_dir / "models", exist_ok=True)
         os.makedirs(output_dir / "metrics", exist_ok=True)
+        
+        # Create graphs directory if saving graphs
+        if save_graphs:
+            os.makedirs(output_dir / "graphs", exist_ok=True)
     
     try:
         # Import necessary modules
@@ -328,8 +340,6 @@ def run_training(
             create_lr_scheduler, compute_class_weights
         )
         from processmine.models.factory import create_model, get_model_config
-        
-        # Import DGL-specific data loader
         from processmine.utils.dataloader import get_graph_dataloader
         
         # Load data if not provided from analysis
@@ -357,15 +367,41 @@ def run_training(
         model_config.update(kwargs)
         
         if model in ["gnn", "enhanced_gnn"]:
-            # Build graph data using DGL
-            logger.info("Building graph data with DGL...")
-            graphs = build_graph_data(
-                df,
-                enhanced=(model == "enhanced_gnn"),
-                batch_size=500 if not mem_efficient else 100,
-                num_workers=kwargs.get('num_workers', 0),
-                verbose=True
-            )
+            # Check for pre-processed graphs
+            graphs = None
+            if graphs_path and os.path.exists(graphs_path):
+                try:
+                    # Try to load preprocessed DGL graphs
+                    logger.info(f"Loading preprocessed DGL graphs from {graphs_path}")
+                    result = load_graphs(graphs_path)
+                    graphs = result[0]  # First element contains the list of graphs
+                    logger.info(f"Loaded {len(graphs)} preprocessed DGL graphs")
+                except Exception as e:
+                    logger.warning(f"Failed to load preprocessed graphs: {e}")
+                    graphs = None
+            
+            # Build graph data if not loaded
+            if graphs is None:
+                logger.info("Building graph data with DGL...")
+                graphs = build_graph_data(
+                    df,
+                    enhanced=(model == "enhanced_gnn"),
+                    batch_size=500 if not mem_efficient else 100,
+                    num_workers=kwargs.get('num_workers', 0),
+                    bidirectional=True,
+                    use_edge_features=use_edge_features,
+                    verbose=True
+                )
+                
+                # Save graphs if requested
+                if save_graphs and output_dir:
+                    graph_save_path = str(output_dir / "graphs" / "processed_graphs.bin")
+                    logger.info(f"Saving processed DGL graphs to {graph_save_path}")
+                    try:
+                        save_graphs(graph_save_path, graphs)
+                        logger.info(f"Saved {len(graphs)} DGL graphs")
+                    except Exception as e:
+                        logger.warning(f"Failed to save graphs: {e}")
             
             # Create model with optimal parameters
             input_dim = len([col for col in df.columns if col.startswith("feat_")])
@@ -376,13 +412,55 @@ def run_training(
                 **model_config
             )
             
-            # Create DGL data loaders
-            # Split indices
-            indices = np.arange(len(graphs))
-            np.random.shuffle(indices)
-            train_idx = indices[:int(0.7 * len(indices))]
-            val_idx = indices[int(0.7 * len(indices)):int(0.85 * len(indices))]
-            test_idx = indices[int(0.85 * len(indices)):]
+            # Prepare for training
+            
+            # Split indices with stratification if possible
+            try:
+                # Extract labels for stratification
+                graph_labels = [g.ndata['label'][0].item() if 'label' in g.ndata else 0 for g in graphs]
+                
+                from sklearn.model_selection import train_test_split
+                train_idx, temp_idx = train_test_split(
+                    range(len(graphs)), 
+                    test_size=0.3, 
+                    random_state=seed,
+                    stratify=graph_labels
+                )
+                val_idx, test_idx = train_test_split(
+                    temp_idx, 
+                    test_size=0.5, 
+                    random_state=seed,
+                    stratify=[graph_labels[i] for i in temp_idx]
+                )
+            except Exception as e:
+                # Fallback to random split
+                logger.warning(f"Stratified split failed, using random split: {e}")
+                indices = np.arange(len(graphs))
+                np.random.shuffle(indices)
+                train_idx = indices[:int(0.7 * len(indices))]
+                val_idx = indices[int(0.7 * len(indices)):int(0.85 * len(indices))]
+                test_idx = indices[int(0.85 * len(indices)):]
+            
+            # Apply DGL sampling if requested (for very large graphs)
+            if dgl_sampling != "none" and any(g.num_nodes() > 1000 for g in graphs):
+                logger.info(f"Applying DGL {dgl_sampling} sampling for large graphs")
+                
+                try:
+                    from processmine.utils.dataloader import apply_dgl_sampling
+                    
+                    # Apply sampling to all graphs
+                    sampled_graphs = []
+                    for g in graphs:
+                        if g.num_nodes() > 1000:  # Only sample large graphs
+                            sampled_g = apply_dgl_sampling(g, method=dgl_sampling)
+                            sampled_graphs.append(sampled_g)
+                        else:
+                            sampled_graphs.append(g)
+                    
+                    graphs = sampled_graphs
+                    logger.info("Applied DGL sampling to reduce graph sizes")
+                except Exception as e:
+                    logger.warning(f"DGL sampling failed: {e}")
             
             # Create data loaders with memory efficiency in mind
             num_workers = kwargs.get('num_workers', 0) if not mem_efficient else 0
@@ -494,6 +572,7 @@ def run_training(
                 "predictions": predictions,
                 "true_labels": true_labels
             }
+
             
         elif model in ["lstm", "enhanced_lstm"]:
             # LSTM models - implementation pending

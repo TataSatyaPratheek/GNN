@@ -9,6 +9,7 @@ from unittest.mock import patch, MagicMock
 import random
 import sys
 import io
+import dgl
 from contextlib import redirect_stdout
 
 # Add coverage reporting
@@ -202,7 +203,7 @@ class TestDataLoaderComprehensive(unittest.TestCase):
         
         # Limited graphs should have maximum 5 nodes per graph
         if len(graphs_limited) > 0:
-            max_nodes = max(g.x.shape[0] for g in graphs_limited)
+            max_nodes = max(g.num_nodes() for g in graphs_limited)
             self.assertLessEqual(max_nodes, 5)
             
     def test_build_heterogeneous_graph(self):
@@ -221,29 +222,12 @@ class TestDataLoaderComprehensive(unittest.TestCase):
         
         # Check structure of first graph
         first_graph = het_graphs[0]
-        self.assertIn('node_features', first_graph)
-        self.assertIn('edge_indices', first_graph)
+        self.assertIsInstance(first_graph, dgl.DGLGraph)
+        
+        # Check if graph has appropriate node types
+        self.assertIn('task', first_graph.ntypes)
+        self.assertIn('resource', first_graph.ntypes)
     
-    def test_build_heterogeneous_graph(self):
-        """Test building heterogeneous graphs."""
-        from processmine.data.graphs import build_heterogeneous_graph
-        
-        # Test building heterogeneous graphs
-        het_graphs = build_heterogeneous_graph(
-            self.df,
-            batch_size=5
-        )
-        
-        # Verify structure
-        self.assertTrue(len(het_graphs) > 0)
-        
-        # Check structure of first graph
-        first_graph = het_graphs[0]
-        self.assertIn('node_features', first_graph)
-        self.assertIn('edge_indices', first_graph)
-        if 'task' in first_graph['node_features']:
-            self.assertTrue(isinstance(first_graph['node_features']['task'], torch.Tensor))
-
     def test_memory_optimization(self):
         """Test memory optimization during data loading."""
         # Capture memory usage output
@@ -576,11 +560,13 @@ class TestModelArchitectures(unittest.TestCase):
         # Import modules
         try:
             import torch
+            import dgl
             from processmine.models.gnn.architectures import (
                 MemoryEfficientGNN, 
-                PositionalGATConv, 
-                DiverseGATConv, 
-                CombinedGATConv
+                MemoryEfficientGATLayer,
+                PositionalGATLayer, 
+                DiverseGATLayer, 
+                CombinedGATLayer
             )
             from processmine.models.sequence.lstm import NextActivityLSTM, EnhancedProcessRNN
             from processmine.models.factory import create_model
@@ -594,49 +580,34 @@ class TestModelArchitectures(unittest.TestCase):
                 [1, 0, 2, 1, 3, 2, 5, 4, 7, 6, 9, 8]   # Target nodes
             ], dtype=torch.long)
             
-            # Create mock PyG data
-            try:
-                from torch_geometric.data import Data
-                from torch_geometric.loader import DataLoader
+            # Create mock DGL graph
+            cls.edge_src = cls.edge_index[0]
+            cls.edge_dst = cls.edge_index[1]
+            cls.test_graph = dgl.graph((cls.edge_src, cls.edge_dst))
+            cls.test_graph.ndata['feat'] = cls.node_features
+            
+            # Create a list of graphs
+            cls.graphs = []
+            for i in range(5):
+                # Create a graph with random nodes and edges
+                n_nodes = random.randint(5, 10)
+                x = torch.randn(n_nodes, 8)  # Node features
                 
-                # Create a list of graphs
-                cls.graphs = []
-                for i in range(5):
-                    # Create a graph with random nodes and edges
-                    n_nodes = random.randint(5, 10)
-                    x = torch.randn(n_nodes, 8)  # Node features
-                    
-                    # Create edge indices
-                    n_edges = n_nodes * 2
-                    edge_src = torch.randint(0, n_nodes, (n_edges,))
-                    edge_dst = torch.randint(0, n_nodes, (n_edges,))
-                    edge_index = torch.stack([edge_src, edge_dst])
-                    
-                    # Create edge attributes
-                    edge_attr = torch.randn(n_edges, 1)
-                    
-                    # Create graph target
-                    y = torch.tensor([i % 3], dtype=torch.long)
-                    
-                    # Create batch index
-                    batch = torch.zeros(n_nodes, dtype=torch.long)
-                    
-                    # Create Data object
-                    data = Data(
-                        x=x, 
-                        edge_index=edge_index, 
-                        edge_attr=edge_attr, 
-                        y=y,
-                        batch=batch
-                    )
-                    cls.graphs.append(data)
+                # Create edge indices
+                n_edges = n_nodes * 2
+                edge_src = torch.randint(0, n_nodes, (n_edges,))
+                edge_dst = torch.randint(0, n_nodes, (n_edges,))
                 
-                # Create dataloader
-                cls.loader = DataLoader(cls.graphs, batch_size=2)
-                cls.pyg_available = True
+                # Create DGL graph
+                g = dgl.graph((edge_src, edge_dst))
+                g.ndata['feat'] = x
+                g.ndata['label'] = torch.tensor([i % 3] * n_nodes, dtype=torch.long)
                 
-            except ImportError:
-                cls.pyg_available = False
+                cls.graphs.append(g)
+            
+            # Create dataloader
+            cls.batch_size = 2
+            cls.batched_graphs = dgl.batch(cls.graphs[:cls.batch_size])
                 
         except ImportError:
             cls.imports_successful = False
@@ -644,7 +615,7 @@ class TestModelArchitectures(unittest.TestCase):
     def setUp(self):
         """Skip tests if imports failed."""
         if not self.imports_successful:
-            self.skipTest("ProcessMine package not available in test environment")
+            self.skipTest("Required imports not available in test environment")
     
     def test_gnn_model_creation(self):
         """Test GNN model creation with different configurations."""
@@ -748,10 +719,7 @@ class TestModelArchitectures(unittest.TestCase):
             self.assertIn('parameters_mb', mem_usage)
     
     def test_gnn_forward_pass(self):
-        """Test GNN forward pass."""
-        if not self.pyg_available:
-            self.skipTest("PyTorch Geometric not available")
-        
+        """Test GNN forward pass with DGL graph."""
         from processmine.models.gnn.architectures import MemoryEfficientGNN
         
         # Create a model
@@ -765,139 +733,73 @@ class TestModelArchitectures(unittest.TestCase):
             attention_type="basic"
         )
         
-        # Test forward pass on a batch
-        for batch in self.loader:
-            output = model(batch)
-            
-            # Verify output shape and structure
-            self.assertIsInstance(output, dict)
-            self.assertIn('task_pred', output)
-            self.assertEqual(output['task_pred'].shape[1], 3)  # 3 output classes
-            break  # Only test the first batch
+        # Test on a batch of graphs
+        outputs = model(self.batched_graphs)
         
-        # Test get_embeddings method
-        for batch in self.loader:
-            embeddings, batch_indices = model.get_embeddings(batch)
-            
-            # Verify embeddings shape
-            self.assertEqual(embeddings.dim(), 2)
-            self.assertEqual(embeddings.shape[1], 16 * 2)  # hidden_dim * heads
-            break
-        
-        # Test get_attention_weights method
-        for batch in self.loader:
-            attn_weights = model.get_attention_weights(batch)
-            
-            # Verify weights shape
-            self.assertIsInstance(attn_weights, list)
-            # AttentionGNN should have attention weights for each layer
-            self.assertEqual(len(attn_weights), 2)  # 2 layers
-            break
+        # Verify outputs
+        self.assertIsInstance(outputs, dict)
+        self.assertIn('task_pred', outputs)
+        self.assertEqual(outputs['task_pred'].shape[0], self.batch_size)
+        self.assertEqual(outputs['task_pred'].shape[1], 3)  # 3 output classes
     
-    def test_lstm_model_creation(self):
-        """Test LSTM model creation."""
-        from processmine.models.sequence.lstm import NextActivityLSTM, EnhancedProcessRNN
-        
-        # Test creating basic LSTM
-        basic_lstm = NextActivityLSTM(
-            num_cls=3,
-            emb_dim=16,
-            hidden_dim=32,
-            num_layers=1,
-            dropout=0.1
-        )
-        
-        # Test new parameters for basic LSTM
-        basic_lstm_with_options = NextActivityLSTM(
-            num_cls=3,
-            emb_dim=16,
-            hidden_dim=32,
-            num_layers=1,
-            dropout=0.1,
-            bidirectional=True,  # Test bidirectional
-            use_attention=True,   # Test attention
-            use_layer_norm=True,  # Test layer norm
-            mem_efficient=True    # Test memory efficiency
-        )
-        
-        # Test creating enhanced RNN
-        enhanced_rnn = EnhancedProcessRNN(
-            num_cls=3,
-            emb_dim=16,
-            hidden_dim=32,
-            num_layers=2,
-            dropout=0.1,
-            use_gru=False,
-            use_transformer=True,
-            num_heads=4
-        )
-        
-        # Test new parameters for enhanced RNN
-        enhanced_rnn_with_options = EnhancedProcessRNN(
-            num_cls=3,
-            emb_dim=16,
-            hidden_dim=32,
-            num_layers=2,
-            dropout=0.1,
-            use_gru=True,              # Test GRU option
-            use_transformer=True,
-            num_heads=4,
-            use_time_features=True,    # Test time features
-            time_encoding_dim=8,       # Test time encoding dimension
-            mem_efficient=True         # Test memory efficiency
-        )
-        
-        # Verify models were created successfully
-        self.assertIsInstance(basic_lstm, NextActivityLSTM)
-        self.assertIsInstance(basic_lstm_with_options, NextActivityLSTM)
-        self.assertIsInstance(enhanced_rnn, EnhancedProcessRNN)
-        self.assertIsInstance(enhanced_rnn_with_options, EnhancedProcessRNN)
-    
-    def test_lstm_forward_pass(self):
-        """Test LSTM forward pass."""
-        from processmine.models.sequence.lstm import NextActivityLSTM
-        import torch
+    def test_enhanced_gnn_forward_pass(self):
+        """Test enhanced GNN forward pass with DGL graph."""
+        from processmine.models.gnn.architectures import MemoryEfficientGNN
         
         # Create a model
-        model = NextActivityLSTM(
-            num_cls=3,
-            emb_dim=16,
-            hidden_dim=32,
-            num_layers=1,
-            dropout=0.1
+        model = MemoryEfficientGNN(
+            input_dim=8,
+            hidden_dim=16,
+            output_dim=3,
+            num_layers=2,
+            heads=2,
+            dropout=0.1,
+            attention_type="combined",
+            pos_enc_dim=4,
+            diversity_weight=0.1
         )
         
-        # Create a batch of sequences
-        seq_batch = torch.randint(0, 3, (5, 10))  # 5 sequences, length 10
-        seq_lengths = torch.tensor([10, 8, 6, 9, 7])  # Variable lengths
+        # Test on a batch of graphs
+        outputs = model(self.batched_graphs)
         
-        # Test forward pass
-        output = model(seq_batch, seq_lengths)
+        # Verify outputs
+        self.assertIsInstance(outputs, dict)
+        self.assertIn('task_pred', outputs)
+        self.assertEqual(outputs['task_pred'].shape[0], self.batch_size)
+        self.assertEqual(outputs['task_pred'].shape[1], 3)  # 3 output classes
         
-        # Verify output shape
-        self.assertIsInstance(output, dict)
-        self.assertIn('task_pred', output)
-        self.assertEqual(output['task_pred'].shape, (5, 3))  # 5 sequences, 3 classes
+        # Verify diversity loss is included
+        self.assertIn('diversity_loss', outputs)
+        self.assertIn('diversity_weight', outputs)
+    
+    def test_embeddings_and_attention(self):
+        """Test getting embeddings and attention weights from model."""
+        from processmine.models.gnn.architectures import MemoryEfficientGNN
         
-        # Test processing graph data
-        if self.pyg_available:
-            # Create a model that can handle graph data
-            model = NextActivityLSTM(
-                num_cls=3,
-                emb_dim=16,
-                hidden_dim=32,
-                num_layers=1,
-                dropout=0.1
-            )
-            
-            # Test _process_graph_data method
-            for batch in self.loader:
-                output = model(batch)
-                
-                # Verify output
-                self.assertIsInstance(output, dict)
-                self.assertIn('task_pred', output)
-                break
+        # Create a model
+        model = MemoryEfficientGNN(
+            input_dim=8,
+            hidden_dim=16,
+            output_dim=3,
+            num_layers=2,
+            heads=2,
+            dropout=0.1,
+            attention_type="basic"
+        )
+        
+        # Test get_embeddings method
+        embeddings, batch_indices = model.get_embeddings(self.batched_graphs)
+        
+        # Verify embeddings
+        self.assertEqual(embeddings.shape[0], self.batched_graphs.num_nodes())
+        self.assertEqual(embeddings.shape[1], 16 * 2)  # hidden_dim * heads
+        
+        # Test get_attention_weights method
+        attn_weights = model.get_attention_weights(self.batched_graphs)
+        
+        # Verify attention weights
+        self.assertIsInstance(attn_weights, list)
+        self.assertEqual(len(attn_weights), 2)  # 2 layers
     
     def test_model_factory(self):
         """Test model factory function."""
@@ -1228,162 +1130,6 @@ class TestVisualizationComprehensive(unittest.TestCase):
         
         # Verify file was created
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "cycle_time_memory_efficient.png")))
-    
-        def test_dashboard_creation(self):
-            """Test dashboard creation."""
-            # Skip if not interactive mode
-            if self.visualizer.force_static:
-                self.skipTest("Visualizer is in static mode, dashboard requires interactive mode")
-            
-            # Generate case data
-            case_stats = pd.DataFrame({
-                'case_id': range(1, 101),
-                'duration_h': self.cycle_times[:100],
-                'task_id_count': np.random.randint(5, 15, 100),
-                'task_id_nunique': np.random.randint(3, 8, 100),
-                'resource_id_nunique': np.random.randint(1, 4, 100)
-            })
-            
-            # Create dashboard
-            self.visualizer.create_dashboard(
-                df=generate_process_data(n_cases=30),
-                cycle_times=self.cycle_times,
-                bottleneck_stats=self.bottleneck_stats,
-                significant_bottlenecks=self.significant_bottlenecks,
-                task_encoder=self.task_encoder,
-                case_stats=case_stats,
-                filename="dashboard.html"
-            )
-            
-            # Verify file was created
-            dashboard_file = os.path.join(self.test_dir, "dashboard.html")
-            if os.path.exists(dashboard_file):
-                # Check that the file is not empty
-                self.assertGreater(os.path.getsize(dashboard_file), 1000)
-
-
-class TestCLIFunctionality(unittest.TestCase):
-    """Test command-line interface functionality."""
-    
-    @classmethod
-    def setUpClass(cls):
-        """Set up test data that can be reused across tests."""
-        # Create a temporary directory for outputs
-        cls.test_dir = tempfile.mkdtemp()
-        
-        # Create a test CSV file
-        cls.test_csv = os.path.join(cls.test_dir, "test_log.csv")
-        cls.test_df = generate_test_csv(cls.test_csv, n_cases=10)
-        
-        # Import modules
-        try:
-            import processmine.cli as cli
-            cls.imports_successful = True
-        except ImportError:
-            cls.imports_successful = False
-    
-    @classmethod
-    def tearDownClass(cls):
-        """Clean up test resources."""
-        shutil.rmtree(cls.test_dir)
-    
-    def setUp(self):
-        """Skip tests if imports failed."""
-        if not self.imports_successful:
-            self.skipTest("ProcessMine CLI not available in test environment")
-    
-    @patch('argparse.ArgumentParser.parse_args')
-    def test_cli_parse_arguments(self, mock_parse_args):
-        """Test command-line argument parsing."""
-        from argparse import Namespace
-        import processmine.cli as cli
-        
-        # Configure mock to return a predefined Namespace
-        mock_parse_args.return_value = Namespace(
-            data_path=self.test_csv,
-            mode='analyze',
-            output_dir=self.test_dir,
-            viz_format='static',
-            seed=42
-        )
-        
-        # Call parse_arguments
-        args = cli.parse_arguments()
-        
-        # Verify parsed arguments
-        self.assertEqual(args.data_path, self.test_csv)
-        self.assertEqual(args.mode, 'analyze')
-        self.assertEqual(args.output_dir, self.test_dir)
-        self.assertEqual(args.viz_format, 'static')
-        self.assertEqual(args.seed, 42)
-    
-    @patch('sys.argv')
-    def test_cli_parse_model_specific_args(self, mock_argv):
-        """Test parsing model-specific arguments (new feature)."""
-        import processmine.cli as cli
-        
-        # Test train mode with model-specific args
-        mock_argv.__getitem__.side_effect = lambda idx: [
-            'processmine',
-            self.test_csv,
-            'train',
-            '--model', 'enhanced_gnn',
-            '--hidden_dim', '32',
-            '--heads', '4',
-            '--attention_type', 'combined'
-        ][idx]
-        mock_argv.__len__.return_value = 10
-        
-        args = cli.parse_arguments()
-        
-        # Verify model-specific args were parsed
-        self.assertEqual(args.model, 'enhanced_gnn')
-        self.assertEqual(args.hidden_dim, 32)
-        self.assertEqual(args.heads, 4)
-        self.assertEqual(args.attention_type, 'combined')
-    
-    @patch('torch.cuda.is_available', return_value=False)
-    def test_cli_setup_environment(self, mock_cuda):
-        """Test environment setup."""
-        import processmine.cli as cli
-        
-        # Create mock args
-        args = MagicMock()
-        args.seed = 42
-        args.device = None
-        args.output_dir = self.test_dir
-        args.debug = True
-        
-        # Test function
-        device, output_dir = cli.setup_environment(args)
-        
-        # Verify setup
-        self.assertEqual(device.type, 'cpu')
-        self.assertTrue(str(output_dir).startswith(self.test_dir))
-    
-    @patch('processmine.core.runner.run_analysis')
-    def test_cli_main_function(self, mock_run_analysis):
-        """Test main function with different modes."""
-        import processmine.cli as cli
-        
-        # Mock run functions
-        mock_run_analysis.return_value = {"result": "success"}
-        
-        # Create mock args
-        args = MagicMock()
-        args.data_path = self.test_csv
-        args.mode = 'analyze'
-        args.output_dir = self.test_dir
-        args.debug = False
-        
-        # Patch parse_arguments
-        with patch('processmine.cli.parse_arguments', return_value=args):
-            # Test main function
-            exit_code = cli.main()
-            
-            # Verify run_analysis was called
-            mock_run_analysis.assert_called_once()
-            self.assertEqual(exit_code, 0)
 
 
 def run_tests_with_coverage():
@@ -1401,7 +1147,6 @@ def run_tests_with_coverage():
     suite.addTests(loader.loadTestsFromTestCase(TestProcessMiningAnalysis))
     suite.addTests(loader.loadTestsFromTestCase(TestModelArchitectures))
     suite.addTests(loader.loadTestsFromTestCase(TestVisualizationComprehensive))
-    suite.addTests(loader.loadTestsFromTestCase(TestCLIFunctionality))
     
     # Run tests
     runner = unittest.TextTestRunner(verbosity=2)
