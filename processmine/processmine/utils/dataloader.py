@@ -193,68 +193,13 @@ def create_node_masks(g, mask_ratio=0.1):
     
     return g
 
-def convert_batch_to_graphs(batch_data):
-    """
-    Convert batch data to DGL graphs
-    
-    Args:
-        batch_data: Data to convert to DGL graphs
-        
-    Returns:
-        List of DGL graphs
-    """
-    # If it's already a DGL graph, just return it in a list
-    if isinstance(batch_data, dgl.DGLGraph):
-        return [batch_data]
-    
-    # If it's a list of DGL graphs, return as is
-    if isinstance(batch_data, list) and all(isinstance(g, dgl.DGLGraph) for g in batch_data):
-        return batch_data
-    
-    # For other data types, raise an error - we're DGL-only now
-    raise ValueError(f"Unsupported data type: {type(batch_data)}. Expected DGL graph or list of DGL graphs.")
-
 def prepare_graph_data(batch_data, device=None):
     """
-    Prepare DGL graph data for model processing
+    Prepare graph data for model processing
     
     Args:
-        batch_data: DGL graph or list of DGL graphs
+        batch_data: Input graph data (must be DGL graph or list of DGL graphs)
         device: Device to move data to
-        
-    Returns:
-        DGL graph or batched graph on specified device
-    """
-    # Handle device
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # If it's a list of graphs, batch them
-    if isinstance(batch_data, list):
-        if not all(isinstance(g, dgl.DGLGraph) for g in batch_data):
-            raise ValueError("All graphs in list must be DGL graphs")
-        
-        if len(batch_data) > 1:
-            batch_data = dgl.batch(batch_data)
-        else:
-            batch_data = batch_data[0]
-    
-    # Ensure we have a DGL graph
-    if not isinstance(batch_data, dgl.DGLGraph):
-        raise ValueError(f"Expected DGL graph, got {type(batch_data)}")
-    
-    # Move graph to device
-    batch_data = batch_data.to(device)
-    
-    return batch_data
-
-def prepare_graph_batch(batch_data, device=None):
-    """
-    Prepare a batch of DGL graphs for model processing
-    
-    Args:
-        batch_data: DGL graph data (single graph or list of graphs)
-        device: Target device for the graphs
         
     Returns:
         DGL graph or batched graph on specified device
@@ -270,17 +215,11 @@ def prepare_graph_batch(batch_data, device=None):
     # Handle list of DGL graphs
     if isinstance(batch_data, list):
         if not all(isinstance(g, dgl.DGLGraph) for g in batch_data):
-            raise ValueError("All graphs in list must be DGL graphs")
+            raise TypeError("All items in the list must be DGL graphs")
+        return dgl.batch(batch_data).to(device)
         
-        if len(batch_data) > 1:
-            return dgl.batch(batch_data).to(device)
-        elif len(batch_data) == 1:
-            return batch_data[0].to(device)
-        else:
-            raise ValueError("Empty graph list provided")
-    
-    # If we get here, the input format is not supported
-    raise ValueError(f"Unsupported data type: {type(batch_data)}. Expected DGL graph or list of DGL graphs.")
+    # Unsupported type
+    raise TypeError(f"Unsupported batch data type: {type(batch_data)}. Must be DGL graph or list of DGL graphs.")
 
 def apply_to_nodes(g, func):
     """
@@ -364,176 +303,40 @@ def create_node_masks(g, mask_ratio=0.1):
     
     return g
 
-def apply_dgl_sampling(g, method='neighbor', fanout=10, k=16):
+def prepare_graph_batch(batch_data, device=None):
     """
-    Apply DGL's graph sampling techniques for memory-efficient processing
+    Prepare a batch of graphs for model processing with DGL
     
     Args:
-        g: DGL graph to sample
-        method: Sampling method ('neighbor', 'topk', 'random', 'khop')
-        fanout: Number of neighbors to sample in neighbor sampling
-        k: Number of nodes to select in topk sampling
+        batch_data: Graph data (DGL graph or list of DGL graphs)
+        device: Target device for the graphs
         
     Returns:
-        Sampled DGL graph
+        DGL graph or batched graph on specified device
     """
+    import torch
     import dgl
     
-    try:
-        if method == 'neighbor':
-            # Sample neighbors with importance weights
-            if 'weight' in g.edata:
-                # Use edge weights for importance sampling
-                frontier = dgl.sampling.sample_neighbors(
-                    g, 
-                    torch.arange(g.num_nodes()), 
-                    fanout, 
-                    edge_dir='out',
-                    prob='weight'
-                )
-                return frontier
-            else:
-                # Uniform sampling if no weights
-                frontier = dgl.sampling.sample_neighbors(
-                    g, 
-                    torch.arange(g.num_nodes()), 
-                    fanout, 
-                    edge_dir='out'
-                )
-                return frontier
-                
-        elif method == 'topk':
-            # Select important nodes based on connectivity or features
-            # Either use in-degree for importance or node features
-            if g.in_degrees().sum() > 0:
-                scores = g.in_degrees().float()
-            else:
-                # Use feature magnitude as importance if available
-                if 'feat' in g.ndata:
-                    scores = g.ndata['feat'].sum(dim=1)
-                else:
-                    scores = torch.ones(g.num_nodes())
-                    
-            # Select top-k nodes
-            _, indices = torch.topk(scores, min(k, g.num_nodes()))
-            return g.subgraph(indices)
-            
-        elif method == 'khop':
-            # Get k-hop subgraph from a set of seed nodes
-            # Choose important nodes as seeds (e.g., with highest degree)
-            if g.in_degrees().sum() > 0:
-                scores = g.in_degrees().float()
-                _, seeds = torch.topk(scores, min(10, g.num_nodes()))
-            else:
-                seeds = torch.arange(min(10, g.num_nodes()))
-                
-            # Extract k-hop subgraph
-            nodes, edges = dgl.khop_in_subgraph(g, seeds, k=2)
-            subg = g.subgraph(nodes)
-            return subg
-            
-        elif method == 'random':
-            # Simple random node sampling
-            sample_size = min(g.num_nodes() // 2 + 1, g.num_nodes())
-            nodes = torch.randperm(g.num_nodes())[:sample_size]
-            return g.subgraph(nodes)
-            
-        else:
-            return g  # Return original graph if method not supported
-            
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"DGL sampling failed: {e}")
-        return g  # Return original graph on error
-
-def adaptive_normalization(features, feature_statistics=None):
-    """
-    Apply appropriate normalization based on data characteristics
-    Implementation of the normalization reconciliation from the improvement plan
+    # Handle device
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    Args:
-        features: Feature tensor or array to normalize
-        feature_statistics: Optional pre-computed statistics
-        
-    Returns:
-        Normalized features
-    """
-    # Convert to numpy if tensor
-    is_tensor = torch.is_tensor(features)
-    if is_tensor:
-        device = features.device
-        features_np = features.cpu().numpy()
-    else:
-        features_np = features
+    # Handle DGL graph or batched graph directly
+    if isinstance(batch_data, dgl.DGLGraph):
+        return batch_data.to(device)
     
-    # Calculate statistics if not provided
-    if feature_statistics is None:
-        feature_statistics = {
-            'mean': np.mean(features_np, axis=0),
-            'std': np.std(features_np, axis=0),
-            'min': np.min(features_np, axis=0),
-            'max': np.max(features_np, axis=0),
-            'skewness': _calculate_skewness(features_np)
-        }
+    # Handle list of DGL graphs
+    if isinstance(batch_data, list):
+        if not all(isinstance(g, dgl.DGLGraph) for g in batch_data):
+            raise TypeError("All items in the list must be DGL graphs")
+        return dgl.batch(batch_data).to(device)
     
-    # Get statistics
-    skewness = feature_statistics['skewness']
-    min_vals = feature_statistics['min']
-    max_vals = feature_statistics['max']
-    
-    # Calculate range ratio (avoiding division by zero)
-    epsilon = 1e-8
-    range_ratio = np.divide(
-        max_vals, 
-        np.maximum(min_vals, epsilon),
-        out=np.ones_like(max_vals),
-        where=min_vals>epsilon
-    )
-    
-    # Choose normalization strategy based on data properties
-    if np.any(np.abs(skewness) > 1.5) or np.any(range_ratio > 10):
-        # Highly skewed with large range differences - use robust scaling
-        median = np.median(features_np, axis=0)
-        q1 = np.percentile(features_np, 25, axis=0)
-        q3 = np.percentile(features_np, 75, axis=0)
-        iqr = q3 - q1
-        # Avoid division by zero
-        iqr = np.maximum(iqr, epsilon)
-        normalized = (features_np - median) / iqr
-    elif np.any(np.abs(features_np) > 5.0):
-        # Large magnitudes - use L2 normalization
-        norms = np.sqrt(np.sum(features_np**2, axis=1, keepdims=True))
-        norms = np.maximum(norms, epsilon)  # Avoid division by zero
-        normalized = features_np / norms
-    else:
-        # Well-behaved features - use MinMax
-        min_vals = feature_statistics['min']
-        max_vals = feature_statistics['max']
-        range_vals = np.maximum(max_vals - min_vals, epsilon)
-        normalized = (features_np - min_vals) / range_vals
-    
-    # Convert back to tensor if input was tensor
-    if is_tensor:
-        normalized = torch.tensor(normalized, dtype=features.dtype, device=device)
-    
-    return normalized
-
-def _calculate_skewness(arr):
-    """Calculate skewness of array elements along first axis"""
-    mean = np.mean(arr, axis=0)
-    std = np.std(arr, axis=0)
-    # Avoid division by zero
-    std = np.maximum(std, 1e-8)
-    
-    # Calculate skewness (third moment)
-    n = arr.shape[0]
-    m3 = np.sum((arr - mean)**3, axis=0) / n
-    return m3 / (std**3)
+    # Unsupported input type
+    raise TypeError(f"Unsupported input type: {type(batch_data)}. Must be DGL graph or list of DGL graphs.")
 
 class MemoryEfficientDataLoader:
     """
     Memory-efficient data loader for DGL graphs with dynamic batch sizing
-    Based on the improvement plan but adapted for DGL
     """
     def __init__(
         self, 
@@ -671,38 +474,199 @@ class MemoryEfficientDataLoader:
         return self.collate_fn(batch)
     
     def _get_memory_usage(self):
-        """Get current memory usage as fraction"""
+        """Get current memory usage as a fraction of total available memory"""
         try:
+            # Check GPU memory if available
             if torch.cuda.is_available():
-                # GPU memory usage
                 allocated = torch.cuda.memory_allocated()
                 reserved = torch.cuda.memory_reserved()
                 total = torch.cuda.get_device_properties(0).total_memory
-                return allocated / total
+                return max(allocated, reserved) / total
             else:
-                # CPU memory usage
-                import psutil
-                return psutil.virtual_memory().percent / 100
+                # Fall back to CPU memory
+                vm = psutil.virtual_memory()
+                return vm.percent / 100.0
         except:
-            # Fallback
-            return 0.5  # Default to middle value
+            # Default to a safe value if measurement fails
+            return 0.7
     
-    def _adjust_batch_size(self, memory_usage):
-        """Dynamically adjust batch size based on memory usage"""
-        if memory_usage > self.memory_threshold:
-            # Memory usage is high, reduce batch size
-            new_size = max(1, int(self.batch_size * 0.8))
-            if new_size != self.batch_size:
-                import logging
-                logging.getLogger(__name__).info(
-                    f"Reducing batch size from {self.batch_size} to {new_size} "
-                    f"due to high memory usage ({memory_usage:.1%})"
-                )
-                self.batch_size = new_size
-        elif memory_usage < self.memory_threshold * 0.7 and self.batch_size < 128:
-            # Memory usage is low, can try increasing batch size
-            new_size = min(128, int(self.batch_size * 1.2))
-            if new_size != self.batch_size:
-                self.batch_size = new_size
-                
+    def _adjust_batch_size(self, current_memory):
+        """Adjust batch size based on current memory usage"""
+        if current_memory > self.memory_threshold:
+            # Reduce batch size when memory usage is high
+            new_batch_size = max(1, int(self.batch_size * 0.8))
+            if new_batch_size != self.batch_size:
+                self.batch_size = new_batch_size
+        elif current_memory < self.memory_threshold * 0.7:
+            # Increase batch size when memory usage is low
+            new_batch_size = min(1024, int(self.batch_size * 1.2))
+            if new_batch_size != self.batch_size:
+                self.batch_size = new_batch_size
+        
         return self.batch_size
+
+def adaptive_normalization(features, feature_statistics=None):
+    """
+    Apply appropriate normalization based on data characteristics
+    Implementation of the normalization reconciliation from the improvement plan
+    
+    Args:
+        features: Feature tensor or array to normalize
+        feature_statistics: Optional pre-computed statistics
+        
+    Returns:
+        Normalized features
+    """
+    # Convert to numpy if tensor
+    is_tensor = torch.is_tensor(features)
+    if is_tensor:
+        device = features.device
+        features_np = features.cpu().numpy()
+    else:
+        features_np = features
+    
+    # Calculate statistics if not provided
+    if feature_statistics is None:
+        feature_statistics = {
+            'mean': np.mean(features_np, axis=0),
+            'std': np.std(features_np, axis=0),
+            'min': np.min(features_np, axis=0),
+            'max': np.max(features_np, axis=0),
+            'skewness': _calculate_skewness(features_np)
+        }
+    
+    # Get statistics
+    skewness = feature_statistics['skewness']
+    min_vals = feature_statistics['min']
+    max_vals = feature_statistics['max']
+    
+    # Calculate range ratio (avoiding division by zero)
+    epsilon = 1e-8
+    range_ratio = np.divide(
+        max_vals, 
+        np.maximum(min_vals, epsilon),
+        out=np.ones_like(max_vals),
+        where=min_vals>epsilon
+    )
+    
+    # Choose normalization strategy based on data properties
+    if np.any(np.abs(skewness) > 1.5) or np.any(range_ratio > 10):
+        # Highly skewed with large range differences - use robust scaling
+        median = np.median(features_np, axis=0)
+        q1 = np.percentile(features_np, 25, axis=0)
+        q3 = np.percentile(features_np, 75, axis=0)
+        iqr = q3 - q1
+        # Avoid division by zero
+        iqr = np.maximum(iqr, epsilon)
+        normalized = (features_np - median) / iqr
+    elif np.any(np.abs(features_np) > 5.0):
+        # Large magnitudes - use L2 normalization
+        norms = np.sqrt(np.sum(features_np**2, axis=1, keepdims=True))
+        norms = np.maximum(norms, epsilon)  # Avoid division by zero
+        normalized = features_np / norms
+    else:
+        # Well-behaved features - use MinMax
+        min_vals = feature_statistics['min']
+        max_vals = feature_statistics['max']
+        range_vals = np.maximum(max_vals - min_vals, epsilon)
+        normalized = (features_np - min_vals) / range_vals
+    
+    # Convert back to tensor if input was tensor
+    if is_tensor:
+        normalized = torch.tensor(normalized, dtype=features.dtype, device=device)
+    
+    return normalized
+
+def _calculate_skewness(arr):
+    """Calculate skewness of array elements along first axis"""
+    mean = np.mean(arr, axis=0)
+    std = np.std(arr, axis=0)
+    # Avoid division by zero
+    std = np.maximum(std, 1e-8)
+    
+    # Calculate skewness (third moment)
+    n = arr.shape[0]
+    m3 = np.sum((arr - mean)**3, axis=0) / n
+    return m3 / (std**3)
+
+def apply_dgl_sampling(g, method='neighbor', fanout=10, k=16):
+    """
+    Apply DGL's graph sampling techniques for memory-efficient processing
+    
+    Args:
+        g: DGL graph to sample
+        method: Sampling method ('neighbor', 'topk', 'random', 'khop')
+        fanout: Number of neighbors to sample in neighbor sampling
+        k: Number of nodes to select in topk sampling
+        
+    Returns:
+        Sampled DGL graph
+    """
+    import dgl
+    
+    try:
+        if method == 'neighbor':
+            # Sample neighbors with importance weights
+            if 'weight' in g.edata:
+                # Use edge weights for importance sampling
+                frontier = dgl.sampling.sample_neighbors(
+                    g, 
+                    torch.arange(g.num_nodes()), 
+                    fanout, 
+                    edge_dir='out',
+                    prob='weight'
+                )
+                return frontier
+            else:
+                # Uniform sampling if no weights
+                frontier = dgl.sampling.sample_neighbors(
+                    g, 
+                    torch.arange(g.num_nodes()), 
+                    fanout, 
+                    edge_dir='out'
+                )
+                return frontier
+                
+        elif method == 'topk':
+            # Select important nodes based on connectivity or features
+            # Either use in-degree for importance or node features
+            if g.in_degrees().sum() > 0:
+                scores = g.in_degrees().float()
+            else:
+                # Use feature magnitude as importance if available
+                if 'feat' in g.ndata:
+                    scores = g.ndata['feat'].sum(dim=1)
+                else:
+                    scores = torch.ones(g.num_nodes())
+                    
+            # Select top-k nodes
+            _, indices = torch.topk(scores, min(k, g.num_nodes()))
+            return g.subgraph(indices)
+            
+        elif method == 'khop':
+            # Get k-hop subgraph from a set of seed nodes
+            # Choose important nodes as seeds (e.g., with highest degree)
+            if g.in_degrees().sum() > 0:
+                scores = g.in_degrees().float()
+                _, seeds = torch.topk(scores, min(10, g.num_nodes()))
+            else:
+                seeds = torch.arange(min(10, g.num_nodes()))
+                
+            # Extract k-hop subgraph
+            nodes, edges = dgl.khop_in_subgraph(g, seeds, k=2)
+            subg = g.subgraph(nodes)
+            return subg
+            
+        elif method == 'random':
+            # Simple random node sampling
+            sample_size = min(g.num_nodes() // 2 + 1, g.num_nodes())
+            nodes = torch.randperm(g.num_nodes())[:sample_size]
+            return g.subgraph(nodes)
+            
+        else:
+            return g  # Return original graph if method not supported
+            
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"DGL sampling failed: {e}")
+        return g  # Return original graph on error

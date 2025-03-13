@@ -1,20 +1,19 @@
 """
 Memory-efficient LSTM model for next activity prediction in process mining.
-Supports DGL graphs, packed sequences, attention, and efficient batch processing.
+Supports packed sequences, attention, and efficient batch processing.
+Fully optimized for DGL graphs.
 """
 
-import logger
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import dgl
+import logging
 from typing import Dict, List, Tuple, Optional, Union, Any
 
-from processmine.models.base import BaseModel
+logger = logging.getLogger(__name__)
 
-
-class NextActivityLSTM(BaseModel):
+class NextActivityLSTM(nn.Module):
     """
     LSTM model for next activity prediction with memory optimization and attention mechanism
     """
@@ -446,11 +445,10 @@ class NextActivityLSTM(BaseModel):
         
         return self.attention_weights
 
-
-class EnhancedProcessRNN(BaseModel):
+class EnhancedProcessRNN(nn.Module):
     """
     Enhanced RNN architecture combining LSTM, GRU, and Transformer layers
-    for complex sequential process mining tasks with DGL support
+    for complex sequential process mining tasks
     """
     def __init__(
         self,
@@ -830,4 +828,3 @@ class EnhancedProcessRNN(BaseModel):
             return self.forward((padded_tasks, padded_times, padding_mask, seq_lengths))
         else:
             return self.forward((padded_tasks, None, padding_mask, seq_lengths))
-        
