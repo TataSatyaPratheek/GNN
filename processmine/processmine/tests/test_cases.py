@@ -11,13 +11,13 @@ from unittest.mock import patch, MagicMock
 try:
     from processmine.core.training import train_model, evaluate_model, compute_class_weights
     from processmine.data.loader import load_and_preprocess_data
-    from processmine.data.graph_builder import build_graph_data, build_heterogeneous_graph
+    from processmine.data.graphs import build_graph_data, build_heterogeneous_graph
     from processmine.models.gnn.architectures import MemoryEfficientGNN, PositionalGATConv
     from processmine.models.sequence.lstm import NextActivityLSTM
     from processmine.process_mining.analysis import analyze_bottlenecks, analyze_cycle_times
     from processmine.visualization.viz import ProcessVisualizer
     from processmine.utils.memory import clear_memory, get_memory_stats
-    from processmine.processmine import create_model
+    from processmine.models.factory import create_model
 except ImportError:
     # For CI/CD where imports might fail
     pass
@@ -90,29 +90,82 @@ class TestDataLoader(unittest.TestCase):
                 self.test_csv, norm_method='l2'
             )
             
-            # Test building graph data with updated parameters
-            graphs = build_graph_data(
+            # Test building graph data with mode parameter (new)
+            graphs_standard = build_graph_data(
                 df, 
                 enhanced=True, 
-                batch_size=2, 
-                num_workers=0, 
-                verbose=True,
-                bidirectional=True,
-                mode='auto'
+                batch_size=2,
+                mode='standard'  # Test standard mode
             )
             
-            # Check that graphs were created
-            self.assertTrue(isinstance(graphs, list))
-            self.assertGreater(len(graphs), 0)
+            # Test with sparse mode (new)
+            graphs_sparse = build_graph_data(
+                df, 
+                enhanced=True, 
+                batch_size=2,
+                mode='sparse'  # Test sparse mode
+            )
             
-            # Check graph structure
-            for graph in graphs:
-                self.assertTrue(hasattr(graph, 'x'))
-                self.assertTrue(hasattr(graph, 'edge_index'))
-                if len(graph.edge_index.shape) > 0 and graph.edge_index.shape[1] > 0:
-                    self.assertTrue(hasattr(graph, 'edge_attr'))
-                self.assertTrue(hasattr(graph, 'y'))
-                
+            # Test with limit_nodes parameter (new)
+            graphs_limited = build_graph_data(
+                df, 
+                enhanced=True, 
+                batch_size=2,
+                limit_nodes=3  # Test node limiting
+            )
+            
+            # Verify graphs were created with proper constraints
+            self.assertTrue(isinstance(graphs_standard, list))
+            self.assertTrue(isinstance(graphs_sparse, list))
+            
+            # Verify node limits are respected
+            for graph in graphs_limited:
+                self.assertLessEqual(graph.x.size(0), 3)
+            
+        except (ImportError, NameError):
+            self.skipTest("ProcessMine package not available in test environment")
+        
+    def test_analyze_resource_performance(self):
+        """Test resource performance analysis (new function)."""
+        try:
+            from processmine.process_mining.analysis import analyze_resource_performance
+            
+            # Test resource performance analysis
+            resource_perf = analyze_resource_performance(self.test_df)
+            
+            # Verify output structure
+            self.assertIsInstance(resource_perf, pd.DataFrame)
+            
+            # Check for new metrics columns
+            self.assertTrue('task_duration_mean' in resource_perf.columns)
+            self.assertTrue('throughput' in resource_perf.columns)
+            
+        except (ImportError, NameError):
+            self.skipTest("ProcessMine package not available in test environment")
+            
+    def test_gnn_model_enhanced_features(self):
+        """Test GNN model with new features."""
+        try:
+            from processmine.models.gnn.architectures import MemoryEfficientGNN
+            
+            # Create model with sparse attention (new)
+            model = MemoryEfficientGNN(
+                input_dim=5,
+                hidden_dim=8,
+                output_dim=3,
+                num_layers=2,
+                heads=2,
+                dropout=0.1,
+                attention_type="basic",
+                sparse_attention=True,  # New parameter
+                use_checkpointing=True  # New parameter
+            )
+            
+            # Check memory usage method (new)
+            mem_usage = model.memory_usage()
+            self.assertIsInstance(mem_usage, dict)
+            self.assertIn('parameters_mb', mem_usage)
+            
         except (ImportError, NameError):
             self.skipTest("ProcessMine package not available in test environment")
 

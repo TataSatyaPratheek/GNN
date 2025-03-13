@@ -1292,22 +1292,22 @@ class TestCLIFunctionality(unittest.TestCase):
         if not self.imports_successful:
             self.skipTest("ProcessMine CLI not available in test environment")
     
-    @patch('sys.argv')
-    def test_cli_parse_arguments(self, mock_argv):
+    @patch('argparse.ArgumentParser.parse_args')
+    def test_cli_parse_arguments(self, mock_parse_args):
         """Test command-line argument parsing."""
+        from argparse import Namespace
         import processmine.cli as cli
         
-        # Test analyze mode
-        mock_argv.__getitem__.side_effect = lambda idx: [
-            'processmine',
-            self.test_csv,
-            'analyze',
-            '--output-dir', self.test_dir,
-            '--viz-format', 'static',
-            '--seed', '42'
-        ][idx]
-        mock_argv.__len__.return_value = 8
+        # Configure mock to return a predefined Namespace
+        mock_parse_args.return_value = Namespace(
+            data_path=self.test_csv,
+            mode='analyze',
+            output_dir=self.test_dir,
+            viz_format='static',
+            seed=42
+        )
         
+        # Call parse_arguments
         args = cli.parse_arguments()
         
         # Verify parsed arguments

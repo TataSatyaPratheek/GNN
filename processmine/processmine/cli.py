@@ -510,28 +510,28 @@ def main():
                 data_path=args.data_path,
                 output_dir=output_dir,
                 device=device,
-                **{k: v for k, v in run_kwargs.items() if k not in ['data_path', 'mode']}
+                **{k: v for k, v in run_kwargs.items() if k not in ['data_path', 'mode', 'output_dir']}
             )
         elif args.mode == "train":
             run_training(
                 data_path=args.data_path,
                 output_dir=output_dir,
                 device=device,
-                **{k: v for k, v in run_kwargs.items() if k not in ['data_path', 'mode']}
+                **{k: v for k, v in run_kwargs.items() if k not in ['data_path', 'mode', 'output_dir']}
             )
         elif args.mode == "optimize":
             run_optimization(
                 data_path=args.data_path,
                 output_dir=output_dir,
                 device=device,
-                **{k: v for k, v in run_kwargs.items() if k not in ['data_path', 'mode']}
+                **{k: v for k, v in run_kwargs.items() if k not in ['data_path', 'mode', 'output_dir']}
             )
         elif args.mode == "full":
             run_full_pipeline(
                 data_path=args.data_path,
                 output_dir=output_dir,
                 device=device,
-                **{k: v for k, v in run_kwargs.items() if k not in ['data_path', 'mode']}
+                **{k: v for k, v in run_kwargs.items() if k not in ['data_path', 'mode', 'output_dir']}
             )
         
         # Log completion time
