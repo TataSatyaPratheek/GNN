@@ -75,6 +75,10 @@ class TestDataLoader(unittest.TestCase):
             self.assertTrue("feat_task_id" in df.columns)
             self.assertTrue("next_task" in df.columns)
             
+            # Check additional features created from new version
+            self.assertTrue("case_events" in df.columns)
+            self.assertTrue("case_unique_tasks" in df.columns)
+            
         except (ImportError, NameError):
             self.skipTest("ProcessMine package not available in test environment")
 
@@ -86,8 +90,16 @@ class TestDataLoader(unittest.TestCase):
                 self.test_csv, norm_method='l2'
             )
             
-            # Test building graph data
-            graphs = build_graph_data(df, enhanced=True, batch_size=2)
+            # Test building graph data with updated parameters
+            graphs = build_graph_data(
+                df, 
+                enhanced=True, 
+                batch_size=2, 
+                num_workers=0, 
+                verbose=True,
+                bidirectional=True,
+                mode='auto'
+            )
             
             # Check that graphs were created
             self.assertTrue(isinstance(graphs, list))
@@ -139,9 +151,16 @@ class TestProcessAnalysis(unittest.TestCase):
     def test_analyze_bottlenecks(self):
         """Test bottleneck analysis."""
         try:
-            # Test the function
+            # Add next_timestamp column for bottleneck analysis
+            self.test_df['next_timestamp'] = self.test_df.groupby("case_id")["timestamp"].shift(-1)
+            
+            # Test the function with the new memory_efficient parameter
             bottleneck_stats, significant_bottlenecks = analyze_bottlenecks(
-                self.test_df, freq_threshold=1, percentile_threshold=75.0
+                self.test_df, 
+                freq_threshold=1, 
+                percentile_threshold=75.0,
+                vectorized=True,
+                memory_efficient=True
             )
             
             # Check output format
@@ -152,14 +171,23 @@ class TestProcessAnalysis(unittest.TestCase):
             self.assertTrue("mean_hours" in bottleneck_stats.columns)
             self.assertTrue("count" in bottleneck_stats.columns)
             
+            # Check new columns from updated function
+            self.assertTrue("rank" in bottleneck_stats.columns)
+            if len(significant_bottlenecks) > 0:
+                self.assertTrue("bottleneck_score" in significant_bottlenecks.columns)
+            
         except (ImportError, NameError):
             self.skipTest("ProcessMine package not available in test environment")
 
     def test_analyze_cycle_times(self):
         """Test cycle time analysis."""
         try:
-            # Test the function
-            case_stats, long_cases, p95 = analyze_cycle_times(self.test_df)
+            # Test the function with the memory_efficient parameter
+            case_stats, long_cases, p95 = analyze_cycle_times(
+                self.test_df, 
+                percentile_threshold=95.0,
+                memory_efficient=True
+            )
             
             # Check output format
             self.assertIsInstance(case_stats, pd.DataFrame)
@@ -169,6 +197,9 @@ class TestProcessAnalysis(unittest.TestCase):
             # Check that stats were computed
             self.assertTrue("duration_h" in case_stats.columns)
             self.assertGreaterEqual(p95, 0)
+            
+            # Check additional metrics from updated function
+            self.assertTrue("duration_days" in case_stats.columns)
             
         except (ImportError, NameError):
             self.skipTest("ProcessMine package not available in test environment")
@@ -216,7 +247,7 @@ class TestModels(unittest.TestCase):
             if self.batch is None:
                 self.skipTest("PyTorch Geometric not available")
                 
-            # Create a GNN model
+            # Create a GNN model with updated parameters
             model = MemoryEfficientGNN(
                 input_dim=5,
                 hidden_dim=8,
@@ -224,13 +255,17 @@ class TestModels(unittest.TestCase):
                 num_layers=2,
                 heads=2,
                 dropout=0.1,
-                attention_type="basic"
+                attention_type="basic",
+                use_batch_norm=True,
+                use_layer_norm=False,
+                use_residual=True,
+                mem_efficient=True
             )
             
             # Test forward pass
             output = model(self.batch)
             
-            # Check output format
+            # Check output format - now returns a dictionary
             self.assertIsInstance(output, dict)
             self.assertTrue("task_pred" in output)
             self.assertEqual(output["task_pred"].shape, (3, 3))  # 3 graphs, 3 classes
@@ -238,6 +273,11 @@ class TestModels(unittest.TestCase):
             # Test get_embeddings
             embeddings, batch_indices = model.get_embeddings(self.batch)
             self.assertTrue(embeddings.shape[1], 8 * 2)  # hidden_dim * heads
+            
+            # Test memory_usage method
+            mem_usage = model.memory_usage()
+            self.assertIsInstance(mem_usage, dict)
+            self.assertIn('parameters_mb', mem_usage)
             
         except (ImportError, NameError):
             self.skipTest("GNN model not available in test environment")
@@ -249,16 +289,20 @@ class TestModels(unittest.TestCase):
             seq_data = torch.randint(0, 3, (5, 10))  # 5 sequences, length 10
             seq_lengths = torch.tensor([10, 8, 6, 10, 7])
             
-            # Create an LSTM model
+            # Create an LSTM model with updated parameters
             model = NextActivityLSTM(
                 num_cls=3,
                 emb_dim=8,
                 hidden_dim=8,
                 num_layers=1,
-                dropout=0.1
+                dropout=0.1,
+                bidirectional=False,
+                use_attention=True,
+                use_layer_norm=True,
+                mem_efficient=True
             )
             
-            # Test forward pass
+            # Test forward pass - now returns a dictionary
             output = model(seq_data, seq_lengths)
             
             # Check output format
@@ -287,9 +331,18 @@ class TestModels(unittest.TestCase):
                 hidden_dim=8
             )
             
+            # Test enhanced models
+            enhanced_gnn = create_model(
+                model_type="enhanced_gnn",
+                input_dim=5,
+                hidden_dim=8,
+                output_dim=3
+            )
+            
             # Check that models were created correctly
             self.assertIsNotNone(gnn_model)
             self.assertIsNotNone(lstm_model)
+            self.assertIsNotNone(enhanced_gnn)
             
         except (ImportError, NameError):
             self.skipTest("Model factory not available in test environment")
@@ -332,10 +385,10 @@ class TestModelTraining(unittest.TestCase):
             mock_no_grad.return_value.__enter__ = MagicMock()
             mock_no_grad.return_value.__exit__ = MagicMock()
             
-            # Test evaluate_model function
+            # Test evaluate_model function with updated interface
             with patch('processmine.core.training._calculate_metrics', return_value={'accuracy': 0.8}):
-                metrics, y_true, y_pred = evaluate_model(
-                    self.model, self.loader, self.criterion, self.device
+                metrics, predictions, true_labels = evaluate_model(
+                    self.model, self.loader, self.device, self.criterion, detailed=True
                 )
             
             # Check that metrics were calculated
@@ -357,13 +410,21 @@ class TestModelTraining(unittest.TestCase):
             
             # Mock evaluate_model
             with patch('processmine.core.training.evaluate_model', 
-                      return_value=({'val_loss': 0.4}, None, None)):
+                      return_value=(0.4, {'val_loss': 0.4}, None, None)):
                 
-                # Test train_model function
+                # Test train_model function with updated parameters
                 model, history = train_model(
-                    self.model, self.loader, self.loader, 
-                    self.optimizer, self.criterion, self.device,
-                    epochs=2, patience=1
+                    model=self.model,
+                    train_loader=self.loader,
+                    val_loader=self.loader, 
+                    optimizer=self.optimizer,
+                    criterion=self.criterion,
+                    device=self.device,
+                    epochs=2,
+                    patience=1,
+                    use_amp=False,
+                    memory_efficient=True,
+                    track_memory=True
                 )
                 
                 # Check that training completed
@@ -412,8 +473,16 @@ class TestVisualization(unittest.TestCase):
     def test_process_visualizer(self):
         """Test ProcessVisualizer initialization."""
         try:
-            # Create a visualizer
-            visualizer = ProcessVisualizer(output_dir=self.test_dir)
+            # Create a visualizer with updated parameters
+            visualizer = ProcessVisualizer(
+                output_dir=self.test_dir,
+                style='default',
+                force_static=False,
+                memory_efficient=True,
+                sampling_threshold=100000,
+                max_plot_points=50000,
+                dpi=120
+            )
             
             # Check that the visualizer was created
             self.assertEqual(visualizer.output_dir, self.test_dir)
@@ -427,9 +496,13 @@ class TestVisualization(unittest.TestCase):
             # Create a visualizer
             visualizer = ProcessVisualizer(output_dir=self.test_dir)
             
-            # Test creating cycle time distribution
+            # Test creating cycle time distribution with updated parameters
             filename = visualizer.cycle_time_distribution(
-                self.cycle_times, filename="cycle_time_test.png"
+                self.cycle_times, 
+                filename="cycle_time_test.png",
+                bins=20,
+                include_kde=True,
+                show_percentiles=True
             )
             
             # Check that the file was created
@@ -444,16 +517,40 @@ class TestVisualization(unittest.TestCase):
             # Create a visualizer
             visualizer = ProcessVisualizer(output_dir=self.test_dir)
             
-            # Test creating bottleneck analysis
+            # Test creating bottleneck analysis with updated parameters
             filename = visualizer.bottleneck_analysis(
                 self.bottleneck_stats,
                 self.significant_bottlenecks,
                 self.task_encoder,
-                filename="bottleneck_test.png"
+                filename="bottleneck_test.png",
+                top_n=3
             )
             
             # Check that the file was created
             self.assertTrue(os.path.exists(os.path.join(self.test_dir, "bottleneck_test.png")))
+            
+        except (ImportError, NameError):
+            self.skipTest("Visualization utilities not available in test environment")
+
+    def test_process_flow(self):
+        """Test creating process flow visualization."""
+        try:
+            # Create a visualizer
+            visualizer = ProcessVisualizer(output_dir=self.test_dir)
+            
+            # Test creating process flow with updated parameters
+            filename = visualizer.process_flow(
+                self.bottleneck_stats,
+                self.task_encoder,
+                self.significant_bottlenecks,
+                filename="process_flow_test.png",
+                max_nodes=20,
+                layout='auto'
+            )
+            
+            # Check that the file was created - this might fail if NetworkX not available
+            if filename:
+                self.assertTrue(os.path.exists(os.path.join(self.test_dir, "process_flow_test.png")))
             
         except (ImportError, NameError):
             self.skipTest("Visualization utilities not available in test environment")
@@ -465,13 +562,15 @@ class TestUtilities(unittest.TestCase):
     def test_memory_utilities(self):
         """Test memory management utilities."""
         try:
-            # Test memory clearing
-            clear_memory()
+            # Test memory clearing with full_clear parameter
+            clear_memory(full_clear=True)
             
-            # Test memory statistics
+            # Test memory statistics with updated return values
             stats = get_memory_stats()
             self.assertIsInstance(stats, dict)
             self.assertTrue("cpu_percent" in stats)
+            self.assertTrue("cpu_used_gb" in stats)
+            self.assertTrue("cpu_available_gb" in stats)
             
         except (ImportError, NameError):
             self.skipTest("Memory utilities not available in test environment")
@@ -484,8 +583,9 @@ class TestUtilities(unittest.TestCase):
                 "next_task": [0, 0, 0, 0, 1, 1, 2]
             })
             
-            # Test computing class weights
-            weights = compute_class_weights(df, num_classes=3)
+            # Test computing class weights with updated interface from core.training
+            from processmine.core.training import compute_class_weights
+            weights = compute_class_weights(df, num_classes=3, method='balanced')
             
             # Check that weights were computed
             self.assertIsInstance(weights, torch.Tensor)

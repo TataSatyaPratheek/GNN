@@ -178,9 +178,27 @@ class TestDataLoaderComprehensive(unittest.TestCase):
             batch_size=5
         )
         
+        # Test with limit_nodes parameter (new feature)
+        graphs_limited = build_graph_data(
+            self.df,
+            enhanced=True,
+            batch_size=5,
+            limit_nodes=5  # Limit nodes per graph
+        )
+        
+        # Test with mode parameter (new feature)
+        graphs_sparse = build_graph_data(
+            self.df,
+            enhanced=True,
+            batch_size=5,
+            mode='sparse'  # Use sparse implementation
+        )
+        
         # Verify differences
         self.assertTrue(len(graphs_basic) > 0)
         self.assertTrue(len(graphs_directed) > 0)
+        self.assertTrue(len(graphs_limited) > 0)
+        self.assertTrue(len(graphs_sparse) > 0)
         
         # Basic graphs should not have edge attributes
         if len(graphs_basic) > 0 and len(graphs_basic[0].edge_index.shape) > 0 and graphs_basic[0].edge_index.shape[1] > 0:
@@ -191,6 +209,11 @@ class TestDataLoaderComprehensive(unittest.TestCase):
             total_edges_enhanced = sum(g.edge_index.shape[1] for g in self.graphs if hasattr(g, 'edge_index'))
             total_edges_directed = sum(g.edge_index.shape[1] for g in graphs_directed if hasattr(g, 'edge_index'))
             self.assertGreaterEqual(total_edges_enhanced, total_edges_directed)
+        
+        # Limited graphs should have maximum 5 nodes per graph
+        if len(graphs_limited) > 0:
+            max_nodes = max(g.x.shape[0] for g in graphs_limited)
+            self.assertLessEqual(max_nodes, 5)
     
     def test_build_heterogeneous_graph(self):
         """Test building heterogeneous graphs."""
@@ -211,12 +234,12 @@ class TestDataLoaderComprehensive(unittest.TestCase):
         self.assertIn('edge_indices', first_graph)
         if 'task' in first_graph['node_features']:
             self.assertTrue(isinstance(first_graph['node_features']['task'], torch.Tensor))
-    
+
     def test_memory_optimization(self):
         """Test memory optimization during data loading."""
         # Capture memory usage output
         from processmine.data.loader import load_and_preprocess_data
-        from processmine.utils.memory import get_memory_stats
+        from processmine.utils.memory import get_memory_stats, clear_memory
         
         # Get initial memory stats
         initial_stats = get_memory_stats()
@@ -230,6 +253,9 @@ class TestDataLoaderComprehensive(unittest.TestCase):
                 use_dtypes=True
             )
         
+        # Clear memory
+        clear_memory(full_clear=True)
+        
         # Get final memory stats
         final_stats = get_memory_stats()
         
@@ -237,6 +263,42 @@ class TestDataLoaderComprehensive(unittest.TestCase):
         if 'cpu_used_gb' in initial_stats and 'cpu_used_gb' in final_stats:
             # Memory increase should be reasonable (less than 1GB for test data)
             self.assertLess(final_stats['cpu_used_gb'] - initial_stats['cpu_used_gb'], 1.0)
+    
+    def test_normalize_features(self):
+        """Test the new normalize_features function."""
+        from processmine.data.features import normalize_features
+        
+        # Create test feature array
+        features = np.random.rand(10, 5)
+        
+        # Test L2 normalization
+        l2_features = normalize_features(features, method='l2')
+        
+        # Test standard normalization
+        std_features = normalize_features(features, method='standard')
+        
+        # Test minmax normalization
+        minmax_features = normalize_features(features, method='minmax')
+        
+        # Test return as tensor
+        tensor_features = normalize_features(features, method='l2', return_tensor=True)
+        
+        # Verify shapes
+        self.assertEqual(l2_features.shape, features.shape)
+        self.assertEqual(std_features.shape, features.shape)
+        self.assertEqual(minmax_features.shape, features.shape)
+        self.assertEqual(tensor_features.shape, features.shape)
+        
+        # Verify L2 normalization
+        l2_norms = np.sqrt(np.sum(l2_features**2, axis=1))
+        self.assertTrue(np.allclose(l2_norms, np.ones(10), atol=1e-6))
+        
+        # Verify minmax normalization in [0, 1]
+        self.assertTrue((minmax_features >= 0).all())
+        self.assertTrue((minmax_features <= 1).all())
+        
+        # Verify tensor return type
+        self.assertIsInstance(tensor_features, torch.Tensor)
 
 
 class TestProcessMiningAnalysis(unittest.TestCase):
@@ -252,7 +314,10 @@ class TestProcessMiningAnalysis(unittest.TestCase):
                 analyze_cycle_times,
                 analyze_transition_patterns,
                 identify_process_variants,
-                analyze_resource_workload
+                analyze_resource_workload,
+                analyze_resource_performance,
+                perform_conformance_checking,
+                run_complete_analysis
             )
             from processmine.data.loader import load_and_preprocess_data
             
@@ -288,7 +353,8 @@ class TestProcessMiningAnalysis(unittest.TestCase):
             bottleneck_stats, significant_bottlenecks = analyze_bottlenecks(
                 self.test_df, 
                 freq_threshold=2, 
-                percentile_threshold=float(percentile)
+                percentile_threshold=float(percentile),
+                vectorized=True  # Test new vectorized parameter
             )
             
             # Verify output structure
@@ -304,6 +370,18 @@ class TestProcessMiningAnalysis(unittest.TestCase):
                 prev_bottlenecks = significant_bottlenecks
             else:
                 self.assertLessEqual(len(significant_bottlenecks), len(prev_bottlenecks))
+        
+        # Test with memory_efficient parameter
+        bottleneck_stats, significant_bottlenecks = analyze_bottlenecks(
+            self.test_df, 
+            freq_threshold=2,
+            percentile_threshold=90.0,
+            memory_efficient=True  # Test new memory_efficient parameter
+        )
+        
+        # Verify output
+        self.assertIsInstance(bottleneck_stats, pd.DataFrame)
+        self.assertIsInstance(significant_bottlenecks, pd.DataFrame)
     
     def test_analyze_cycle_times(self):
         """Test cycle time analysis."""
@@ -324,6 +402,16 @@ class TestProcessMiningAnalysis(unittest.TestCase):
         # Verify that p95 is a valid percentile
         self.assertGreaterEqual(p95, 0)
         self.assertTrue(case_stats['duration_h'].quantile(0.95) <= p95 * 1.01)  # Allow for small numerical differences
+        
+        # Test with memory_efficient parameter
+        case_stats, long_cases, p95 = analyze_cycle_times(
+            self.test_df,
+            memory_efficient=True  # Test new memory_efficient parameter
+        )
+        
+        # Verify output
+        self.assertIsInstance(case_stats, pd.DataFrame)
+        self.assertIsInstance(long_cases, pd.DataFrame)
     
     def test_analyze_transition_patterns(self):
         """Test transition pattern analysis."""
@@ -342,6 +430,17 @@ class TestProcessMiningAnalysis(unittest.TestCase):
             row_sum = row.sum()
             if not pd.isna(row_sum) and row_sum > 0:
                 self.assertAlmostEqual(row_sum, 1.0, places=6)
+        
+        # Test with memory_efficient parameter
+        transitions, trans_count, prob_matrix = analyze_transition_patterns(
+            self.test_df,
+            memory_efficient=True  # Test new memory_efficient parameter
+        )
+        
+        # Verify output
+        self.assertIsInstance(transitions, pd.DataFrame)
+        self.assertIsInstance(trans_count, pd.DataFrame)
+        self.assertIsInstance(prob_matrix, pd.DataFrame)
     
     def test_identify_process_variants(self):
         """Test process variant identification."""
@@ -365,6 +464,17 @@ class TestProcessMiningAnalysis(unittest.TestCase):
             if 'percentage' in variant_stats.columns:
                 total_pct = variant_stats['percentage'].sum()
                 self.assertAlmostEqual(total_pct, 100.0, places=1)
+        
+        # Test with memory_efficient parameter
+        variant_stats, variant_sequences = identify_process_variants(
+            self.test_df,
+            max_variants=5,
+            memory_efficient=True  # Test new memory_efficient parameter
+        )
+        
+        # Verify output
+        self.assertIsInstance(variant_stats, pd.DataFrame)
+        self.assertIsInstance(variant_sequences, dict)
     
     def test_analyze_resource_workload(self):
         """Test resource workload analysis."""
@@ -384,6 +494,73 @@ class TestProcessMiningAnalysis(unittest.TestCase):
         if 'workload_percentage' in resource_stats.columns:
             total_pct = resource_stats['workload_percentage'].sum()
             self.assertAlmostEqual(total_pct, 100.0, places=1)
+        
+        # Test with memory_efficient parameter
+        resource_stats = analyze_resource_workload(
+            self.test_df,
+            memory_efficient=True  # Test new memory_efficient parameter
+        )
+        
+        # Verify output
+        self.assertIsInstance(resource_stats, pd.DataFrame)
+    
+    def test_analyze_resource_performance(self):
+        """Test resource performance analysis (new function)."""
+        from processmine.process_mining.analysis import analyze_resource_performance
+        
+        # Test resource performance analysis
+        resource_perf = analyze_resource_performance(self.test_df)
+        
+        # Verify output structure
+        self.assertIsInstance(resource_perf, pd.DataFrame)
+        
+        # Check columns (new metrics)
+        expected_columns = [
+            'task_duration_mean', 'task_duration_median', 
+            'task_id_count', 'throughput'
+        ]
+        
+        for col in expected_columns:
+            self.assertIn(col, resource_perf.columns)
+    
+    def test_conformance_checking(self):
+        """Test conformance checking."""
+        from processmine.process_mining.analysis import perform_conformance_checking
+        
+        # Test conformance checking
+        results = perform_conformance_checking(self.test_df)
+        
+        # Verify output structure
+        self.assertIsInstance(results, dict)
+        self.assertIn('conformance_ratio', results)
+        self.assertIn('variant_coverage', results)
+    
+    def test_run_complete_analysis(self):
+        """Test the complete analysis pipeline."""
+        from processmine.process_mining.analysis import run_complete_analysis
+        
+        # Test complete analysis
+        results = run_complete_analysis(self.test_df)
+        
+        # Verify output structure
+        self.assertIsInstance(results, dict)
+        
+        # Check for key components
+        expected_keys = [
+            'bottleneck_stats', 'significant_bottlenecks', 
+            'case_stats', 'transitions', 'variant_stats', 
+            'resource_stats', 'metrics'
+        ]
+        
+        for key in expected_keys:
+            self.assertIn(key, results)
+        
+        # Check metrics structure
+        self.assertIn('cases', results['metrics'])
+        self.assertIn('events', results['metrics'])
+        self.assertIn('activities', results['metrics'])
+        self.assertIn('resources', results['metrics'])
+        self.assertIn('perf', results['metrics'])
 
 
 class TestModelArchitectures(unittest.TestCase):
@@ -520,6 +697,43 @@ class TestModelArchitectures(unittest.TestCase):
             diversity_weight=0.1
         ))
         
+        # Test new parameters: sparse_attention
+        models.append(MemoryEfficientGNN(
+            input_dim=8,
+            hidden_dim=16,
+            output_dim=3,
+            num_layers=2,
+            heads=2,
+            dropout=0.1,
+            attention_type="basic",
+            sparse_attention=True  # New parameter
+        ))
+        
+        # Test new parameters: use_checkpointing
+        models.append(MemoryEfficientGNN(
+            input_dim=8,
+            hidden_dim=16,
+            output_dim=3,
+            num_layers=2,
+            heads=2,
+            dropout=0.1,
+            attention_type="basic",
+            use_checkpointing=True  # New parameter
+        ))
+        
+        # Test new parameters: pooling
+        for pooling in ["mean", "max", "sum", "combined", "attention"]:
+            models.append(MemoryEfficientGNN(
+                input_dim=8,
+                hidden_dim=16,
+                output_dim=3,
+                num_layers=2,
+                heads=2,
+                dropout=0.1,
+                attention_type="basic",
+                pooling=pooling  # New parameter with different options
+            ))
+        
         # Verify models were created successfully
         for model in models:
             self.assertIsInstance(model, MemoryEfficientGNN)
@@ -551,11 +765,30 @@ class TestModelArchitectures(unittest.TestCase):
         for batch in self.loader:
             output = model(batch)
             
-            # Verify output shape
+            # Verify output shape and structure
             self.assertIsInstance(output, dict)
             self.assertIn('task_pred', output)
             self.assertEqual(output['task_pred'].shape[1], 3)  # 3 output classes
             break  # Only test the first batch
+        
+        # Test get_embeddings method
+        for batch in self.loader:
+            embeddings, batch_indices = model.get_embeddings(batch)
+            
+            # Verify embeddings shape
+            self.assertEqual(embeddings.dim(), 2)
+            self.assertEqual(embeddings.shape[1], 16 * 2)  # hidden_dim * heads
+            break
+        
+        # Test get_attention_weights method
+        for batch in self.loader:
+            attn_weights = model.get_attention_weights(batch)
+            
+            # Verify weights shape
+            self.assertIsInstance(attn_weights, list)
+            # AttentionGNN should have attention weights for each layer
+            self.assertEqual(len(attn_weights), 2)  # 2 layers
+            break
     
     def test_lstm_model_creation(self):
         """Test LSTM model creation."""
@@ -570,6 +803,19 @@ class TestModelArchitectures(unittest.TestCase):
             dropout=0.1
         )
         
+        # Test new parameters for basic LSTM
+        basic_lstm_with_options = NextActivityLSTM(
+            num_cls=3,
+            emb_dim=16,
+            hidden_dim=32,
+            num_layers=1,
+            dropout=0.1,
+            bidirectional=True,  # Test bidirectional
+            use_attention=True,   # Test attention
+            use_layer_norm=True,  # Test layer norm
+            mem_efficient=True    # Test memory efficiency
+        )
+        
         # Test creating enhanced RNN
         enhanced_rnn = EnhancedProcessRNN(
             num_cls=3,
@@ -582,9 +828,26 @@ class TestModelArchitectures(unittest.TestCase):
             num_heads=4
         )
         
+        # Test new parameters for enhanced RNN
+        enhanced_rnn_with_options = EnhancedProcessRNN(
+            num_cls=3,
+            emb_dim=16,
+            hidden_dim=32,
+            num_layers=2,
+            dropout=0.1,
+            use_gru=True,              # Test GRU option
+            use_transformer=True,
+            num_heads=4,
+            use_time_features=True,    # Test time features
+            time_encoding_dim=8,       # Test time encoding dimension
+            mem_efficient=True         # Test memory efficiency
+        )
+        
         # Verify models were created successfully
         self.assertIsInstance(basic_lstm, NextActivityLSTM)
+        self.assertIsInstance(basic_lstm_with_options, NextActivityLSTM)
         self.assertIsInstance(enhanced_rnn, EnhancedProcessRNN)
+        self.assertIsInstance(enhanced_rnn_with_options, EnhancedProcessRNN)
     
     def test_lstm_forward_pass(self):
         """Test LSTM forward pass."""
@@ -611,6 +874,26 @@ class TestModelArchitectures(unittest.TestCase):
         self.assertIsInstance(output, dict)
         self.assertIn('task_pred', output)
         self.assertEqual(output['task_pred'].shape, (5, 3))  # 5 sequences, 3 classes
+        
+        # Test processing graph data
+        if self.pyg_available:
+            # Create a model that can handle graph data
+            model = NextActivityLSTM(
+                num_cls=3,
+                emb_dim=16,
+                hidden_dim=32,
+                num_layers=1,
+                dropout=0.1
+            )
+            
+            # Test _process_graph_data method
+            for batch in self.loader:
+                output = model(batch)
+                
+                # Verify output
+                self.assertIsInstance(output, dict)
+                self.assertIn('task_pred', output)
+                break
     
     def test_model_factory(self):
         """Test model factory function."""
@@ -643,10 +926,49 @@ class TestModelArchitectures(unittest.TestCase):
             hidden_dim=32
         ))
         
+        # Test enhanced LSTM
+        models.append(create_model(
+            model_type='enhanced_lstm',
+            num_cls=3,
+            emb_dim=16,
+            hidden_dim=32
+        ))
+        
+        # Test random forest
+        try:
+            models.append(create_model(
+                model_type='random_forest',
+                n_estimators=10
+            ))
+        except ImportError:
+            pass  # Skip if sklearn not available
+        
+        # Test XGBoost
+        try:
+            models.append(create_model(
+                model_type='xgboost',
+                n_estimators=10,
+                max_depth=3
+            ))
+        except ImportError:
+            pass  # Skip if xgboost not available
+        
         # Verify models were created successfully
-        model_types = ['OptimizedGNN', 'OptimizedGNN', 'NextActivityLSTM']
+        expected_types = [
+            'MemoryEfficientGNN', 'MemoryEfficientGNN', 
+            'NextActivityLSTM', 'EnhancedProcessRNN',
+            'RandomForestClassifier', 'XGBClassifier'
+        ]
+        
         for i, model in enumerate(models):
-            self.assertTrue(model.__class__.__name__ in model_types[i])
+            # Check model type matches expected
+            if i < len(expected_types):
+                model_type = model.__class__.__name__
+                self.assertTrue(
+                    model_type == expected_types[i] or 
+                    expected_types[i] in str(type(model)),
+                    f"Expected {expected_types[i]}, got {model_type}"
+                )
 
 
 class TestVisualizationComprehensive(unittest.TestCase):
@@ -733,10 +1055,18 @@ class TestVisualizationComprehensive(unittest.TestCase):
             include_kde=False
         )
         
+        # Test with show_percentiles parameter
+        self.visualizer.cycle_time_distribution(
+            self.cycle_times, 
+            filename="cycle_time_no_percentiles.png",
+            show_percentiles=False  # New parameter
+        )
+        
         # Verify files were created
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "cycle_time_default.png")))
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "cycle_time_custom_bins.png")))
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "cycle_time_no_kde.png")))
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "cycle_time_no_percentiles.png")))
     
     def test_bottleneck_analysis_options(self):
         """Test bottleneck analysis with different options."""
@@ -814,8 +1144,17 @@ class TestVisualizationComprehensive(unittest.TestCase):
             filename="transition_heatmap.png"
         )
         
-        # Verify file was created
+        # Test with max_activities parameter
+        self.visualizer.transition_heatmap(
+            prob_matrix,
+            self.task_encoder,
+            filename="transition_heatmap_limited.png",
+            max_activities=3  # Limit to 3 activities
+        )
+        
+        # Verify files were created
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "transition_heatmap.png")))
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "transition_heatmap_limited.png")))
     
     def test_dashboard_creation(self):
         """Test dashboard creation."""
@@ -848,6 +1187,41 @@ class TestVisualizationComprehensive(unittest.TestCase):
         if os.path.exists(dashboard_file):
             # Check that the file is not empty
             self.assertGreater(os.path.getsize(dashboard_file), 1000)
+    
+    def test_visualizer_init_options(self):
+        """Test visualizer initialization with different options."""
+        # Test with different styles
+        for style in ['default', 'dark', 'light']:
+            visualizer = ProcessVisualizer(
+                output_dir=self.test_dir,
+                style=style
+            )
+            
+            # Create a simple visualization to verify it works
+            visualizer.cycle_time_distribution(
+                self.cycle_times, 
+                filename=f"cycle_time_{style}.png"
+            )
+            
+            # Verify file was created
+            self.assertTrue(os.path.exists(os.path.join(self.test_dir, f"cycle_time_{style}.png")))
+        
+        # Test with memory_efficient parameter
+        memory_efficient_viz = ProcessVisualizer(
+            output_dir=self.test_dir,
+            memory_efficient=True,
+            sampling_threshold=50,  # Low threshold to force sampling
+            max_plot_points=25       # Low max points to test sampling
+        )
+        
+        # Create visualization with large dataset
+        memory_efficient_viz.cycle_time_distribution(
+            np.random.exponential(scale=10, size=100),  # Size > sampling_threshold
+            filename="cycle_time_memory_efficient.png"
+        )
+        
+        # Verify file was created
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "cycle_time_memory_efficient.png")))
 
 
 class TestCLIFunctionality(unittest.TestCase):
@@ -905,6 +1279,31 @@ class TestCLIFunctionality(unittest.TestCase):
         self.assertEqual(args.viz_format, 'static')
         self.assertEqual(args.seed, 42)
     
+    @patch('sys.argv')
+    def test_cli_parse_model_specific_args(self, mock_argv):
+        """Test parsing model-specific arguments (new feature)."""
+        import processmine.processmine.cli as cli
+        
+        # Test train mode with model-specific args
+        mock_argv.__getitem__.side_effect = lambda idx: [
+            'processmine',
+            self.test_csv,
+            'train',
+            '--model', 'enhanced_gnn',
+            '--hidden_dim', '32',
+            '--heads', '4',
+            '--attention_type', 'combined'
+        ][idx]
+        mock_argv.__len__.return_value = 10
+        
+        args = cli.parse_arguments()
+        
+        # Verify model-specific args were parsed
+        self.assertEqual(args.model, 'enhanced_gnn')
+        self.assertEqual(args.hidden_dim, 32)
+        self.assertEqual(args.heads, 4)
+        self.assertEqual(args.attention_type, 'combined')
+    
     @patch('torch.cuda.is_available', return_value=False)
     def test_cli_setup_environment(self, mock_cuda):
         """Test environment setup."""
@@ -925,32 +1324,28 @@ class TestCLIFunctionality(unittest.TestCase):
         self.assertTrue(str(output_dir).startswith(self.test_dir))
     
     @patch('processmine.core.runner.run_analysis')
-    def test_cli_run_analysis(self, mock_run_analysis):
-        """Test running analysis through CLI."""
+    def test_cli_main_function(self, mock_run_analysis):
+        """Test main function with different modes."""
         import processmine.processmine.cli as cli
         
-        # Mock the analysis runner
+        # Mock run functions
         mock_run_analysis.return_value = {"result": "success"}
         
         # Create mock args
         args = MagicMock()
         args.data_path = self.test_csv
-        args.bottleneck_threshold = 90.0
-        args.freq_threshold = 5
-        args.max_variants = 10
-        args.skip_conformance = True
+        args.mode = 'analyze'
+        args.output_dir = self.test_dir
         args.debug = False
-        args.cache_dir = None
         
-        # Mock device
-        device = torch.device('cpu')
-        
-        # Test function
-        result = cli.run_analysis(args, device, self.test_dir)
-        
-        # Verify run_analysis was called
-        mock_run_analysis.assert_called_once()
-        self.assertEqual(result, {"result": "success"})
+        # Patch parse_arguments
+        with patch('processmine.processmine.cli.parse_arguments', return_value=args):
+            # Test main function
+            exit_code = cli.main()
+            
+            # Verify run_analysis was called
+            mock_run_analysis.assert_called_once()
+            self.assertEqual(exit_code, 0)
 
 
 def run_tests_with_coverage():
