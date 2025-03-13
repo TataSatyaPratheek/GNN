@@ -520,97 +520,289 @@ def convert_pyg_to_dgl(pyg_data):
             return g
     else:
         raise ValueError("Input data doesn't have PyG format attributes (x, edge_index)")
+    
+
+class MemoryEfficientDataLoader:
     """
-    Convert a PyG graph to DGL format optimized for memory
+    Memory-efficient data loader for DGL graphs with dynamic batch sizing
+    Based on the improvement plan but adapted for DGL
+    """
+    def __init__(
+        self, 
+        dataset, 
+        batch_size=32, 
+        shuffle=True, 
+        pin_memory=True,
+        prefetch_factor=2, 
+        memory_threshold=0.85,
+        drop_last=False,
+        collate_fn=None
+    ):
+        """
+        Initialize memory-efficient data loader
+        
+        Args:
+            dataset: Dataset or list of DGL graphs
+            batch_size: Initial batch size
+            shuffle: Whether to shuffle the data
+            pin_memory: Whether to use pinned memory
+            prefetch_factor: Prefetch factor for asynchronous loading
+            memory_threshold: Memory usage threshold to trigger adjustments
+            drop_last: Whether to drop the last batch if incomplete
+            collate_fn: Custom collate function (defaults to dgl.batch)
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.pin_memory = pin_memory
+        self.prefetch_factor = prefetch_factor
+        self.memory_threshold = memory_threshold
+        self.drop_last = drop_last
+        
+        # Default to DGL batch collate if not provided
+        self.collate_fn = collate_fn or (lambda graphs: dgl.batch(graphs))
+        
+        # Calculate initial indices
+        self.indices = list(range(len(dataset)))
+        if self.shuffle:
+            random.shuffle(self.indices)
+        
+        # Track memory usage for adaptive batch sizing
+        self.batch_size_history = []
+        self.memory_usage_history = []
+        
+        # Track current position
+        self.position = 0
+    
+    def __iter__(self):
+        """Create iterator for batches"""
+        # Reset position
+        self.position = 0
+        
+        # Reshuffle if needed
+        if self.shuffle:
+            random.shuffle(self.indices)
+        
+        return self
+    
+    def __next__(self):
+        """Get next batch with memory-aware adaptive sizing"""
+        if self.position >= len(self.indices):
+            raise StopIteration
+        
+        # Check current memory usage
+        current_memory = self._get_memory_usage()
+        
+        # Adjust batch size if needed
+        current_batch_size = self._adjust_batch_size(current_memory)
+        
+        # Calculate end position for this batch
+        end_position = min(self.position + current_batch_size, len(self.indices))
+        
+        # Handle drop_last
+        if self.drop_last and end_position - self.position < current_batch_size:
+            self.position = len(self.indices)  # Move to end
+            raise StopIteration
+        
+        # Get batch indices
+        batch_indices = self.indices[self.position:end_position]
+        
+        # Update position for next batch
+        self.position = end_position
+        
+        # Track memory and batch size for analysis
+        self.batch_size_history.append(current_batch_size)
+        self.memory_usage_history.append(current_memory)
+        
+        # Extract and collate batch
+        batch = [self.dataset[i] for i in batch_indices]
+        
+        # Run garbage collection if memory usage is high
+        if current_memory > self.memory_threshold * 0.95:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        return self.collate_fn(batch)
+    
+    def __len__(self):
+        """Get number of batches"""
+        if self.drop_last:
+            return len(self.indices) // self.batch_size
+        else:
+            return (len(self.indices) + self.batch_size - 1) // self.batch_size
+    
+    def _get_memory_usage(self):
+        """Get current memory usage as a fraction"""
+        if torch.cuda.is_available():
+            # GPU memory
+            allocated = torch.cuda.memory_allocated()
+            total = torch.cuda.get_device_properties(0).total_memory
+            return allocated / total
+        else:
+            # CPU memory
+            vm = psutil.virtual_memory()
+            return vm.percent / 100.0
+    
+    def _adjust_batch_size(self, memory_usage):
+        """
+        Dynamically adjust batch size based on memory usage
+        
+        Args:
+            memory_usage: Current memory usage as fraction
+            
+        Returns:
+            Adjusted batch size
+        """
+        if memory_usage > self.memory_threshold:
+            # Memory usage too high, reduce batch size
+            reduction_factor = self.memory_threshold / max(memory_usage, 0.001)
+            new_batch_size = max(1, int(self.batch_size * reduction_factor))
+            return new_batch_size
+        elif memory_usage < self.memory_threshold * 0.7:
+            # Memory usage is low, can increase batch size
+            # Be conservative with increases (10% at a time)
+            increase_factor = min(1.1, self.memory_threshold / max(memory_usage, 0.001))
+            new_batch_size = min(len(self.dataset), int(self.batch_size * increase_factor))
+            return new_batch_size
+        else:
+            # Memory usage is in a good range, keep current batch size
+            return self.batch_size
+    
+    def get_memory_stats(self):
+        """Get memory usage statistics"""
+        return {
+            "batch_sizes": self.batch_size_history,
+            "memory_usage": self.memory_usage_history,
+            "average_batch_size": sum(self.batch_size_history) / max(1, len(self.batch_size_history)),
+            "min_batch_size": min(self.batch_size_history) if self.batch_size_history else self.batch_size,
+            "max_batch_size": max(self.batch_size_history) if self.batch_size_history else self.batch_size,
+            "current_memory": self._get_memory_usage()
+        }
+
+
+def adaptive_normalization(features, feature_statistics=None):
+    """
+    Apply appropriate normalization based on data characteristics
+    Implementation of the normalization reconciliation from the improvement plan
     
     Args:
-        pyg_data: PyG graph data
-        device: Target device
+        features: Feature tensor or array to normalize
+        feature_statistics: Optional pre-computed statistics
         
     Returns:
-        DGL graph or batched graph
+        Normalized features
     """
-    import torch
-    import dgl
-    
-    # Check if this is a batched PyG graph
-    if hasattr(pyg_data, 'batch'):
-        # Extract batching information
-        batch_size = pyg_data.batch.max().item() + 1
-        graphs = []
-        
-        # Process each graph in the batch
-        for i in range(batch_size):
-            # Get nodes for this graph
-            mask = pyg_data.batch == i
-            node_indices = torch.where(mask)[0]
-            
-            # Skip empty graphs
-            if len(node_indices) == 0:
-                continue
-                
-            # Get node features
-            x = pyg_data.x[mask]
-            
-            # Get edges for this graph
-            edge_mask = torch.isin(pyg_data.edge_index[0], node_indices) & \
-                       torch.isin(pyg_data.edge_index[1], node_indices)
-            
-            # Create DGL graph
-            if edge_mask.sum() > 0:
-                # Get edges with mapping to local indices
-                edge_index = pyg_data.edge_index[:, edge_mask]
-                
-                # Create node index mapping
-                idx_map = {idx.item(): new_idx for new_idx, idx in enumerate(node_indices)}
-                
-                # Map edge indices efficiently
-                src = torch.tensor([idx_map[idx.item()] for idx in edge_index[0]])
-                dst = torch.tensor([idx_map[idx.item()] for idx in edge_index[1]])
-                
-                # Create DGL graph
-                g = dgl.graph((src, dst), num_nodes=len(node_indices))
-                
-                # Add node features
-                g.ndata['feat'] = x
-                
-                # Add node labels if available
-                if hasattr(pyg_data, 'y') and pyg_data.y is not None:
-                    g.ndata['label'] = pyg_data.y[mask]
-                
-                # Add edge features if available
-                if hasattr(pyg_data, 'edge_attr') and pyg_data.edge_attr is not None:
-                    g.edata['feat'] = pyg_data.edge_attr[edge_mask]
-            else:
-                # Create graph with only nodes
-                g = dgl.graph(([], []), num_nodes=len(node_indices))
-                g.ndata['feat'] = x
-                
-                # Add node labels if available
-                if hasattr(pyg_data, 'y') and pyg_data.y is not None:
-                    g.ndata['label'] = pyg_data.y[mask]
-            
-            graphs.append(g)
-        
-        # Return batched graph
-        return dgl.batch(graphs).to(device) if graphs else None
+    # Convert to numpy if tensor
+    is_tensor = torch.is_tensor(features)
+    if is_tensor:
+        device = features.device
+        features_np = features.cpu().numpy()
     else:
-        # Single PyG graph
-        x = pyg_data.x
-        edge_index = pyg_data.edge_index
+        features_np = features
+    
+    # Calculate statistics if not provided
+    if feature_statistics is None:
+        feature_statistics = {
+            'mean': np.mean(features_np, axis=0),
+            'std': np.std(features_np, axis=0),
+            'min': np.min(features_np, axis=0),
+            'max': np.max(features_np, axis=0),
+            'skewness': _calculate_skewness(features_np)
+        }
+    
+    # Get statistics
+    skewness = feature_statistics['skewness']
+    min_vals = feature_statistics['min']
+    max_vals = feature_statistics['max']
+    
+    # Calculate range ratio (avoiding division by zero)
+    epsilon = 1e-8
+    range_ratio = np.divide(
+        max_vals, 
+        np.maximum(min_vals, epsilon),
+        out=np.ones_like(max_vals),
+        where=min_vals>epsilon
+    )
+    
+    # Choose normalization strategy based on data properties
+    if np.any(np.abs(skewness) > 1.5) or np.any(range_ratio > 10):
+        # Highly skewed with large range differences - use robust scaling
+        median = np.median(features_np, axis=0)
+        q1 = np.percentile(features_np, 25, axis=0)
+        q3 = np.percentile(features_np, 75, axis=0)
+        iqr = q3 - q1
+        # Avoid division by zero
+        iqr = np.maximum(iqr, epsilon)
+        normalized = (features_np - median) / iqr
+    elif np.any(np.abs(features_np) > 5.0):
+        # Large magnitudes - use L2 normalization
+        norms = np.sqrt(np.sum(features_np**2, axis=1, keepdims=True))
+        norms = np.maximum(norms, epsilon)  # Avoid division by zero
+        normalized = features_np / norms
+    else:
+        # Well-behaved features - use MinMax
+        min_vals = feature_statistics['min']
+        max_vals = feature_statistics['max']
+        range_vals = np.maximum(max_vals - min_vals, epsilon)
+        normalized = (features_np - min_vals) / range_vals
+    
+    # Convert back to tensor if input was tensor
+    if is_tensor:
+        normalized = torch.tensor(normalized, dtype=features.dtype, device=device)
+    
+    return normalized
+
+def _calculate_skewness(arr):
+    """Calculate skewness of array elements along first axis"""
+    mean = np.mean(arr, axis=0)
+    std = np.std(arr, axis=0)
+    # Avoid division by zero
+    std = np.maximum(std, 1e-8)
+    
+    # Calculate skewness (third moment)
+    n = arr.shape[0]
+    m3 = np.sum((arr - mean)**3, axis=0) / n
+    return m3 / (std**3)
+
+def get_pyg_compatible_attributes(g):
+    """
+    Create PyG-compatible attributes from a DGL graph for backward compatibility
+    
+    Args:
+        g: DGL graph
         
-        # Create DGL graph
-        g = dgl.graph((edge_index[0], edge_index[1]), num_nodes=x.shape[0])
-        
-        # Add node features
-        g.ndata['feat'] = x
-        
-        # Add node labels if available
-        if hasattr(pyg_data, 'y') and pyg_data.y is not None:
-            g.ndata['label'] = pyg_data.y
-        
-        # Add edge features if available
-        if hasattr(pyg_data, 'edge_attr') and pyg_data.edge_attr is not None:
-            g.edata['feat'] = pyg_data.edge_attr
-        
-        return g.to(device)
+    Returns:
+        Dictionary with PyG-style attributes
+    """
+    compat_dict = {}
+    
+    # Basic properties
+    compat_dict['num_nodes'] = g.num_nodes()
+    compat_dict['num_edges'] = g.num_edges()
+    
+    # Node features
+    if 'feat' in g.ndata:
+        compat_dict['x'] = g.ndata['feat']
+    
+    # Edge list (PyG style)
+    src, dst = g.edges()
+    compat_dict['edge_index'] = torch.stack([src, dst], dim=0)
+    
+    # Edge features
+    if 'feat' in g.edata:
+        compat_dict['edge_attr'] = g.edata['feat']
+    
+    # Labels
+    if 'label' in g.ndata:
+        compat_dict['y'] = g.ndata['label']
+    
+    # Batch information if available
+    if hasattr(g, 'batch_num_nodes'):
+        # Create PyG-style batch tensor
+        batch = []
+        for i, num_nodes in enumerate(g.batch_num_nodes()):
+            batch.extend([i] * num_nodes)
+        compat_dict['batch'] = torch.tensor(batch, device=g.device)
+    
+    return compat_dict

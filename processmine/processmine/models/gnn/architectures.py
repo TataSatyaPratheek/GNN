@@ -1372,3 +1372,334 @@ class CombinedGATLayer(nn.Module):
         diversity_loss = (global_similarity * 0.7 - avg_entropy * 0.3) * self.diversity_weight
         
         return diversity_loss
+    
+class ProcessLoss(nn.Module):
+    """
+    Multi-objective loss function for process mining with DGL compatibility
+    """
+    def __init__(self, task_weight=0.5, time_weight=0.3, structure_weight=0.2):
+        """
+        Initialize process loss with component weights
+        
+        Args:
+            task_weight: Weight for task prediction loss
+            time_weight: Weight for time prediction loss
+            structure_weight: Weight for structural loss
+        """
+        super().__init__()
+        self.task_weight = task_weight
+        self.time_weight = time_weight
+        self.structure_weight = structure_weight
+        self.task_loss = nn.CrossEntropyLoss()
+        self.time_loss = nn.MSELoss()
+    
+    def forward(self, task_pred, task_target, g=None, time_pred=None, time_target=None, 
+                structure_info=None):
+        """
+        Forward pass with multiple loss components
+        
+        Args:
+            task_pred: Task prediction logits
+            task_target: Task ground truth
+            g: DGL graph or batched graph (for structural loss)
+            time_pred: Time prediction (optional)
+            time_target: Time ground truth (optional)
+            structure_info: Additional structural information (optional)
+            
+        Returns:
+            Tuple of (combined_loss, component_dict)
+        """
+        # Task prediction loss
+        task_loss = self.task_loss(task_pred, task_target)
+        
+        # Initialize other losses
+        time_loss = torch.tensor(0.0, device=task_pred.device)
+        structure_loss = torch.tensor(0.0, device=task_pred.device)
+        
+        # Cycle time prediction loss if available
+        if time_pred is not None and time_target is not None:
+            time_loss = self.time_loss(time_pred, time_target)
+        
+        # Structural loss if graph and embeddings available
+        if g is not None and 'h' in g.ndata and structure_info is not None:
+            # Extract critical path nodes if provided
+            critical_path = structure_info.get('critical_path', [])
+            if critical_path:
+                # Get node embeddings for critical path nodes
+                if g.batch_size > 1:
+                    # For batched graph, we need to map the critical path nodes
+                    # to the correct positions in the batched graph
+                    batch_indices = structure_info.get('batch_indices', [])
+                    if batch_indices:
+                        embeddings = g.ndata['h']
+                        cp_embeddings = []
+                        for node_idx, batch_idx in zip(critical_path, batch_indices):
+                            # Calculate offset in the batched graph
+                            offset = 0
+                            for i in range(batch_idx):
+                                offset += g.batch_num_nodes()[i]
+                            cp_embeddings.append(embeddings[offset + node_idx])
+                        
+                        if cp_embeddings:
+                            cp_embeddings = torch.stack(cp_embeddings)
+                            # Minimize distance between consecutive nodes in critical path
+                            diffs = cp_embeddings[1:] - cp_embeddings[:-1]
+                            structure_loss = torch.mean(torch.norm(diffs, dim=1))
+                else:
+                    # For single graph, just index directly
+                    embeddings = g.ndata['h']
+                    cp_embeddings = embeddings[critical_path]
+                    # Minimize distance between consecutive nodes in critical path
+                    diffs = cp_embeddings[1:] - cp_embeddings[:-1]
+                    structure_loss = torch.mean(torch.norm(diffs, dim=1))
+        
+        # Combine losses with weights
+        combined_loss = (
+            self.task_weight * task_loss +
+            self.time_weight * time_loss +
+            self.structure_weight * structure_loss
+        )
+        
+        return combined_loss, {
+            'task_loss': task_loss.item(),
+            'time_loss': time_loss.item(),
+            'structure_loss': structure_loss.item(),
+            'combined_loss': combined_loss.item()
+        }
+
+class PositionalEncoding(nn.Module):
+    """
+    Positional encoding module for graph neural networks
+    Implements the position-aware features described in the improvement plan
+    """
+    def __init__(self, input_dim, pos_dim=16, max_len=1000):
+        """
+        Initialize positional encoding module
+        
+        Args:
+            input_dim: Dimension of input features
+            pos_dim: Dimension of positional encoding
+            max_len: Maximum sequence length
+        """
+        super().__init__()
+        self.input_dim = input_dim
+        self.pos_dim = pos_dim
+        self.max_len = max_len
+        
+        # Learnable position embedding
+        self.pos_embedding = nn.Embedding(max_len, pos_dim)
+        
+        # Projection to combine with input
+        self.pos_projection = nn.Linear(input_dim + pos_dim, input_dim)
+        
+        # Initialize weights
+        nn.init.xavier_uniform_(self.pos_projection.weight)
+        nn.init.zeros_(self.pos_projection.bias)
+    
+    def forward(self, x, positions=None):
+        """
+        Forward pass
+        
+        Args:
+            x: Input features [batch_size, seq_len, input_dim] or [num_nodes, input_dim]
+            positions: Optional explicit positions. If None, uses node indices.
+            
+        Returns:
+            Position-enhanced features [batch_size, seq_len, input_dim] or [num_nodes, input_dim]
+        """
+        if x.dim() == 2:
+            # [num_nodes, input_dim]
+            num_nodes = x.size(0)
+            if positions is None:
+                # Use node indices as positions
+                positions = torch.arange(num_nodes, device=x.device)
+            
+            # Clamp positions to max_len
+            positions = torch.clamp(positions, 0, self.max_len - 1)
+            
+            # Get position embeddings [num_nodes, pos_dim]
+            pos_emb = self.pos_embedding(positions)
+            
+            # Concatenate with input features [num_nodes, input_dim + pos_dim]
+            enhanced = torch.cat([x, pos_emb], dim=-1)
+            
+            # Project back to original dimension [num_nodes, input_dim]
+            return self.pos_projection(enhanced)
+            
+        elif x.dim() == 3:
+            # [batch_size, seq_len, input_dim]
+            batch_size, seq_len = x.size(0), x.size(1)
+            if positions is None:
+                # Use sequence indices as positions
+                positions = torch.arange(seq_len, device=x.device).expand(batch_size, -1)
+            
+            # Clamp positions to max_len
+            positions = torch.clamp(positions, 0, self.max_len - 1)
+            
+            # Get position embeddings [batch_size, seq_len, pos_dim]
+            pos_emb = self.pos_embedding(positions)
+            
+            # Concatenate with input features [batch_size, seq_len, input_dim + pos_dim]
+            enhanced = torch.cat([x, pos_emb], dim=-1)
+            
+            # Project back to original dimension [batch_size, seq_len, input_dim]
+            return self.pos_projection(enhanced)
+        
+        else:
+            raise ValueError(f"Unsupported input dimension: {x.dim()}")
+
+
+class ExpressiveGATConv(nn.Module):
+    """
+    More expressive GAT convolution with additional features as mentioned in the improvement plan
+    Implemented with DGL for performance and memory efficiency
+    """
+    def __init__(
+        self, 
+        in_dim, 
+        out_dim, 
+        num_heads=4, 
+        feat_drop=0.0, 
+        attn_drop=0.0, 
+        negative_slope=0.2,
+        residual=True,
+        allow_zero_in_degree=False
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.num_heads = num_heads
+        self.feat_drop = feat_drop
+        self.attn_drop = attn_drop
+        self.negative_slope = negative_slope
+        self.residual = residual
+        self.allow_zero_in_degree = allow_zero_in_degree
+        
+        # Multi-head attention
+        self.fc = nn.Linear(in_dim, out_dim * num_heads, bias=False)
+        self.attn_l = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
+        self.attn_r = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
+        self.attn_e = nn.Parameter(torch.FloatTensor(1, num_heads, out_dim))
+        
+        # Additional expressive components from improvement plan
+        self.gate = nn.Linear(in_dim, num_heads)
+        self.feat_proj = nn.Linear(in_dim, out_dim * num_heads)
+        
+        # Residual connection
+        if residual:
+            if in_dim != out_dim * num_heads:
+                self.res_fc = nn.Linear(in_dim, out_dim * num_heads, bias=False)
+            else:
+                self.res_fc = nn.Identity()
+        else:
+            self.register_buffer('res_fc', None)
+        
+        # Dropout
+        self.feat_drop = nn.Dropout(feat_drop)
+        self.attn_drop = nn.Dropout(attn_drop)
+        
+        # Activation
+        self.leaky_relu = nn.LeakyReLU(negative_slope)
+        
+        # Initialize parameters
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        """Initialize learnable parameters"""
+        gain = nn.init.calculate_gain('relu')
+        nn.init.xavier_normal_(self.fc.weight, gain=gain)
+        nn.init.xavier_normal_(self.feat_proj.weight, gain=gain)
+        nn.init.xavier_normal_(self.attn_l, gain=gain)
+        nn.init.xavier_normal_(self.attn_r, gain=gain)
+        nn.init.xavier_normal_(self.attn_e, gain=gain)
+        nn.init.xavier_normal_(self.gate.weight, gain=gain)
+        
+        if isinstance(self.res_fc, nn.Linear):
+            nn.init.xavier_normal_(self.res_fc.weight, gain=gain)
+    
+    def forward(self, graph, feat, edge_feat=None, get_attention=False):
+        """
+        Forward computation with DGL
+        
+        Args:
+            graph: DGL graph object
+            feat: Node features
+            edge_feat: Edge features (optional)
+            get_attention: Whether to return attention weights
+            
+        Returns:
+            Updated node features or tuple of (features, attention weights)
+        """
+        with graph.local_scope():
+            # Feature dropout
+            h_src = h_dst = self.feat_drop(feat)
+            
+            # Feature transformation
+            feat_src = feat_dst = self.fc(h_src).view(-1, self.num_heads, self.out_dim)
+            
+            # Additional feature projection (more expressive)
+            feat_proj = self.feat_proj(h_src).view(-1, self.num_heads, self.out_dim)
+            
+            # Gating mechanism for feature importance
+            gate = torch.sigmoid(self.gate(h_src)).view(-1, self.num_heads, 1)
+            feat_proj = feat_proj * gate
+            
+            # Prepare for attention
+            el = (feat_src * self.attn_l).sum(dim=-1).unsqueeze(-1)
+            er = (feat_dst * self.attn_r).sum(dim=-1).unsqueeze(-1)
+            
+            # Add to graph
+            graph.srcdata.update({'ft': feat_src, 'el': el, 'proj': feat_proj})
+            graph.dstdata.update({'er': er})
+            
+            # Handle edge features if provided
+            if edge_feat is not None:
+                if edge_feat.dim() != 3:
+                    # Reshape edge features to [num_edges, num_heads, out_dim]
+                    edge_feat = edge_feat.view(-1, 1, 1).expand(-1, self.num_heads, 1)
+                graph.edata.update({'ee': edge_feat})
+                
+                # Compute edge attention
+                def edge_attention(edges):
+                    ee = (edges.data['ee'] * self.attn_e).sum(dim=-1).unsqueeze(-1)
+                    a = self.leaky_relu(edges.src['el'] + edges.dst['er'] + ee)
+                    return {'a': self.attn_drop(a)}
+            else:
+                # Standard attention calculation
+                def edge_attention(edges):
+                    a = self.leaky_relu(edges.src['el'] + edges.dst['er'])
+                    return {'a': self.attn_drop(a)}
+            
+            # Apply attention
+            graph.apply_edges(edge_attention)
+            
+            # Edge softmax for normalized attention
+            graph.edata['a'] = dgl.ops.edge_softmax(graph, graph.edata['a'])
+            
+            # Message passing
+            def message_func(edges):
+                # Combine features with projected features for more expressivity
+                combined = edges.src['ft'] + edges.src['proj']
+                return {'a': edges.data['a'], 'm': combined}
+            
+            def reduce_func(nodes):
+                # Weighted sum based on attention
+                alpha = nodes.mailbox['a']
+                h = torch.sum(alpha * nodes.mailbox['m'], dim=1)
+                return {'h': h}
+            
+            # Update all nodes
+            graph.update_all(message_func, reduce_func)
+            
+            # Get updated features
+            h = graph.dstdata['h']
+            
+            # Apply residual connection if specified
+            if self.residual:
+                h = h + self.res_fc(feat)
+            
+            # Return attention weights if requested
+            if get_attention:
+                return h, graph.edata['a']
+            else:
+                return h

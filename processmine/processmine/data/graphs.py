@@ -422,7 +422,7 @@ def _log_graph_statistics(graphs, stats, start_time, verbose):
 def build_heterogeneous_graph(
     df: pd.DataFrame, 
     node_types: Optional[Dict[str, List[str]]] = None, 
-    edge_types: Optional[List[str]] = None, 
+    edge_types: Optional[List[Tuple[str, str, str]]] = None,  # Updated to use canonical DGL edge type tuples
     batch_size: int = 1000, 
     verbose: bool = True,
     use_edge_attr: bool = True
@@ -434,8 +434,8 @@ def build_heterogeneous_graph(
         df: Process data dataframe
         node_types: Dictionary mapping node types to feature columns
                     (e.g., {'task': ['task_id', 'feat_task_id'], 'resource': ['resource_id']})
-        edge_types: List of edge types to create
-                    (e.g., ['task_to_task', 'task_to_resource', 'resource_to_task'])
+        edge_types: List of edge types in (src_type, relation, dst_type) format
+                    (e.g., [('task', 'to', 'task'), ('task', 'uses', 'resource')])
         batch_size: Batch size for memory-efficient processing
         verbose: Whether to print progress information
         use_edge_attr: Whether to include edge attributes
@@ -459,7 +459,11 @@ def build_heterogeneous_graph(
     
     # Define default edge types if not provided
     if edge_types is None:
-        edge_types = ["task_to_task", "task_to_resource", "resource_to_task"]
+        edge_types = [
+            ('task', 'to', 'task'),
+            ('task', 'uses', 'resource'),
+            ('resource', 'performs', 'task')
+        ]
     
     # Get unique case IDs
     case_ids = df["case_id"].unique()
@@ -483,16 +487,13 @@ def build_heterogeneous_graph(
         
         # Process each case
         for case_id, case_group in batch_df.groupby("case_id"):
-            # Dictionaries to store node features by type
+            # Dictionaries to store node features and mappings by type
             node_features = {}
+            node_mappings = {}
+            node_counts = {}
             
-            # Dictionary to map node IDs to indices
-            node_indices = {}
-            
-            # Dictionaries to store edge information by type
-            edge_srcs = {}
-            edge_dsts = {}
-            edge_features = {}
+            # Data dictionaries for heterograph construction - using canonical DGL format
+            graph_data = {}
             
             # Extract nodes and features for each node type
             for node_type, feature_cols in node_types.items():
@@ -504,155 +505,178 @@ def build_heterogeneous_graph(
                         logger.warning(f"No valid columns found for node type {node_type}")
                     continue
                 
-                # Get unique node IDs
+                # Get unique node IDs based on node type
                 if node_type == "task":
-                    node_ids = case_group["task_id"].values
                     id_col = "task_id"
                 elif node_type == "resource":
-                    node_ids = case_group["resource_id"].values
                     id_col = "resource_id"
                 else:
                     # For custom node types, use the first column as ID
                     id_col = valid_cols[0]
-                    node_ids = case_group[id_col].values
+                
+                # Get unique nodes with features
+                unique_nodes = case_group[id_col].unique()
+                node_counts[node_type] = len(unique_nodes)
+                
+                # Create mapping from original ID to graph node index
+                node_mappings[node_type] = {node_id: idx for idx, node_id in enumerate(unique_nodes)}
                 
                 # Extract features
-                if len(valid_cols) > 1:
-                    # Use all feature columns
-                    features = case_group[valid_cols].values
+                feat_cols = [col for col in valid_cols if col != id_col]
+                if feat_cols:
+                    # Create feature matrix, handle each unique node once
+                    features = np.zeros((len(unique_nodes), len(feat_cols)), dtype=np.float32)
+                    
+                    for idx, node_id in enumerate(unique_nodes):
+                        # Use the first occurrence of this node for features
+                        node_data = case_group[case_group[id_col] == node_id].iloc[0]
+                        features[idx] = node_data[feat_cols].values
                 else:
-                    # Use ID column as feature
-                    features = case_group[id_col].values.reshape(-1, 1)
+                    # Use node ID as single feature
+                    features = np.array(unique_nodes).reshape(-1, 1).astype(np.float32)
                 
-                # Convert to tensors
+                # Convert to tensor
                 node_features[node_type] = torch.tensor(features, dtype=torch.float32)
-                
-                # Map node IDs to indices
-                for idx, node_id in enumerate(node_ids):
-                    if node_type not in node_indices:
-                        node_indices[node_type] = {}
-                    node_indices[node_type][node_id] = idx
             
             # Process edges for each edge type
-            for edge_type in edge_types:
+            for src_type, rel_type, dst_type in edge_types:
+                # Skip if source or destination type is missing
+                if src_type not in node_mappings or dst_type not in node_mappings:
+                    continue
+                
+                # Create edge lists and attributes
                 src_nodes = []
                 dst_nodes = []
-                attrs = []
+                edge_attrs = []
                 
-                if edge_type == "task_to_task":
-                    # Sequential task transitions
-                    if "task" in node_indices:
-                        n_tasks = len(case_group)
-                        if n_tasks > 1:
-                            # Create sequential edges
-                            for i in range(n_tasks - 1):
-                                src_nodes.append(i)
-                                dst_nodes.append(i + 1)
-                            
-                            # Add edge features if enabled
-                            if use_edge_attr and "timestamp" in case_group.columns:
-                                timestamps = case_group["timestamp"].values
-                                for i in range(n_tasks - 1):
-                                    time_diff = (timestamps[i+1] - timestamps[i]) / np.timedelta64(1, 'h')
-                                    attrs.append([float(time_diff)])
-                
-                elif edge_type == "task_to_resource":
-                    # Connect tasks to resources
-                    if "task" in node_indices and "resource" in node_indices:
-                        for idx, row in case_group.iterrows():
-                            if hasattr(row, "task_id") and hasattr(row, "resource_id"):
-                                task_id = row["task_id"]
-                                resource_id = row["resource_id"]
-                                
-                                if task_id in node_indices["task"] and resource_id in node_indices["resource"]:
-                                    src_nodes.append(node_indices["task"][task_id])
-                                    dst_nodes.append(node_indices["resource"][resource_id])
-                                    
-                                    # Add placeholder edge features if enabled
-                                    if use_edge_attr:
-                                        attrs.append([1.0])  # Default edge attribute
-                
-                elif edge_type == "resource_to_task":
-                    # Just reverse of task_to_resource
-                    if "task_to_resource" in edge_srcs and "task_to_resource" in edge_dsts:
-                        src_nodes = edge_dsts["task_to_resource"]
-                        dst_nodes = edge_srcs["task_to_resource"]
+                if src_type == dst_type == "task" and rel_type == "to":
+                    # Task to task transitions (sequential in process)
+                    task_ids = case_group["task_id"].values
+                    task_map = node_mappings["task"]
+                    
+                    for i in range(len(task_ids) - 1):
+                        src_id = task_ids[i]
+                        dst_id = task_ids[i+1]
                         
-                        # Copy attributes if present
-                        if use_edge_attr and "task_to_resource" in edge_features:
-                            attrs = edge_features["task_to_resource"]
+                        if src_id in task_map and dst_id in task_map:
+                            src_nodes.append(task_map[src_id])
+                            dst_nodes.append(task_map[dst_id])
+                            
+                            # Add edge attributes if enabled
+                            if use_edge_attr and "timestamp" in case_group.columns:
+                                time_diff = (case_group["timestamp"].iloc[i+1] - case_group["timestamp"].iloc[i]).total_seconds() / 3600
+                                edge_attrs.append([float(time_diff)])
                 
-                # Store the edge information if we have edges
+                elif src_type == "task" and dst_type == "resource" and rel_type == "uses":
+                    # Task uses resource relationship
+                    for _, row in case_group.iterrows():
+                        task_id = row["task_id"]
+                        resource_id = row["resource_id"]
+                        
+                        task_map = node_mappings["task"]
+                        resource_map = node_mappings["resource"]
+                        
+                        if task_id in task_map and resource_id in resource_map:
+                            src_nodes.append(task_map[task_id])
+                            dst_nodes.append(resource_map[resource_id])
+                            
+                            # Add edge attributes if needed
+                            if use_edge_attr:
+                                edge_attrs.append([1.0])  # Default weight
+                
+                elif src_type == "resource" and dst_type == "task" and rel_type == "performs":
+                    # Resource performs task relationship
+                    for _, row in case_group.iterrows():
+                        resource_id = row["resource_id"]
+                        task_id = row["task_id"]
+                        
+                        resource_map = node_mappings["resource"]
+                        task_map = node_mappings["task"]
+                        
+                        if resource_id in resource_map and task_id in task_map:
+                            src_nodes.append(resource_map[resource_id])
+                            dst_nodes.append(task_map[task_id])
+                            
+                            # Add edge attributes if needed
+                            if use_edge_attr:
+                                edge_attrs.append([1.0])  # Default weight
+                
+                # Add other custom edge types here...
+                
+                # Store the edge data if we have edges
                 if src_nodes and dst_nodes:
-                    edge_srcs[edge_type] = src_nodes
-                    edge_dsts[edge_type] = dst_nodes
+                    # Create canonical edge type tuple for heterograph
+                    etype = (src_type, rel_type, dst_type)
+                    graph_data[etype] = (src_nodes, dst_nodes)
                     
-                    # FIX: Check properly if attrs has elements before converting to tensor
-                    if use_edge_attr and len(attrs) > 0:
-                        edge_features[edge_type] = torch.tensor(attrs, dtype=torch.float32)
+                    # Store edge attributes if available
+                    if use_edge_attr and edge_attrs:
+                        if 'edge_features' not in locals():
+                            edge_features = {}
+                        edge_features[etype] = torch.tensor(edge_attrs, dtype=torch.float32)
             
-            # Create DGL heterogeneous graph
-            if node_features and edge_srcs:
-                # Check what node types and edge types we actually have data for
-                available_ntypes = list(node_features.keys())
-                available_etypes = []
+            # Create heterogeneous graph if we have nodes and edges
+            if node_features and graph_data:
+                # Specify number of nodes for each type to avoid issues with isolated nodes
+                num_nodes_dict = {ntype: count for ntype, count in node_counts.items()}
                 
-                # Validate edge types
-                for e_type in edge_srcs.keys():
-                    if "_to_" in e_type:
-                        src_type, dst_type = e_type.split("_to_")
-                        if src_type in available_ntypes and dst_type in available_ntypes:
-                            available_etypes.append((src_type, e_type, dst_type))
+                # Create the heterograph with appropriate number of nodes
+                g = dgl.heterograph(graph_data, num_nodes_dict=num_nodes_dict)
                 
-                # Create the graph data dict
-                graph_data = {}
-                for src_type, e_type, dst_type in available_etypes:
-                    src = edge_srcs[e_type]
-                    dst = edge_dsts[e_type]
-                    if src and dst:
-                        graph_data[(src_type, e_type, dst_type)] = (src, dst)
+                # Add node features
+                for ntype, features in node_features.items():
+                    if g.num_nodes(ntype) > 0:
+                        g.nodes[ntype].data['feat'] = features
                 
-                # Create heterogeneous graph if we have edges
-                if graph_data:
-                    g = dgl.heterograph(graph_data)
+                # Add edge features if available
+                if use_edge_attr and 'edge_features' in locals():
+                    for etype, features in edge_features.items():
+                        if g.num_edges(etype) > 0:
+                            g.edges[etype].data['feat'] = features
+                
+                # Add node labels (for task nodes)
+                if 'task' in node_features and 'next_task' in case_group.columns:
+                    # Create label mapping from task IDs to indices
+                    task_map = node_mappings['task']
+                    task_ids = list(task_map.keys())
                     
-                    # Add node features
-                    for ntype, features in node_features.items():
-                        if g.num_nodes(ntype) > 0:
-                            g.nodes[ntype].data['feat'] = features
+                    # Initialize labels tensor with -1 (padding value)
+                    labels = torch.full((len(task_ids),), -1, dtype=torch.long)
                     
-                    # Add edge features
-                    for src_type, e_type, dst_type in available_etypes:
-                        if e_type in edge_features and g.num_edges(e_type) > 0:
-                            g.edges[e_type].data['feat'] = edge_features[e_type]
+                    # Fill in known labels
+                    for i, task_id in enumerate(task_ids):
+                        # Find rows where this is the current task
+                        task_rows = case_group[case_group['task_id'] == task_id]
+                        if not task_rows.empty and 'next_task' in task_rows.columns:
+                            # Use the first valid next_task as label
+                            next_task = task_rows['next_task'].iloc[0]
+                            if not pd.isna(next_task):
+                                labels[i] = int(next_task)
                     
-                    # Add graph-level label
-                    if 'task' in g.ntypes and 'next_task' in df.columns:
-                        task_labels = torch.tensor(case_group["next_task"].values, dtype=torch.long)
-                        if len(task_labels) == g.number_of_nodes('task'):
-                            g.nodes['task'].data['label'] = task_labels
-                    
-                    # Add metadata
-                    het_graphs.append(g)
-                else:
-                    # No edges, create simple graph with just nodes
-                    if verbose:
-                        logger.warning(f"No valid edges found for case {case_id}, creating node-only graph")
-                    
-                    # Create a minimal graph with just one node type
-                    g = dgl.heterograph({("task", "self", "task"): ([], [])})
-                    
-                    # Add node features for task type
-                    if "task" in node_features:
-                        g.nodes['task'].data['feat'] = node_features["task"]
-                        if 'next_task' in case_group.columns:
-                            g.nodes['task'].data['label'] = torch.tensor(case_group["next_task"].values, dtype=torch.long)
-                    
-                    het_graphs.append(g)
+                    # Only assign valid labels (not -1)
+                    valid_mask = labels >= 0
+                    if valid_mask.any():
+                        g.nodes['task'].data['label'] = labels.masked_fill(~valid_mask, 0)
+                
+                het_graphs.append(g)
             else:
-                # No valid nodes or edges, log warning
+                # No valid edges, create minimal graph with just nodes
                 if verbose:
-                    logger.warning(f"No valid nodes or edges found for case {case_id}")
+                    logger.warning(f"No valid edges found for case {case_id}, creating node-only heterograph")
+                
+                # Create a minimal heterograph with at least one node type
+                for ntype, count in node_counts.items():
+                    if count > 0:
+                        # Create heterograph with single node type and no edges
+                        g = dgl.heterograph({(ntype, 'self', ntype): ([], [])}, 
+                                            num_nodes_dict={ntype: count})
+                        
+                        # Add features for this node type
+                        if ntype in node_features:
+                            g.nodes[ntype].data['feat'] = node_features[ntype]
+                        
+                        het_graphs.append(g)
+                        break
         
         # Update progress
         progress_tracker(batch_end - i)
@@ -660,5 +684,27 @@ def build_heterogeneous_graph(
     # Log completion
     if verbose:
         logger.info(f"Built {len(het_graphs)} heterogeneous graphs in {time.time() - start_time:.2f}s")
+        
+        # Log graph statistics
+        if het_graphs:
+            total_nodes = 0
+            total_edges = 0
+            node_types_used = set()
+            edge_types_used = set()
+            
+            for g in het_graphs[:min(100, len(het_graphs))]:  # Sample at most 100 graphs
+                for ntype in g.ntypes:
+                    total_nodes += g.num_nodes(ntype)
+                    node_types_used.add(ntype)
+                
+                for etype in g.canonical_etypes:
+                    total_edges += g.num_edges(etype)
+                    edge_types_used.add(etype)
+            
+            logger.info(f"Graph statistics (sample of {min(100, len(het_graphs))} graphs):")
+            logger.info(f"  Average nodes per graph: {total_nodes / min(100, len(het_graphs)):.1f}")
+            logger.info(f"  Average edges per graph: {total_edges / min(100, len(het_graphs)):.1f}")
+            logger.info(f"  Node types used: {sorted(node_types_used)}")
+            logger.info(f"  Edge types used: {sorted(edge_types_used)}")
     
     return het_graphs
