@@ -1,16 +1,18 @@
 """
 Memory-efficient LSTM model for next activity prediction in process mining.
-Supports packed sequences, attention, and efficient batch processing.
-Fully compatible with DGL graphs while maintaining PyG backward compatibility.
+Supports DGL graphs, packed sequences, attention, and efficient batch processing.
 """
 
+import logger
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import dgl
 from typing import Dict, List, Tuple, Optional, Union, Any
 
 from processmine.models.base import BaseModel
+
 
 class NextActivityLSTM(BaseModel):
     """
@@ -98,7 +100,7 @@ class NextActivityLSTM(BaseModel):
         Forward pass with efficient sequence handling
         
         Args:
-            x: Input tensor [batch_size, seq_len] with task IDs or graph
+            x: Input tensor [batch_size, seq_len] with task IDs or DGL graph
             seq_lengths: Sequence lengths [batch_size]
             
         Returns:
@@ -108,11 +110,6 @@ class NextActivityLSTM(BaseModel):
         if hasattr(x, 'ndata') and 'feat' in x.ndata:
             # Extract case-level sequences using DGL batched graph
             return self._process_dgl_graph(x)
-        
-        # Handle PyG Data objects for backward compatibility
-        elif hasattr(x, 'x') and hasattr(x, 'batch'):
-            # Extract case-level sequences using batch information
-            return self._process_graph_data(x)
         
         # Handle list of variable-length sequences
         if isinstance(x, list):
@@ -249,7 +246,7 @@ class NextActivityLSTM(BaseModel):
     
     def _process_dgl_graph(self, g):
         """
-        Process DGL graph by extracting case-level sequences with DGL-optimized approach
+        Process DGL graph by extracting case-level sequences
         
         Args:
             g: DGL graph or batched graph
@@ -265,20 +262,20 @@ class NextActivityLSTM(BaseModel):
         seq_lengths = []
         
         if is_batched:
-            # Get number of nodes per graph using DGL's batch API
+            # Get number of nodes per graph
             batch_num_nodes = g.batch_num_nodes()
             
             # Process each graph in the batch
             node_offset = 0
             for graph_idx, num_nodes in enumerate(batch_num_nodes):
-                # Extract nodes for this graph using DGL's slice operations
-                graph_node_features = g.ndata['feat'][node_offset:node_offset+num_nodes]
+                # Extract nodes for this graph
+                graph_nodes = g.ndata['feat'][node_offset:node_offset+num_nodes]
                 
-                # Extract task IDs - first column is typically task ID if multiple features
-                if graph_node_features.size(1) > 1:
-                    task_ids = graph_node_features[:, 0].long()
+                # Extract task IDs - assume first column contains task ID if multiple features
+                if graph_nodes.size(1) > 1:
+                    task_ids = graph_nodes[:, 0].long()
                 else:
-                    task_ids = graph_node_features.squeeze(-1).long()
+                    task_ids = graph_nodes.squeeze(-1).long()
                 
                 # Handle possible negative or out-of-range IDs
                 task_ids = torch.clamp(task_ids, min=0, max=self.num_cls-1)
@@ -291,94 +288,13 @@ class NextActivityLSTM(BaseModel):
                 node_offset += num_nodes
         else:
             # Single graph - just extract the sequence
-            graph_node_features = g.ndata['feat']
+            graph_nodes = g.ndata['feat']
             
-            # Extract task IDs - handle both multi-feature and single-feature cases
-            if graph_node_features.size(1) > 1:
-                task_ids = graph_node_features[:, 0].long()
+            # Extract task IDs - assume first column contains task ID if multiple features
+            if graph_nodes.size(1) > 1:
+                task_ids = graph_nodes[:, 0].long()
             else:
-                task_ids = graph_node_features.squeeze(-1).long()
-            
-            # Handle possible negative or out-of-range IDs
-            task_ids = torch.clamp(task_ids, min=0, max=self.num_cls-1)
-            
-            # Store sequence and length
-            sequences.append(task_ids)
-            seq_lengths.append(len(task_ids))
-        
-        # Process extracted sequences - we'll use DGL's efficient batch tensor processing
-        return self._process_sequence_list(sequences, seq_lengths)
-    
-    def _process_graph_data(self, data):
-        """
-        Process PyG Data by extracting case-level sequences with proper feature handling
-        (Maintained for backward compatibility)
-        
-        Args:
-            data: PyG Data object with batch information
-                
-        Returns:
-            Output logits [batch_size, num_classes]
-        """
-        # Extract batch information
-        batch = data.batch
-        
-        # Get unique batch indices (cases)
-        unique_batches = torch.unique(batch)
-        batch_size = unique_batches.size(0)
-        
-        # Extract sequence for each case
-        sequences = []
-        seq_lengths = []
-        
-        # Check if data has feature names for better feature selection
-        feature_indices = {}
-        if hasattr(data, 'feature_names') and len(data.feature_names) > 0:
-            # Find indices of useful features by name pattern
-            for i, name in enumerate(data.feature_names):
-                if 'task' in name.lower():
-                    feature_indices['task'] = i
-                elif 'resource' in name.lower():
-                    feature_indices['resource'] = i
-                elif 'time' in name.lower() or 'timestamp' in name.lower():
-                    feature_indices['time'] = i
-            
-            # Default to first column if no task feature found
-            if 'task' not in feature_indices:
-                feature_indices['task'] = 0
-        
-        # Process each case
-        for b in unique_batches:
-            # Get nodes for this case in order
-            mask = (batch == b)
-            case_idx = torch.where(mask)[0]
-            
-            # Check if position information is available
-            # PyG doesn't guarantee node order within a graph, so we try to reconstruct it
-            if hasattr(data, 'pos'):
-                # Sort nodes by position if available
-                pos = data.pos[mask]
-                # Sort by sequence position
-                sorted_order = torch.argsort(pos.view(-1))
-                case_idx = case_idx[sorted_order]
-            
-            # Get case nodes in proper order
-            case_nodes = data.x[case_idx]
-            
-            # Extract task IDs using the appropriate feature
-            if case_nodes.size(1) > 1:
-                # Multi-feature nodes
-                if feature_indices:
-                    # Use identified task feature
-                    task_feature_idx = feature_indices['task']
-                else:
-                    # Assume first dimension contains task ID
-                    task_feature_idx = 0
-                    
-                task_ids = case_nodes[:, task_feature_idx].long()
-            else:
-                # Single feature node - use directly
-                task_ids = case_nodes.squeeze(-1).long()
+                task_ids = graph_nodes.squeeze(-1).long()
             
             # Handle possible negative or out-of-range IDs
             task_ids = torch.clamp(task_ids, min=0, max=self.num_cls-1)
@@ -407,9 +323,6 @@ class NextActivityLSTM(BaseModel):
             if hasattr(x, 'ndata') and 'feat' in x.ndata:
                 # Handle DGL graph data
                 return self._extract_embeddings_dgl_graph(x)
-            elif hasattr(x, 'x') and hasattr(x, 'batch'):
-                # Handle PyG data for backward compatibility
-                return self._extract_embeddings_graph(x)
             
             # Handle list of sequences
             if isinstance(x, list):
@@ -514,37 +427,6 @@ class NextActivityLSTM(BaseModel):
         # Get embeddings for extracted sequences
         return self._extract_embeddings_list(sequences, seq_lengths)
     
-    def _extract_embeddings_graph(self, data):
-        """Extract embeddings from PyG graph data (backward compatibility)"""
-        # Extract features and batch assignments
-        x = data.x
-        batch = data.batch
-        
-        # Get unique batch indices (cases)
-        unique_batches = torch.unique(batch)
-        
-        # Extract sequence for each case
-        sequences = []
-        seq_lengths = []
-        
-        for b in unique_batches:
-            # Get nodes for this case
-            mask = (batch == b)
-            case_nodes = x[mask]
-            
-            # Extract task IDs
-            if case_nodes.size(1) > 1:
-                task_ids = case_nodes[:, 0].long()
-            else:
-                task_ids = case_nodes.squeeze(-1).long()
-            
-            # Store sequence and length
-            sequences.append(task_ids)
-            seq_lengths.append(len(task_ids))
-        
-        # Get embeddings for extracted sequences
-        return self._extract_embeddings_list(sequences, seq_lengths)
-    
     def get_attention_weights(self, x, seq_lengths=None):
         """
         Get attention weights for interpretability
@@ -564,10 +446,11 @@ class NextActivityLSTM(BaseModel):
         
         return self.attention_weights
 
+
 class EnhancedProcessRNN(BaseModel):
     """
     Enhanced RNN architecture combining LSTM, GRU, and Transformer layers
-    for complex sequential process mining tasks
+    for complex sequential process mining tasks with DGL support
     """
     def __init__(
         self,
@@ -698,7 +581,6 @@ class EnhancedProcessRNN(BaseModel):
         Args:
             batch: Input batch which can be:
                 - DGL graph or batched graph
-                - PyG Data object
                 - Tuple of (task_ids, time_diffs)
                 - Tensor of task IDs
                 - Dictionary with 'task_ids' and optional 'time_diffs'
@@ -722,9 +604,6 @@ class EnhancedProcessRNN(BaseModel):
         elif hasattr(batch, 'ndata') and 'feat' in batch.ndata:
             # DGL graph object
             return self._process_dgl_graph(batch)
-        elif hasattr(batch, 'x') and hasattr(batch, 'batch'):
-            # PyG Data object (for backward compatibility)
-            return self._process_graph_data(batch)
         else:
             # Assume tensor input of task IDs
             task_ids = batch
@@ -951,77 +830,4 @@ class EnhancedProcessRNN(BaseModel):
             return self.forward((padded_tasks, padded_times, padding_mask, seq_lengths))
         else:
             return self.forward((padded_tasks, None, padding_mask, seq_lengths))
-    
-    def _process_graph_data(self, data):
-        """
-        Process PyG Data by extracting case-level sequences
-        (Maintained for backward compatibility)
         
-        Args:
-            data: PyG Data object
-            
-        Returns:
-            Model predictions
-        """
-        # Extract features and batch assignments
-        x = data.x
-        batch = data.batch
-        edge_attr = data.edge_attr if hasattr(data, 'edge_attr') else None
-        
-        # Get unique batch indices (cases)
-        unique_batches = torch.unique(batch)
-        batch_size = unique_batches.size(0)
-        
-        # Extract task IDs and time differences for each case
-        task_sequences = []
-        time_sequences = []
-        seq_lengths = []
-        
-        for b in unique_batches:
-            # Get nodes for this case
-            mask = (batch == b)
-            case_nodes = x[mask]
-            
-            # Extract task IDs (assuming first feature column is task ID)
-            if case_nodes.size(1) > 1:
-                task_ids = case_nodes[:, 0].long()
-            else:
-                task_ids = case_nodes.squeeze(-1).long()
-            
-            # Store sequence and length
-            task_sequences.append(task_ids)
-            seq_lengths.append(len(task_ids))
-            
-            # Extract time differences if available
-            if edge_attr is not None and self.use_time_features:
-                # Get edges for this case
-                case_edges = edge_attr[mask]
-                # Extract time features (assuming first edge attribute is time difference)
-                if len(case_edges) > 0:
-                    time_diffs = case_edges[:, 0]
-                    time_sequences.append(time_diffs)
-        
-        # Create padded batch
-        max_len = max(seq_lengths)
-        padded_tasks = torch.zeros(batch_size, max_len, dtype=torch.long, device=x.device)
-        padded_times = torch.zeros(batch_size, max_len, dtype=torch.float, device=x.device) if self.use_time_features else None
-        
-        # Fill in sequences
-        for i in range(batch_size):
-            length = seq_lengths[i]
-            padded_tasks[i, :length] = task_sequences[i]
-            
-            if self.use_time_features and time_sequences and i < len(time_sequences):
-                time_len = min(length, len(time_sequences[i]))
-                padded_times[i, :time_len] = time_sequences[i][:time_len]
-        
-        # Create padding mask
-        padding_mask = torch.arange(max_len, device=x.device)[None, :] >= torch.tensor(
-            seq_lengths, device=x.device
-        )[:, None]
-        
-        # Process batch
-        if self.use_time_features and padded_times is not None:
-            return self.forward((padded_tasks, padded_times, padding_mask, seq_lengths))
-        else:
-            return self.forward((padded_tasks, None, padding_mask, seq_lengths))

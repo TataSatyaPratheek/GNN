@@ -1,4 +1,3 @@
-# src/processmine/utils/evaluation.py
 """
 Evaluation utilities for process mining models.
 """
@@ -110,7 +109,7 @@ def evaluate_model(model, data_loader, criterion=None, device=None, detailed=Tru
     
     Args:
         model: PyTorch model to evaluate
-        data_loader: Data loader for test data
+        data_loader: Data loader for test data (DGL graphs)
         criterion: Loss function (optional)
         device: Computing device
         detailed: Whether to compute detailed metrics
@@ -153,8 +152,28 @@ def evaluate_model(model, data_loader, criterion=None, device=None, detailed=Tru
     # Evaluate without gradient tracking
     with torch.no_grad():
         for batch_data in progress_bar:
+            # Check if this is a PyG format data (backwards compatibility)
+            if hasattr(batch_data, 'x') and hasattr(batch_data, 'edge_index'):
+                logger.warning("PyG format detected in evaluate_model. Convert to DGL for future compatibility.")
+                try:
+                    from processmine.utils.dataloader import convert_pyg_to_dgl
+                    batch_data = convert_pyg_to_dgl(batch_data)
+                except Exception as e:
+                    logger.error(f"Failed to convert PyG data to DGL: {e}")
+                    continue
+            
             # Move batch to device
-            batch_data = batch_data.to(device)
+            if isinstance(batch_data, list):
+                # List of graphs needs to be batched
+                try:
+                    import dgl
+                    batch_data = dgl.batch(batch_data).to(device)
+                except Exception as e:
+                    logger.error(f"Failed to batch graphs: {e}")
+                    continue
+            else:
+                # Single graph or already batched
+                batch_data = batch_data.to(device)
             
             # Forward pass
             outputs = model(batch_data)
@@ -233,3 +252,22 @@ def evaluate_model(model, data_loader, criterion=None, device=None, detailed=Tru
         gc.collect()
     
     return metrics, all_preds, all_labels
+
+def calculate_f1_scores(true_labels, predictions, average='weighted'):
+    """
+    Calculate F1 scores with proper handling of edge cases
+    
+    Args:
+        true_labels: Ground truth labels
+        predictions: Predicted labels
+        average: Averaging method ('micro', 'macro', 'weighted', None)
+        
+    Returns:
+        F1 score or dictionary of F1 scores per class
+    """
+    # Handle empty inputs
+    if len(true_labels) == 0 or len(predictions) == 0:
+        return 0.0 if average else {}
+    
+    # Use scikit-learn's implementation with proper zero division handling
+    return f1_score(true_labels, predictions, average=average, zero_division=0)

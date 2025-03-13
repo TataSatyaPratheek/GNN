@@ -153,7 +153,60 @@ CLI_CONFIG = {
     
     # Mode-specific arguments
     'modes': {
-        'analyze': {
+    'ablation': {
+'description': "Run ablation study to evaluate model components",
+'arguments': {
+    'model': {
+        'help': "Model type to use as baseline",
+        'choices': ["gnn", "lstm", "enhanced_gnn", "enhanced_lstm", "xgboost", "random_forest"],
+        'default': "enhanced_gnn"
+    },
+    'study_name': {
+        'help': "Name for ablation study",
+        'type': str,
+        'default': "ablation_study"
+    },
+    'n_seeds': {
+        'help': "Number of random seeds to use",
+        'type': int,
+        'default': 3
+    },
+    'ablate_components': {
+        'help': "Components to ablate (comma-separated, e.g. 'use_residual,use_batch_norm')",
+        'type': str
+    },
+    'grid_search': {
+        'help': "Run grid search over parameters (JSON string)",
+        'type': str
+    },
+    'parallel': {
+        'help': "Run experiments in parallel",
+        'action': "store_true"
+    },
+    'metrics': {
+        'help': "Metrics to aggregate (comma-separated)",
+        'type': str,
+        'default': "accuracy,f1_weighted"
+    },
+    'epochs': {
+        'help': "Training epochs",
+        'type': int,
+        'default': 20
+    },
+    'batch_size': {
+        'help': "Batch size",
+        'type': int,
+        'default': 32
+    },
+    'lr': {
+        'help': "Learning rate",
+        'type': float,
+        'default': 0.001
+    },
+    'include_modes': ["train"]  # Include train mode arguments
+}
+},
+           'analyze': {
             'description': "Train a predictive model",
             'arguments': {
                 'bottleneck_threshold': {
@@ -586,6 +639,75 @@ def main():
                 **{k: v for k, v in run_kwargs.items() if k not in ['data_path', 'mode', 'output_dir']}
             )
         
+        elif args.mode == "ablation":
+            # Import ablation study
+            from processmine.core.ablation import AblationStudy
+            
+            # Create base config from CLI args
+            base_config = {k: v for k, v in run_kwargs.items() if k not in ['mode', 'ablate_components', 'grid_search', 'parallel', 'n_seeds', 'metrics', 'study_name']}
+            
+            # Specify output directory
+            from pathlib import Path
+            output_dir = Path(output_dir) / "ablation_studies"
+            
+            # Create random seeds
+            import random
+            random_seeds = [random.randint(1, 10000) for _ in range(args.n_seeds)]
+            
+            # Initialize ablation study
+            study = AblationStudy(
+                base_config=base_config,
+                output_dir=output_dir,
+                experiment_name=args.study_name,
+                device=device,
+                save_models=True,
+                parallel=args.parallel,
+                random_seeds=random_seeds
+            )
+            
+            # Add baseline (unchanged) experiment
+            study.add_experiment("baseline", {})
+            
+            # Add component ablation experiments if specified
+            if args.ablate_components:
+                components = args.ablate_components.split(',')
+                study.add_ablation_experiments(components, disable=True)
+            
+            # Add grid search experiments if specified
+            if args.grid_search:
+                import json
+                try:
+                    grid = json.loads(args.grid_search)
+                    study.add_grid_search(grid)
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON for grid search")
+            
+            # Define function to run a single experiment
+            def run_experiment(config, device):
+                # Use training function from runner
+                training_results = run_training(
+                    data_path=args.data_path,
+                    output_dir=output_dir / "experiments" / config.get("name", "unnamed"),
+                    device=device,
+                    **config
+                )
+                
+                # Extract metrics
+                if isinstance(training_results, dict) and "metrics" in training_results:
+                    return training_results["metrics"]
+                return training_results
+            
+            # Parse metrics
+            metrics = args.metrics.split(',') if args.metrics else ["accuracy", "f1_weighted"]
+            
+            # Run ablation study
+            results = study.run_experiments(
+                run_function=run_experiment,
+                aggregate_metrics=metrics
+            )
+            
+        logger.info(f"Ablation study completed. Results saved to {output_dir / args.study_name}")
+        
         # Log completion time
         total_time = time.time() - start_time
         logger.info(f"Process mining completed in {total_time:.2f}s")
@@ -602,132 +724,3 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
     
-    
-"""# Updates to be added to processmine/cli.py
-
-# Add this to the CLI_CONFIG dictionary in the 'modes' section:
-
-'ablation': {
-    'description': "Run ablation study to evaluate model components",
-    'arguments': {
-        'model': {
-            'help': "Model type to use as baseline",
-            'choices': ["gnn", "lstm", "enhanced_gnn", "enhanced_lstm", "xgboost", "random_forest"],
-            'default': "enhanced_gnn"
-        },
-        'study_name': {
-            'help': "Name for ablation study",
-            'type': str,
-            'default': "ablation_study"
-        },
-        'n_seeds': {
-            'help': "Number of random seeds to use",
-            'type': int,
-            'default': 3
-        },
-        'ablate_components': {
-            'help': "Components to ablate (comma-separated, e.g. 'use_residual,use_batch_norm')",
-            'type': str
-        },
-        'grid_search': {
-            'help': "Run grid search over parameters (JSON string)",
-            'type': str
-        },
-        'parallel': {
-            'help': "Run experiments in parallel",
-            'action': "store_true"
-        },
-        'metrics': {
-            'help': "Metrics to aggregate (comma-separated)",
-            'type': str,
-            'default': "accuracy,f1_weighted"
-        },
-        'epochs': {
-            'help': "Training epochs",
-            'type': int,
-            'default': 20
-        },
-        'batch_size': {
-            'help': "Batch size",
-            'type': int,
-            'default': 32
-        },
-        'lr': {
-            'help': "Learning rate",
-            'type': float,
-            'default': 0.001
-        },
-        'include_modes': ["train"]  # Include train mode arguments
-    }
-},
-
-# Add this to main() function to handle the ablation study mode:
-
-elif args.mode == "ablation":
-    # Import ablation study
-    from processmine.core.ablation import AblationStudy
-    
-    # Create base config from CLI args
-    base_config = {k: v for k, v in run_kwargs.items() if k not in ['mode', 'ablate_components', 'grid_search', 'parallel', 'n_seeds', 'metrics', 'study_name']}
-    
-    # Specify output directory
-    from pathlib import Path
-    output_dir = Path(output_dir) / "ablation_studies"
-    
-    # Create random seeds
-    import random
-    random_seeds = [random.randint(1, 10000) for _ in range(args.n_seeds)]
-    
-    # Initialize ablation study
-    study = AblationStudy(
-        base_config=base_config,
-        output_dir=output_dir,
-        experiment_name=args.study_name,
-        device=device,
-        save_models=True,
-        parallel=args.parallel,
-        random_seeds=random_seeds
-    )
-    
-    # Add baseline (unchanged) experiment
-    study.add_experiment("baseline", {})
-    
-    # Add component ablation experiments if specified
-    if args.ablate_components:
-        components = args.ablate_components.split(',')
-        study.add_ablation_experiments(components, disable=True)
-    
-    # Add grid search experiments if specified
-    if args.grid_search:
-        import json
-        try:
-            grid = json.loads(args.grid_search)
-            study.add_grid_search(grid)
-        except json.JSONDecodeError:
-            logger.error("Invalid JSON for grid search")
-    
-    # Define function to run a single experiment
-    def run_experiment(config, device):
-        # Use training function from runner
-        training_results = run_training(
-            data_path=args.data_path,
-            output_dir=output_dir / "experiments" / config.get("name", "unnamed"),
-            device=device,
-            **config
-        )
-        
-        # Extract metrics
-        if isinstance(training_results, dict) and "metrics" in training_results:
-            return training_results["metrics"]
-        return training_results
-    
-    # Parse metrics
-    metrics = args.metrics.split(',') if args.metrics else ["accuracy", "f1_weighted"]
-    
-    # Run ablation study
-    results = study.run_experiments(
-        run_function=run_experiment,
-        aggregate_metrics=metrics
-    )
-    
-    logger.info(f"Ablation study completed. Results saved to {output_dir / args.study_name}")"""

@@ -3,6 +3,7 @@ Data loading and processing utilities for DGL-based graph models.
 """
 
 import psutil
+import logging
 import gc
 from random import random
 import torch
@@ -10,17 +11,190 @@ import dgl
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional, Union
 
-def collate_dgl_graphs(graphs):
+logger = logging.getLogger(__name__)
+class MemoryEfficientDataLoader:
     """
-    Collate function for batching DGL graphs
-    
-    Args:
-        graphs: List of DGL graphs to batch
+    Memory-efficient data loader for DGL graphs with dynamic batch sizing
+    """
+    def __init__(
+        self, 
+        dataset, 
+        batch_size=32, 
+        shuffle=True, 
+        pin_memory=True,
+        prefetch_factor=2, 
+        memory_threshold=0.85,
+        drop_last=False,
+        collate_fn=None,
+        num_workers=0
+    ):
+        """
+        Initialize memory-efficient data loader
         
-    Returns:
-        Batched DGL graph
-    """
-    return dgl.batch(graphs)
+        Args:
+            dataset: Dataset or list of DGL graphs
+            batch_size: Initial batch size
+            shuffle: Whether to shuffle the data
+            pin_memory: Whether to use pinned memory
+            prefetch_factor: Prefetch factor for asynchronous loading
+            memory_threshold: Memory usage threshold to trigger adjustments
+            drop_last: Whether to drop the last batch if incomplete
+            collate_fn: Custom collate function (defaults to dgl.batch)
+            num_workers: Number of worker processes
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.pin_memory = pin_memory
+        self.prefetch_factor = prefetch_factor
+        self.memory_threshold = memory_threshold
+        self.drop_last = drop_last
+        self.num_workers = num_workers
+        
+        # Default to DGL batch collate if not provided
+        self.collate_fn = collate_fn or (lambda graphs: dgl.batch(graphs))
+        
+        # Calculate initial indices
+        self.indices = list(range(len(dataset)))
+        if self.shuffle:
+            import random
+            random.shuffle(self.indices)
+        
+        # Track memory usage for adaptive batch sizing
+        self.batch_size_history = []
+        self.memory_usage_history = []
+        
+        # Set up DGL DataLoader for multi-process loading if workers > 0
+        if num_workers > 0:
+            try:
+                from dgl.dataloading import GraphDataLoader
+                self.dataloader = GraphDataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=shuffle,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    drop_last=drop_last,
+                    collate_fn=self.collate_fn
+                )
+                self.use_dgl_loader = True
+            except ImportError:
+                self.use_dgl_loader = False
+        else:
+            self.use_dgl_loader = False
+        
+        # Track current position
+        self.position = 0
+        self._iterator = None
+    
+    def __iter__(self):
+        """Create iterator for batches"""
+        # If using DGL DataLoader, return its iterator
+        if self.use_dgl_loader:
+            self._iterator = iter(self.dataloader)
+            return self
+        
+        # Reset position
+        self.position = 0
+        
+        # Reshuffle if needed
+        if self.shuffle:
+            import random
+            random.shuffle(self.indices)
+        
+        return self
+    
+    def __next__(self):
+        """Get next batch with memory-aware adaptive sizing"""
+        if self.use_dgl_loader:
+            try:
+                return next(self._iterator)
+            except StopIteration:
+                raise StopIteration
+        
+        if self.position >= len(self.indices):
+            raise StopIteration
+        
+        # Check current memory usage
+        current_memory = self._get_memory_usage()
+        
+        # Adjust batch size if needed
+        current_batch_size = self._adjust_batch_size(current_memory)
+        
+        # Calculate end position for this batch
+        end_position = min(self.position + current_batch_size, len(self.indices))
+        
+        # Handle drop_last
+        if self.drop_last and end_position - self.position < current_batch_size:
+            self.position = len(self.indices)  # Move to end
+            raise StopIteration
+        
+        # Get batch indices
+        batch_indices = self.indices[self.position:end_position]
+        
+        # Update position for next batch
+        self.position = end_position
+        
+        # Track memory and batch size for analysis
+        self.batch_size_history.append(current_batch_size)
+        self.memory_usage_history.append(current_memory)
+        
+        # Extract and collate batch
+        batch = [self.dataset[i] for i in batch_indices]
+        
+        # Run garbage collection if memory usage is high
+        if current_memory > self.memory_threshold * 0.95:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        return self.collate_fn(batch)
+    
+    def _get_memory_usage(self):
+        """Get current memory usage as fraction of available memory"""
+        try:
+            if torch.cuda.is_available():
+                # GPU memory
+                device = torch.cuda.current_device()
+                allocated = torch.cuda.memory_allocated(device)
+                total = torch.cuda.get_device_properties(device).total_memory
+                return allocated / total
+            else:
+                # CPU memory
+                vm = psutil.virtual_memory()
+                return vm.percent / 100.0
+        except:
+            # Fallback
+            return 0.5
+    
+    def _adjust_batch_size(self, memory_usage):
+        """Adjust batch size based on memory pressure"""
+        if memory_usage > self.memory_threshold:
+            # Memory pressure - reduce batch size
+            new_size = max(1, int(self.batch_size * 0.8))
+            if new_size != self.batch_size:
+                self.batch_size = new_size
+        elif memory_usage < self.memory_threshold * 0.7:
+            # Low memory usage - can increase batch size
+            new_size = min(1024, int(self.batch_size * 1.2))
+            if new_size != self.batch_size:
+                self.batch_size = new_size
+        
+        return self.batch_size
+
+
+def _calculate_skewness(arr):
+    """Calculate skewness of array elements along first axis"""
+    mean = np.mean(arr, axis=0)
+    std = np.std(arr, axis=0)
+    # Avoid division by zero
+    std = np.maximum(std, 1e-8)
+    
+    # Calculate skewness (third moment)
+    n = arr.shape[0]
+    m3 = np.sum((arr - mean)**3, axis=0) / n
+    return m3 / (std**3)
 
 def get_graph_dataloader(graphs, batch_size=32, shuffle=True, num_workers=0):
     """
@@ -44,6 +218,20 @@ def get_graph_dataloader(graphs, batch_size=32, shuffle=True, num_workers=0):
         num_workers=num_workers,
         collate_fn=collate_dgl_graphs
     )
+
+
+def collate_dgl_graphs(graphs):
+    """
+    Collate function for batching DGL graphs
+    
+    Args:
+        graphs: List of DGL graphs to batch
+        
+    Returns:
+        Batched DGL graph
+    """
+    return dgl.batch(graphs)
+
 
 def get_graph_targets(g):
     """
@@ -125,7 +313,7 @@ def get_batch_graphs_from_indices(graphs, indices):
 
 def apply_to_nodes(g, func):
     """
-    Apply a function to all nodes in a graph
+    Apply a function to all nodes in a graph with DGL optimized approach
     
     Args:
         g: DGL graph
@@ -134,18 +322,23 @@ def apply_to_nodes(g, func):
     Returns:
         Updated graph
     """
-    # Create a new graph to avoid modifying the original
-    new_g = g.clone()
-    
-    # Apply function to node features
+    # Using DGL's in-place feature modification when possible
     if 'feat' in g.ndata:
-        new_g.ndata['feat'] = func(g.ndata['feat'])
-    
-    return new_g
+        # Create a new graph only if necessary
+        if func.__code__.co_argcount > 1 or g.is_readonly():
+            # Create a new graph to avoid modifying the original
+            new_g = g.clone()
+            new_g.ndata['feat'] = func(g.ndata['feat'])
+            return new_g
+        else:
+            # Apply function in-place to save memory
+            g.ndata['feat'] = func(g.ndata['feat'])
+            return g
+    return g
 
 def apply_to_edges(g, func):
     """
-    Apply a function to all edges in a graph
+    Apply a function to all edges in a graph using DGL optimized approach
     
     Args:
         g: DGL graph
@@ -154,18 +347,22 @@ def apply_to_edges(g, func):
     Returns:
         Updated graph
     """
-    # Create a new graph to avoid modifying the original
-    new_g = g.clone()
-    
-    # Apply function to edge features
     if 'feat' in g.edata:
-        new_g.edata['feat'] = func(g.edata['feat'])
-    
-    return new_g
+        # Use in-place operations when possible
+        if func.__code__.co_argcount > 1 or g.is_readonly():
+            # Create a new graph only when necessary
+            new_g = g.clone()
+            new_g.edata['feat'] = func(g.edata['feat'])
+            return new_g
+        else:
+            # Apply function in-place
+            g.edata['feat'] = func(g.edata['feat'])
+            return g
+    return g
 
 def create_node_masks(g, mask_ratio=0.1):
     """
-    Create node feature masks for self-supervised learning
+    Create node feature masks for self-supervised learning with DGL-optimized approach
     
     Args:
         g: DGL graph
@@ -176,22 +373,26 @@ def create_node_masks(g, mask_ratio=0.1):
     """
     num_nodes = g.num_nodes()
     mask_indices = torch.randperm(num_nodes)[:int(num_nodes * mask_ratio)]
-    mask = torch.zeros(num_nodes, dtype=torch.bool)
+    mask = torch.zeros(num_nodes, dtype=torch.bool, device=g.device)
     mask[mask_indices] = True
     
     # Add mask to graph
     g.ndata['mask'] = mask
     
-    # Store original features for masked nodes
+    # Store original features for masked nodes if they exist
     if 'feat' in g.ndata:
-        g.ndata['orig_feat'] = g.ndata['feat'].clone()
+        # Save original features only for masked nodes to save memory
+        orig_feat = g.ndata['feat'].clone()
+        g.ndata['orig_feat'] = orig_feat
         
-        # Apply masking (replace with zeros)
-        masked_feat = g.ndata['feat'].clone()
-        masked_feat[mask] = 0.0
-        g.ndata['feat'] = masked_feat
+        # Apply masking (replace with zeros) using DGL's efficient indexing
+        if mask.any():
+            masked_feat = g.ndata['feat'].clone()
+            masked_feat[mask] = 0.0
+            g.ndata['feat'] = masked_feat
     
     return g
+
 
 def convert_batch_to_graphs(batch_data):
     """
@@ -396,274 +597,6 @@ def create_node_masks(g, mask_ratio=0.1):
     
     return g
 
-def prepare_graph_batch(batch_data, device=None, convert_pyg=True):
-    """
-    Prepare a batch of graphs for model processing with enhanced DGL integration
-    
-    Args:
-        batch_data: Graph data in various formats
-        device: Target device for the graphs
-        convert_pyg: Whether to convert PyG graphs to DGL if detected
-        
-    Returns:
-        DGL graph or batched graph on specified device
-    """
-    import torch
-    import dgl
-    
-    # Handle device
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Handle DGL graph or batched graph directly
-    if isinstance(batch_data, dgl.DGLGraph):
-        return batch_data.to(device)
-    
-    # Handle list of DGL graphs
-    if isinstance(batch_data, list) and all(isinstance(g, dgl.DGLGraph) for g in batch_data):
-        return dgl.batch(batch_data).to(device)
-    
-    # Handle PyG data conversion if needed
-    if convert_pyg and hasattr(batch_data, 'x') and hasattr(batch_data, 'edge_index'):
-        return convert_pyg_to_dgl(batch_data, device)
-    
-    # Handle other formats by falling back to the conversion function
-    graphs = convert_batch_to_graphs(batch_data)
-    if len(graphs) > 1:
-        return dgl.batch(graphs).to(device)
-    elif len(graphs) == 1:
-        return graphs[0].to(device)
-    else:
-        raise ValueError("No valid graphs found in batch data")
-
-def convert_pyg_to_dgl(pyg_data):
-    """
-    Convert PyTorch Geometric data format to DGL format
-    
-    Args:
-        pyg_data: PyG data object or batch
-        
-    Returns:
-        Equivalent DGL graph or batched graph
-    """
-    import dgl
-    import torch
-    
-    # Check if input is already a DGL graph
-    if isinstance(pyg_data, dgl.DGLGraph):
-        return pyg_data
-    
-    # Check if input has PyG-style attributes
-    if hasattr(pyg_data, 'x') and hasattr(pyg_data, 'edge_index'):
-        if hasattr(pyg_data, 'batch'):
-            # This is a batched PyG graph
-            batch_size = pyg_data.batch.max().item() + 1
-            dgl_graphs = []
-            
-            for i in range(batch_size):
-                # Extract nodes for this graph
-                mask = pyg_data.batch == i
-                node_indices = torch.where(mask)[0]
-                
-                # Get features for this graph
-                x = pyg_data.x[mask]
-                
-                # Get edges for this graph
-                edge_mask = torch.isin(pyg_data.edge_index[0], node_indices) & \
-                           torch.isin(pyg_data.edge_index[1], node_indices)
-                
-                if edge_mask.sum() > 0:
-                    edge_index = pyg_data.edge_index[:, edge_mask]
-                    
-                    # Remap node indices to local indices
-                    idx_map = {idx.item(): new_idx for new_idx, idx in enumerate(node_indices)}
-                    edge_src = torch.tensor([idx_map[idx.item()] for idx in edge_index[0]])
-                    edge_dst = torch.tensor([idx_map[idx.item()] for idx in edge_index[1]])
-                    
-                    # Create DGL graph
-                    g = dgl.graph((edge_src, edge_dst), num_nodes=len(node_indices))
-                    
-                    # Add node features
-                    g.ndata['feat'] = x
-                    
-                    # Add node labels if available
-                    if hasattr(pyg_data, 'y') and pyg_data.y is not None:
-                        g.ndata['label'] = pyg_data.y[mask]
-                    
-                    # Add edge features if available
-                    if hasattr(pyg_data, 'edge_attr') and pyg_data.edge_attr is not None:
-                        g.edata['feat'] = pyg_data.edge_attr[edge_mask]
-                else:
-                    # Create an empty graph with just nodes
-                    g = dgl.graph(([], []), num_nodes=len(node_indices))
-                    g.ndata['feat'] = x
-                    
-                    # Add node labels if available
-                    if hasattr(pyg_data, 'y') and pyg_data.y is not None:
-                        g.ndata['label'] = pyg_data.y[mask]
-                
-                dgl_graphs.append(g)
-            
-            # Batch the DGL graphs
-            return dgl.batch(dgl_graphs)
-        else:
-            # Single PyG graph
-            g = dgl.graph((pyg_data.edge_index[0], pyg_data.edge_index[1]), 
-                           num_nodes=pyg_data.x.shape[0])
-            g.ndata['feat'] = pyg_data.x
-            
-            # Add node labels if available
-            if hasattr(pyg_data, 'y') and pyg_data.y is not None:
-                g.ndata['label'] = pyg_data.y
-            
-            # Add edge features if available
-            if hasattr(pyg_data, 'edge_attr') and pyg_data.edge_attr is not None:
-                g.edata['feat'] = pyg_data.edge_attr
-            
-            return g
-    else:
-        raise ValueError("Input data doesn't have PyG format attributes (x, edge_index)")
-    
-
-class MemoryEfficientDataLoader:
-    """
-    Memory-efficient data loader for DGL graphs with dynamic batch sizing
-    Based on the improvement plan but adapted for DGL
-    """
-    def __init__(
-        self, 
-        dataset, 
-        batch_size=32, 
-        shuffle=True, 
-        pin_memory=True,
-        prefetch_factor=2, 
-        memory_threshold=0.85,
-        drop_last=False,
-        collate_fn=None,
-        num_workers=0
-    ):
-        """
-        Initialize memory-efficient data loader
-        
-        Args:
-            dataset: Dataset or list of DGL graphs
-            batch_size: Initial batch size
-            shuffle: Whether to shuffle the data
-            pin_memory: Whether to use pinned memory
-            prefetch_factor: Prefetch factor for asynchronous loading
-            memory_threshold: Memory usage threshold to trigger adjustments
-            drop_last: Whether to drop the last batch if incomplete
-            collate_fn: Custom collate function (defaults to dgl.batch)
-            num_workers: Number of worker processes
-        """
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.pin_memory = pin_memory
-        self.prefetch_factor = prefetch_factor
-        self.memory_threshold = memory_threshold
-        self.drop_last = drop_last
-        self.num_workers = num_workers
-        
-        # Default to DGL batch collate if not provided
-        self.collate_fn = collate_fn or (lambda graphs: dgl.batch(graphs))
-        
-        # Calculate initial indices
-        self.indices = list(range(len(dataset)))
-        if self.shuffle:
-            import random
-            random.shuffle(self.indices)
-        
-        # Track memory usage for adaptive batch sizing
-        self.batch_size_history = []
-        self.memory_usage_history = []
-        
-        # Set up DGL DataLoader for multi-process loading if workers > 0
-        if num_workers > 0:
-            try:
-                from dgl.dataloading import GraphDataLoader
-                self.dataloader = GraphDataLoader(
-                    dataset,
-                    batch_size=batch_size,
-                    shuffle=shuffle,
-                    num_workers=num_workers,
-                    pin_memory=pin_memory,
-                    drop_last=drop_last,
-                    collate_fn=self.collate_fn
-                )
-                self.use_dgl_loader = True
-            except ImportError:
-                self.use_dgl_loader = False
-        else:
-            self.use_dgl_loader = False
-        
-        # Track current position
-        self.position = 0
-        self._iterator = None
-    
-    def __iter__(self):
-        """Create iterator for batches"""
-        # If using DGL DataLoader, return its iterator
-        if self.use_dgl_loader:
-            self._iterator = iter(self.dataloader)
-            return self
-        
-        # Reset position
-        self.position = 0
-        
-        # Reshuffle if needed
-        if self.shuffle:
-            import random
-            random.shuffle(self.indices)
-        
-        return self
-    
-    def __next__(self):
-        """Get next batch with memory-aware adaptive sizing"""
-        if self.use_dgl_loader:
-            try:
-                return next(self._iterator)
-            except StopIteration:
-                raise StopIteration
-        
-        if self.position >= len(self.indices):
-            raise StopIteration
-        
-        # Check current memory usage
-        current_memory = self._get_memory_usage()
-        
-        # Adjust batch size if needed
-        current_batch_size = self._adjust_batch_size(current_memory)
-        
-        # Calculate end position for this batch
-        end_position = min(self.position + current_batch_size, len(self.indices))
-        
-        # Handle drop_last
-        if self.drop_last and end_position - self.position < current_batch_size:
-            self.position = len(self.indices)  # Move to end
-            raise StopIteration
-        
-        # Get batch indices
-        batch_indices = self.indices[self.position:end_position]
-        
-        # Update position for next batch
-        self.position = end_position
-        
-        # Track memory and batch size for analysis
-        self.batch_size_history.append(current_batch_size)
-        self.memory_usage_history.append(current_memory)
-        
-        # Extract and collate batch
-        batch = [self.dataset[i] for i in batch_indices]
-        
-        # Run garbage collection if memory usage is high
-        if current_memory > self.memory_threshold * 0.95:
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        
-        return self.collate_fn(batch)
     
 def adaptive_normalization(features, feature_statistics=None):
     """
@@ -737,6 +670,7 @@ def adaptive_normalization(features, feature_statistics=None):
     
     return normalized
 
+
 def _calculate_skewness(arr):
     """Calculate skewness of array elements along first axis"""
     mean = np.mean(arr, axis=0)
@@ -791,6 +725,76 @@ def get_pyg_compatible_attributes(g):
     
     return compat_dict
 
+
+def chunk_process_large_graph(g, process_func, max_nodes_per_chunk=10000):
+    """
+    Process very large graphs in chunks to reduce peak memory usage
+    
+    Args:
+        g: DGL graph to process
+        process_func: Function that processes subgraphs
+        max_nodes_per_chunk: Maximum nodes per chunk
+        
+    Returns:
+        Processed graph
+    """
+    import dgl
+    import torch
+    import math
+    
+    # If graph is small enough, process directly
+    if g.num_nodes() <= max_nodes_per_chunk:
+        return process_func(g)
+    
+    # For large graphs, process in chunks
+    num_chunks = math.ceil(g.num_nodes() / max_nodes_per_chunk)
+    
+    # Process batched graph
+    if hasattr(g, 'batch_num_nodes') and g.batch_size > 1:
+        # Process each subgraph separately
+        result_graphs = []
+        
+        node_offset = 0
+        for i, num_nodes in enumerate(g.batch_num_nodes()):
+            # Extract this subgraph
+            nodes = list(range(node_offset, node_offset + num_nodes))
+            subg = dgl.node_subgraph(g, nodes)
+            
+            # Process subgraph
+            processed_subg = process_func(subg)
+            
+            # Add to results
+            result_graphs.append(processed_subg)
+            
+            # Update offset
+            node_offset += num_nodes
+        
+        # Batch results
+        return dgl.batch(result_graphs)
+    
+    # Process single large graph in chunks
+    else:
+        # Create node chunks
+        all_nodes = torch.arange(g.num_nodes(), device=g.device)
+        node_chunks = torch.chunk(all_nodes, num_chunks)
+        
+        # Process each chunk
+        processed_chunks = []
+        for chunk_nodes in node_chunks:
+            # Extract chunk subgraph
+            subg = dgl.node_subgraph(g, chunk_nodes)
+            
+            # Process subgraph
+            processed_subg = process_func(subg)
+            
+            # Add to results
+            processed_chunks.append(processed_subg)
+        
+        # Combine results (implementation depends on what process_func does)
+        # This is a placeholder - you'll need to implement based on your use case
+        raise NotImplementedError(
+            "Combining processed chunks needs to be implemented based on process_func semantics")
+
 def apply_dgl_sampling(g, method='neighbor', fanout=10, k=16):
     """
     Apply DGL's graph sampling techniques for memory-efficient processing
@@ -804,8 +808,6 @@ def apply_dgl_sampling(g, method='neighbor', fanout=10, k=16):
     Returns:
         Sampled DGL graph
     """
-    import dgl
-    
     try:
         if method == 'neighbor':
             # Sample neighbors with importance weights
@@ -872,3 +874,220 @@ def apply_dgl_sampling(g, method='neighbor', fanout=10, k=16):
         import logging
         logging.getLogger(__name__).warning(f"DGL sampling failed: {e}")
         return g  # Return original graph on error
+    
+    
+def convert_batch_to_graphs(batch_data):
+    """
+    Convert batch of arbitrary graph data to DGL graphs
+    
+    Args:
+        batch_data: Batch data that needs to be converted to DGL graphs
+        
+    Returns:
+        List of DGL graphs
+    """
+    graphs = []
+    
+    # Handle different input formats
+    if hasattr(batch_data, 'x') and hasattr(batch_data, 'edge_index'):
+        # Handle PyG-style data (DEPRECATED)
+        logger.warning("PyG format detected. This compatibility will be removed in future versions. Please use DGL graphs.")
+        
+        # This is a backward compatibility feature during migration
+        try:
+            # Try to use the converter function
+            return convert_pyg_to_dgl(batch_data, return_list=True)
+        except Exception as e:
+            logger.error(f"Error converting PyG data to DGL: {e}")
+    elif isinstance(batch_data, list):
+        # Assuming list of DGL graphs
+        return batch_data
+    elif isinstance(batch_data, dgl.DGLGraph):
+        # Already a DGL graph
+        return [batch_data]
+    else:
+        raise ValueError(f"Unsupported batch data type: {type(batch_data)}")
+    
+    return graphs
+
+def convert_pyg_to_dgl(pyg_data, return_list=False):
+    """
+    Convert PyTorch Geometric data format to DGL format (DEPRECATED)
+    This function will be removed in a future version
+    
+    Args:
+        pyg_data: PyG data object or batch
+        return_list: Whether to return a list of graphs or a single batched graph
+        
+    Returns:
+        DGL graph or list of DGL graphs
+    """
+    import dgl
+    import torch
+    
+    logger.warning("PyG to DGL conversion is deprecated and will be removed in future versions.")
+    
+    # Check if input is already a DGL graph
+    if isinstance(pyg_data, dgl.DGLGraph):
+        return [pyg_data] if return_list else pyg_data
+    
+    # Check if input has PyG-style attributes
+    if hasattr(pyg_data, 'x') and hasattr(pyg_data, 'edge_index'):
+        if hasattr(pyg_data, 'batch'):
+            # This is a batched PyG graph
+            batch_size = pyg_data.batch.max().item() + 1
+            dgl_graphs = []
+            
+            for i in range(batch_size):
+                # Extract nodes for this graph
+                mask = pyg_data.batch == i
+                node_indices = torch.where(mask)[0]
+                
+                # Get features for this graph
+                x = pyg_data.x[mask]
+                
+                # Get edges for this graph
+                edge_mask = torch.isin(pyg_data.edge_index[0], node_indices) & \
+                           torch.isin(pyg_data.edge_index[1], node_indices)
+                
+                if edge_mask.sum() > 0:
+                    edge_index = pyg_data.edge_index[:, edge_mask]
+                    
+                    # Remap node indices to local indices
+                    idx_map = {idx.item(): new_idx for new_idx, idx in enumerate(node_indices)}
+                    edge_src = torch.tensor([idx_map[idx.item()] for idx in edge_index[0]])
+                    edge_dst = torch.tensor([idx_map[idx.item()] for idx in edge_index[1]])
+                    
+                    # Create DGL graph
+                    g = dgl.graph((edge_src, edge_dst), num_nodes=len(node_indices))
+                    
+                    # Add node features
+                    g.ndata['feat'] = x
+                    
+                    # Add node labels if available
+                    if hasattr(pyg_data, 'y') and pyg_data.y is not None:
+                        g.ndata['label'] = pyg_data.y[mask]
+                    
+                    # Add edge features if available
+                    if hasattr(pyg_data, 'edge_attr') and pyg_data.edge_attr is not None:
+                        g.edata['feat'] = pyg_data.edge_attr[edge_mask]
+                else:
+                    # Create an empty graph with just nodes
+                    g = dgl.graph(([], []), num_nodes=len(node_indices))
+                    g.ndata['feat'] = x
+                    
+                    # Add node labels if available
+                    if hasattr(pyg_data, 'y') and pyg_data.y is not None:
+                        g.ndata['label'] = pyg_data.y[mask]
+                
+                dgl_graphs.append(g)
+            
+            # Return list or batched graph
+            return dgl_graphs if return_list else dgl.batch(dgl_graphs)
+        else:
+            # Single PyG graph
+            g = dgl.graph((pyg_data.edge_index[0], pyg_data.edge_index[1]), 
+                           num_nodes=pyg_data.x.shape[0])
+            g.ndata['feat'] = pyg_data.x
+            
+            # Add node labels if available
+            if hasattr(pyg_data, 'y') and pyg_data.y is not None:
+                g.ndata['label'] = pyg_data.y
+            
+            # Add edge features if available
+            if hasattr(pyg_data, 'edge_attr') and pyg_data.edge_attr is not None:
+                g.edata['feat'] = pyg_data.edge_attr
+            
+            return [g] if return_list else g
+    else:
+        raise ValueError("Input data doesn't have PyG format attributes (x, edge_index)")
+
+def prepare_graph_batch(batch_data, device=None, convert_pyg=False):
+    """
+    Prepare a batch of graphs for model processing with DGL
+    
+    Args:
+        batch_data: Graph data in various formats
+        device: Target device for the graphs
+        convert_pyg: Whether to attempt converting PyG graphs to DGL if detected (DEPRECATED)
+        
+    Returns:
+        DGL graph or batched graph on specified device
+    """
+    import torch
+    import dgl
+    
+    # Handle device
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Handle DGL graph or batched graph directly
+    if isinstance(batch_data, dgl.DGLGraph):
+        return batch_data.to(device)
+    
+    # Handle list of DGL graphs
+    if isinstance(batch_data, list) and all(isinstance(g, dgl.DGLGraph) for g in batch_data):
+        return dgl.batch(batch_data).to(device)
+    
+    # Handle PyG data conversion if needed and selected
+    if convert_pyg and hasattr(batch_data, 'x') and hasattr(batch_data, 'edge_index'):
+        logger.warning("PyG format detected. This compatibility will be removed in future versions.")
+        return convert_pyg_to_dgl(batch_data).to(device)
+    
+    # Convert other formats to DGL graphs (batched data)
+    try:
+        graphs = convert_batch_to_graphs(batch_data)
+        if len(graphs) > 1:
+            return dgl.batch(graphs).to(device)
+        elif len(graphs) == 1:
+            return graphs[0].to(device)
+        else:
+            raise ValueError("No valid graphs found in batch data")
+    except Exception as e:
+        logger.error(f"Failed to prepare graph batch: {e}")
+        raise
+
+def get_pyg_compatible_attributes(g):
+    """
+    Create PyG-compatible attributes from a DGL graph (DEPRECATED)
+    This function will be removed in a future version
+    
+    Args:
+        g: DGL graph
+        
+    Returns:
+        Dictionary with PyG-style attributes
+    """
+    logger.warning("PyG compatibility layer is deprecated and will be removed.")
+    
+    compat_dict = {}
+    
+    # Basic properties
+    compat_dict['num_nodes'] = g.num_nodes()
+    compat_dict['num_edges'] = g.num_edges()
+    
+    # Node features
+    if 'feat' in g.ndata:
+        compat_dict['x'] = g.ndata['feat']
+    
+    # Edge list (PyG style)
+    src, dst = g.edges()
+    compat_dict['edge_index'] = torch.stack([src, dst], dim=0)
+    
+    # Edge features
+    if 'feat' in g.edata:
+        compat_dict['edge_attr'] = g.edata['feat']
+    
+    # Labels
+    if 'label' in g.ndata:
+        compat_dict['y'] = g.ndata['label']
+    
+    # Batch information if available
+    if hasattr(g, 'batch_num_nodes'):
+        # Create PyG-style batch tensor
+        batch = []
+        for i, num_nodes in enumerate(g.batch_num_nodes()):
+            batch.extend([i] * num_nodes)
+        compat_dict['batch'] = torch.tensor(batch, device=g.device)
+    
+    return compat_dict
