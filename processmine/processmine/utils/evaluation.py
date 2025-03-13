@@ -3,6 +3,8 @@
 Evaluation utilities for process mining models.
 """
 
+import gc
+import logging
 import numpy as np
 import torch
 from sklearn.metrics import (
@@ -10,6 +12,8 @@ from sklearn.metrics import (
     matthews_corrcoef, confusion_matrix
 )
 from sklearn.utils.class_weight import compute_class_weight as sk_compute_class_weight
+
+logger = logging.getLogger(__name__)
 
 def compute_class_weights(df, num_classes):
     """
@@ -100,110 +104,132 @@ def get_graph_targets(g):
         # No labels found
         return None
     
-def evaluate_model(model, data_loader, criterion, device, is_neural=True):
+def evaluate_model(model, data_loader, criterion=None, device=None, detailed=True, memory_efficient=True):
     """
-    Evaluate model performance with comprehensive metrics.
+    Evaluate model on test data with improved DGL compatibility
     
     Args:
-        model: Model to evaluate
+        model: PyTorch model to evaluate
         data_loader: Data loader for test data
-        criterion: Loss function
+        criterion: Loss function (optional)
         device: Computing device
-        is_neural: Whether the model is a neural network
+        detailed: Whether to compute detailed metrics
+        memory_efficient: Whether to use memory-efficient evaluation
         
     Returns:
-        Dictionary of evaluation metrics
+        Tuple of (metrics, predictions, labels)
     """
-    if is_neural:
-        # Evaluate neural model
-        model.eval()
-        test_loss = 0.0
-        y_true = []
-        y_pred = []
-        
-        with torch.no_grad():
-            for batch_data in data_loader:
-                batch_data = batch_data.to(device)
-                
-                # Handle different model output formats
-                if hasattr(model, 'predict'):
-                    # Model has a predict method
-                    predictions = model.predict(batch_data)
-                    if isinstance(predictions, tuple):
-                        logits = predictions[0]
-                    else:
-                        logits = predictions
-                else:
-                    # Standard forward pass
-                    logits = model(batch_data)
-                
-                # Get graph-level targets using DGL approach
-                graph_targets = get_graph_targets(batch_data)
-                
-                # Compute loss
-                loss = criterion(logits, graph_targets)
-                test_loss += loss.item()
-                
-                # Get predictions
-                _, predicted = torch.max(logits, 1)
-                
-                # Collect targets and predictions
-                y_true.extend(graph_targets.cpu().numpy())
-                y_pred.extend(predicted.cpu().numpy())
-        
-        # Convert to numpy arrays
-        y_true = np.array(y_true)
-        y_pred = np.array(y_pred)
+    # Set up device
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    else:
-        # Evaluate sklearn-based model
-        # Extract features and labels
-        X_test, y_true = [], []
-        
-        for batch_data in data_loader:
-            # Extract DGL graph features and convert to numpy
-            if hasattr(batch_data, 'ndata') and 'feat' in batch_data.ndata:
-                X_test.extend(batch_data.ndata['feat'].cpu().numpy())
-                
-            # Extract labels
-            if hasattr(batch_data, 'ndata') and 'label' in batch_data.ndata:
-                graph_targets = get_graph_targets(batch_data)
-                y_true.extend(graph_targets.cpu().numpy())
-        
-        # Convert to numpy arrays
-        X_test = np.array(X_test)
-        y_true = np.array(y_true)
-        
-        # Make predictions
-        y_pred = model.predict(X_test)
+    # Move model to device
+    model = model.to(device)
+    
+    # Set model to evaluation mode
+    model.eval()
+    
+    # Initialize result arrays
+    all_preds = []
+    all_labels = []
+    test_loss = 0.0 if criterion is not None else None
+    test_samples = 0
+    
+    # Import utility function for getting graph targets
+    from processmine.utils.dataloader import get_graph_targets
+    
+    # Clear memory before evaluation
+    if memory_efficient and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    # Get progress bar
+    try:
+        from tqdm import tqdm
+        progress_bar = tqdm(data_loader, desc="Evaluating", leave=False)
+    except ImportError:
+        progress_bar = data_loader
+    
+    # Evaluate without gradient tracking
+    with torch.no_grad():
+        for batch_data in progress_bar:
+            # Move batch to device
+            batch_data = batch_data.to(device)
+            
+            # Forward pass
+            outputs = model(batch_data)
+            
+            # Handle different model output formats
+            if isinstance(outputs, dict):
+                logits = outputs.get("task_pred", next(iter(outputs.values())))
+            elif isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
+            
+            # Get graph-level targets using DGL approach
+            graph_targets = get_graph_targets(batch_data)
+            
+            if graph_targets is None:
+                logger.warning("No target labels found in graph data")
+                continue
+            
+            # Compute loss if criterion provided
+            if criterion is not None:
+                loss = criterion(logits, graph_targets)
+                batch_size = batch_data.batch_size if hasattr(batch_data, 'batch_size') else 1
+                test_loss += loss.item() * batch_size
+                test_samples += batch_size
+            
+            # Get predicted classes
+            _, predicted = torch.max(logits, dim=1)
+            
+            # Collect predictions and labels
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(graph_targets.cpu().numpy())
+            
+            # Free batch memory for very large models
+            if memory_efficient:
+                del outputs, batch_data
+                if criterion is not None:
+                    del loss
+    
+    # Convert to numpy arrays
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
     
     # Calculate metrics
+    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, matthews_corrcoef
+    
     metrics = {}
-    metrics['accuracy'] = accuracy_score(y_true, y_pred)
-    metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-    metrics['precision_macro'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
-    metrics['recall_macro'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
-    metrics['mcc'] = matthews_corrcoef(y_true, y_pred)
     
-    if is_neural and 'test_loss' not in metrics:
-        metrics['test_loss'] = test_loss / len(data_loader) if len(data_loader) > 0 else 0.0
-    
-    # Add confusion matrix
-    metrics['confusion_matrix'] = confusion_matrix(y_true, y_pred).tolist()
-    
-    return metrics, y_true, y_pred
-
-def calculate_f1_scores(y_true, y_pred, average='weighted'):
-    """
-    Calculate F1 scores with proper handling of edge cases.
-    
-    Args:
-        y_true: True labels
-        y_pred: Predicted labels
-        average: Averaging method ('micro', 'macro', 'weighted', None)
+    if len(all_labels) > 0:
+        metrics['accuracy'] = accuracy_score(all_labels, all_preds)
+        metrics['f1_macro'] = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        metrics['f1_weighted'] = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+        metrics['precision_macro'] = precision_score(all_labels, all_preds, average='macro', zero_division=0)
+        metrics['recall_macro'] = recall_score(all_labels, all_preds, average='macro', zero_division=0)
         
-    Returns:
-        F1 score
-    """
-    return f1_score(y_true, y_pred, average=average, zero_division=0)
+        # Add MCC for binary and multiclass (not multilabel)
+        try:
+            metrics['mcc'] = matthews_corrcoef(all_labels, all_preds)
+        except ValueError:
+            # Skip MCC for incompatible data
+            pass
+    else:
+        logger.warning("No labels collected during evaluation, metrics will be zeros")
+        metrics = {
+            'accuracy': 0.0, 'f1_macro': 0.0, 'f1_weighted': 0.0,
+            'precision_macro': 0.0, 'recall_macro': 0.0
+        }
+    
+    # Add test loss
+    if test_loss is not None:
+        metrics['test_loss'] = test_loss / max(test_samples, 1)
+    
+    # Final memory cleanup
+    if memory_efficient and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    return metrics, all_preds, all_labels

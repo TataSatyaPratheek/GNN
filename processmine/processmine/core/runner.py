@@ -373,7 +373,7 @@ def run_training(
                 try:
                     # Try to load preprocessed DGL graphs
                     logger.info(f"Loading preprocessed DGL graphs from {graphs_path}")
-                    result = load_graphs(graphs_path)
+                    result = dgl.load_graphs(graphs_path)
                     graphs = result[0]  # First element contains the list of graphs
                     logger.info(f"Loaded {len(graphs)} preprocessed DGL graphs")
                 except Exception as e:

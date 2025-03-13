@@ -735,71 +735,77 @@ class EnhancedProcessRNN(BaseModel):
     
     def _process_graph_data(self, data):
         """
-        Process PyG Data by extracting case-level sequences with time information
+        Process DGL graph data by extracting case-level sequences with proper feature handling
         
         Args:
-            data: PyG Data object
-            
+            data: DGL Graph object with batch information
+                
         Returns:
-            Model predictions
+            Output logits [batch_size, num_classes]
         """
-        # Extract features and batch assignments
-        x = data.x
-        batch = data.batch
-        edge_attr = data.edge_attr if hasattr(data, 'edge_attr') else None
+        # Get batch size
+        batch_size = data.batch_size if hasattr(data, 'batch_size') else 1
         
-        # Get unique batch indices (cases)
-        unique_batches = torch.unique(batch)
-        batch_size = unique_batches.size(0)
-        
-        # Extract task IDs and time differences for each case
-        task_sequences = []
-        time_sequences = []
+        # Extract sequences for each graph in the batch
+        sequences = []
         seq_lengths = []
         
-        for b in unique_batches:
-            # Get nodes for this case
-            mask = (batch == b)
-            case_nodes = x[mask]
+        if batch_size > 1:
+            # Get the number of nodes per graph
+            batch_num_nodes = data.batch_num_nodes()
             
-            # Extract task IDs (assuming first feature column is task ID)
-            if case_nodes.size(1) > 1:
-                task_ids = case_nodes[:, 0].long()
+            # Track node offset for each graph
+            node_offset = 0
+            
+            # Process each graph
+            for i, num_nodes in enumerate(batch_num_nodes):
+                # Get nodes for this graph
+                graph_nodes = data.ndata['feat'][node_offset:node_offset + num_nodes]
+                
+                # Get task IDs - assume they're in first column or stored separately
+                if graph_nodes.size(1) > 1:
+                    task_ids = graph_nodes[:, 0].long()  # Use first feature as task ID
+                else:
+                    task_ids = graph_nodes.squeeze(-1).long()
+                
+                # Get sequence ordering - try to use position attribute if available
+                if 'pos' in data.ndata:
+                    pos = data.ndata['pos'][node_offset:node_offset + num_nodes]
+                    # Sort by position
+                    _, sorted_indices = torch.sort(pos.view(-1))
+                    task_ids = task_ids[sorted_indices]
+                
+                # Handle possible out-of-range IDs
+                task_ids = torch.clamp(task_ids, min=0, max=self.num_cls-1)
+                
+                # Store sequence and length
+                sequences.append(task_ids)
+                seq_lengths.append(len(task_ids))
+                
+                # Update offset
+                node_offset += num_nodes
+        else:
+            # Single graph
+            graph_nodes = data.ndata['feat']
+            
+            # Get task IDs
+            if graph_nodes.size(1) > 1:
+                task_ids = graph_nodes[:, 0].long()
             else:
-                task_ids = case_nodes.long()
+                task_ids = graph_nodes.squeeze(-1).long()
+            
+            # Get sequence ordering if available
+            if 'pos' in data.ndata:
+                pos = data.ndata['pos']
+                _, sorted_indices = torch.sort(pos.view(-1))
+                task_ids = task_ids[sorted_indices]
+            
+            # Handle possible out-of-range IDs
+            task_ids = torch.clamp(task_ids, min=0, max=self.num_cls-1)
             
             # Store sequence and length
-            task_sequences.append(task_ids)
+            sequences.append(task_ids)
             seq_lengths.append(len(task_ids))
-            
-            # Extract time differences if available
-            if edge_attr is not None and self.use_time_features:
-                # Get edges for this case
-                case_edges = edge_attr[mask]
-                # Extract time features (assuming first edge attribute is time difference)
-                time_diffs = case_edges[:, 0]
-                time_sequences.append(time_diffs)
         
-        # Create padded batch
-        max_len = max(seq_lengths)
-        padded_tasks = torch.zeros(batch_size, max_len, dtype=torch.long, device=x.device)
-        padded_times = torch.zeros(batch_size, max_len, dtype=torch.float, device=x.device) if self.use_time_features else None
-        
-        # Fill in sequences
-        for i in range(batch_size):
-            length = seq_lengths[i]
-            padded_tasks[i, :length] = task_sequences[i]
-            
-            if self.use_time_features and time_sequences:
-                padded_times[i, :length] = time_sequences[i]
-        
-        # Create padding mask
-        padding_mask = torch.arange(max_len, device=x.device)[None, :] >= torch.tensor(
-            seq_lengths, device=x.device
-        )[:, None]
-        
-        # Process batch
-        if self.use_time_features and padded_times is not None:
-            return self.forward((padded_tasks, padded_times, padding_mask, seq_lengths))
-        else:
-            return self.forward((padded_tasks, None, padding_mask, seq_lengths))
+        # Process extracted sequences using existing function
+        return self._process_sequence_list(sequences, seq_lengths)
