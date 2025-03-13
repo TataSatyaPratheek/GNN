@@ -90,7 +90,7 @@ def get_graph_targets(g):
 
 def get_batch_graphs_from_indices(graphs, indices):
     """
-    Get a list of graphs from indices
+    Get a list of graphs from indices with proper error handling
     
     Args:
         graphs: List of DGL graphs
@@ -99,7 +99,26 @@ def get_batch_graphs_from_indices(graphs, indices):
     Returns:
         List of DGL graphs at the specified indices
     """
-    return [graphs[i] for i in indices]
+    if not isinstance(graphs, list):
+        raise TypeError(f"Expected list of graphs, got {type(graphs)}")
+    
+    if len(graphs) == 0:
+        raise ValueError("Empty graph list provided")
+    
+    # Check if indices are valid
+    max_idx = max(indices) if indices else -1
+    if max_idx >= len(graphs):
+        raise IndexError(f"Index {max_idx} out of range for graph list of length {len(graphs)}")
+    
+    # Extract graphs
+    result = [graphs[i] for i in indices]
+    
+    # Verify all are DGL graphs
+    for i, g in enumerate(result):
+        if not isinstance(g, dgl.DGLGraph):
+            raise TypeError(f"Graph at index {indices[i]} is not a DGL graph: {type(g)}")
+    
+    return result
 
 def apply_to_nodes(g, func):
     """
@@ -291,3 +310,307 @@ def prepare_graph_data(batch_data, device=None):
     batch_data = batch_data.to(device)
     
     return batch_data
+
+def apply_to_nodes(g, func):
+    """
+    Apply a function to all nodes in a graph with DGL optimized approach
+    
+    Args:
+        g: DGL graph
+        func: Function to apply to node features
+        
+    Returns:
+        Updated graph
+    """
+    # Using DGL's in-place feature modification when possible
+    if 'feat' in g.ndata:
+        # Create a new graph only if necessary
+        if func.__code__.co_argcount > 1 or g.is_readonly():
+            # Create a new graph to avoid modifying the original
+            new_g = g.clone()
+            new_g.ndata['feat'] = func(g.ndata['feat'])
+            return new_g
+        else:
+            # Apply function in-place to save memory
+            g.ndata['feat'] = func(g.ndata['feat'])
+            return g
+    return g
+
+def apply_to_edges(g, func):
+    """
+    Apply a function to all edges in a graph using DGL optimized approach
+    
+    Args:
+        g: DGL graph
+        func: Function to apply to edge features
+        
+    Returns:
+        Updated graph
+    """
+    if 'feat' in g.edata:
+        # Use in-place operations when possible
+        if func.__code__.co_argcount > 1 or g.is_readonly():
+            # Create a new graph only when necessary
+            new_g = g.clone()
+            new_g.edata['feat'] = func(g.edata['feat'])
+            return new_g
+        else:
+            # Apply function in-place
+            g.edata['feat'] = func(g.edata['feat'])
+            return g
+    return g
+
+def create_node_masks(g, mask_ratio=0.1):
+    """
+    Create node feature masks for self-supervised learning with DGL-optimized approach
+    
+    Args:
+        g: DGL graph
+        mask_ratio: Ratio of nodes to mask
+        
+    Returns:
+        Graph with added mask
+    """
+    num_nodes = g.num_nodes()
+    mask_indices = torch.randperm(num_nodes)[:int(num_nodes * mask_ratio)]
+    mask = torch.zeros(num_nodes, dtype=torch.bool, device=g.device)
+    mask[mask_indices] = True
+    
+    # Add mask to graph
+    g.ndata['mask'] = mask
+    
+    # Store original features for masked nodes if they exist
+    if 'feat' in g.ndata:
+        # Save original features only for masked nodes to save memory
+        orig_feat = g.ndata['feat'].clone()
+        g.ndata['orig_feat'] = orig_feat
+        
+        # Apply masking (replace with zeros) using DGL's efficient indexing
+        if mask.any():
+            masked_feat = g.ndata['feat'].clone()
+            masked_feat[mask] = 0.0
+            g.ndata['feat'] = masked_feat
+    
+    return g
+
+def prepare_graph_batch(batch_data, device=None, convert_pyg=True):
+    """
+    Prepare a batch of graphs for model processing with enhanced DGL integration
+    
+    Args:
+        batch_data: Graph data in various formats
+        device: Target device for the graphs
+        convert_pyg: Whether to convert PyG graphs to DGL if detected
+        
+    Returns:
+        DGL graph or batched graph on specified device
+    """
+    import torch
+    import dgl
+    
+    # Handle device
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Handle DGL graph or batched graph directly
+    if isinstance(batch_data, dgl.DGLGraph):
+        return batch_data.to(device)
+    
+    # Handle list of DGL graphs
+    if isinstance(batch_data, list) and all(isinstance(g, dgl.DGLGraph) for g in batch_data):
+        return dgl.batch(batch_data).to(device)
+    
+    # Handle PyG data conversion if needed
+    if convert_pyg and hasattr(batch_data, 'x') and hasattr(batch_data, 'edge_index'):
+        return convert_pyg_to_dgl(batch_data, device)
+    
+    # Handle other formats by falling back to the conversion function
+    graphs = convert_batch_to_graphs(batch_data)
+    if len(graphs) > 1:
+        return dgl.batch(graphs).to(device)
+    elif len(graphs) == 1:
+        return graphs[0].to(device)
+    else:
+        raise ValueError("No valid graphs found in batch data")
+
+def convert_pyg_to_dgl(pyg_data):
+    """
+    Convert PyTorch Geometric data format to DGL format
+    
+    Args:
+        pyg_data: PyG data object or batch
+        
+    Returns:
+        Equivalent DGL graph or batched graph
+    """
+    import dgl
+    import torch
+    
+    # Check if input is already a DGL graph
+    if isinstance(pyg_data, dgl.DGLGraph):
+        return pyg_data
+    
+    # Check if input has PyG-style attributes
+    if hasattr(pyg_data, 'x') and hasattr(pyg_data, 'edge_index'):
+        if hasattr(pyg_data, 'batch'):
+            # This is a batched PyG graph
+            batch_size = pyg_data.batch.max().item() + 1
+            dgl_graphs = []
+            
+            for i in range(batch_size):
+                # Extract nodes for this graph
+                mask = pyg_data.batch == i
+                node_indices = torch.where(mask)[0]
+                
+                # Get features for this graph
+                x = pyg_data.x[mask]
+                
+                # Get edges for this graph
+                edge_mask = torch.isin(pyg_data.edge_index[0], node_indices) & \
+                           torch.isin(pyg_data.edge_index[1], node_indices)
+                
+                if edge_mask.sum() > 0:
+                    edge_index = pyg_data.edge_index[:, edge_mask]
+                    
+                    # Remap node indices to local indices
+                    idx_map = {idx.item(): new_idx for new_idx, idx in enumerate(node_indices)}
+                    edge_src = torch.tensor([idx_map[idx.item()] for idx in edge_index[0]])
+                    edge_dst = torch.tensor([idx_map[idx.item()] for idx in edge_index[1]])
+                    
+                    # Create DGL graph
+                    g = dgl.graph((edge_src, edge_dst), num_nodes=len(node_indices))
+                    
+                    # Add node features
+                    g.ndata['feat'] = x
+                    
+                    # Add node labels if available
+                    if hasattr(pyg_data, 'y') and pyg_data.y is not None:
+                        g.ndata['label'] = pyg_data.y[mask]
+                    
+                    # Add edge features if available
+                    if hasattr(pyg_data, 'edge_attr') and pyg_data.edge_attr is not None:
+                        g.edata['feat'] = pyg_data.edge_attr[edge_mask]
+                else:
+                    # Create an empty graph with just nodes
+                    g = dgl.graph(([], []), num_nodes=len(node_indices))
+                    g.ndata['feat'] = x
+                    
+                    # Add node labels if available
+                    if hasattr(pyg_data, 'y') and pyg_data.y is not None:
+                        g.ndata['label'] = pyg_data.y[mask]
+                
+                dgl_graphs.append(g)
+            
+            # Batch the DGL graphs
+            return dgl.batch(dgl_graphs)
+        else:
+            # Single PyG graph
+            g = dgl.graph((pyg_data.edge_index[0], pyg_data.edge_index[1]), 
+                           num_nodes=pyg_data.x.shape[0])
+            g.ndata['feat'] = pyg_data.x
+            
+            # Add node labels if available
+            if hasattr(pyg_data, 'y') and pyg_data.y is not None:
+                g.ndata['label'] = pyg_data.y
+            
+            # Add edge features if available
+            if hasattr(pyg_data, 'edge_attr') and pyg_data.edge_attr is not None:
+                g.edata['feat'] = pyg_data.edge_attr
+            
+            return g
+    else:
+        raise ValueError("Input data doesn't have PyG format attributes (x, edge_index)")
+    """
+    Convert a PyG graph to DGL format optimized for memory
+    
+    Args:
+        pyg_data: PyG graph data
+        device: Target device
+        
+    Returns:
+        DGL graph or batched graph
+    """
+    import torch
+    import dgl
+    
+    # Check if this is a batched PyG graph
+    if hasattr(pyg_data, 'batch'):
+        # Extract batching information
+        batch_size = pyg_data.batch.max().item() + 1
+        graphs = []
+        
+        # Process each graph in the batch
+        for i in range(batch_size):
+            # Get nodes for this graph
+            mask = pyg_data.batch == i
+            node_indices = torch.where(mask)[0]
+            
+            # Skip empty graphs
+            if len(node_indices) == 0:
+                continue
+                
+            # Get node features
+            x = pyg_data.x[mask]
+            
+            # Get edges for this graph
+            edge_mask = torch.isin(pyg_data.edge_index[0], node_indices) & \
+                       torch.isin(pyg_data.edge_index[1], node_indices)
+            
+            # Create DGL graph
+            if edge_mask.sum() > 0:
+                # Get edges with mapping to local indices
+                edge_index = pyg_data.edge_index[:, edge_mask]
+                
+                # Create node index mapping
+                idx_map = {idx.item(): new_idx for new_idx, idx in enumerate(node_indices)}
+                
+                # Map edge indices efficiently
+                src = torch.tensor([idx_map[idx.item()] for idx in edge_index[0]])
+                dst = torch.tensor([idx_map[idx.item()] for idx in edge_index[1]])
+                
+                # Create DGL graph
+                g = dgl.graph((src, dst), num_nodes=len(node_indices))
+                
+                # Add node features
+                g.ndata['feat'] = x
+                
+                # Add node labels if available
+                if hasattr(pyg_data, 'y') and pyg_data.y is not None:
+                    g.ndata['label'] = pyg_data.y[mask]
+                
+                # Add edge features if available
+                if hasattr(pyg_data, 'edge_attr') and pyg_data.edge_attr is not None:
+                    g.edata['feat'] = pyg_data.edge_attr[edge_mask]
+            else:
+                # Create graph with only nodes
+                g = dgl.graph(([], []), num_nodes=len(node_indices))
+                g.ndata['feat'] = x
+                
+                # Add node labels if available
+                if hasattr(pyg_data, 'y') and pyg_data.y is not None:
+                    g.ndata['label'] = pyg_data.y[mask]
+            
+            graphs.append(g)
+        
+        # Return batched graph
+        return dgl.batch(graphs).to(device) if graphs else None
+    else:
+        # Single PyG graph
+        x = pyg_data.x
+        edge_index = pyg_data.edge_index
+        
+        # Create DGL graph
+        g = dgl.graph((edge_index[0], edge_index[1]), num_nodes=x.shape[0])
+        
+        # Add node features
+        g.ndata['feat'] = x
+        
+        # Add node labels if available
+        if hasattr(pyg_data, 'y') and pyg_data.y is not None:
+            g.ndata['label'] = pyg_data.y
+        
+        # Add edge features if available
+        if hasattr(pyg_data, 'edge_attr') and pyg_data.edge_attr is not None:
+            g.edata['feat'] = pyg_data.edge_attr
+        
+        return g.to(device)
