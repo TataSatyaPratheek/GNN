@@ -11,13 +11,16 @@ setup(
         "matplotlib>=3.3.0",
         "scikit-learn>=0.23.0",
         "torch>=1.8.0",  # Core PyTorch dependency
+        "dgl>=2.4.0",    # Core DGL dependency
     ],
     extras_require={
         # Optional dependencies that are required for specific features
         "gnn": [
-            "torch-geometric>=2.0.0",
-            "torch-scatter>=2.0.0",
-            "torch-sparse>=0.6.0",
+            "dgl>=2.4.0",
+            "networkx>=2.5.0",
+        ],
+        "gpu": [
+            "dgl-cu124>=2.4.0",  # CUDA 12.4 version of DGL
         ],
         "viz": [
             "seaborn>=0.11.0",
@@ -25,12 +28,17 @@ setup(
             "networkx>=2.5.0",
         ],
         "all": [
-            "torch-geometric>=2.0.0",
-            "torch-scatter>=2.0.0",
-            "torch-sparse>=0.6.0",
+            "dgl>=2.4.0",
+            "networkx>=2.5.0",
             "seaborn>=0.11.0",
             "plotly>=4.14.0",
+            "dask>=2022.1.0",
+        ],
+        "gpu-all": [
+            "dgl-cu124>=2.4.0",
             "networkx>=2.5.0",
+            "seaborn>=0.11.0",
+            "plotly>=4.14.0",
             "dask>=2022.1.0",
         ],
         "dev": [

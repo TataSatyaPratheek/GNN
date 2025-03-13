@@ -395,13 +395,13 @@ class ProcessMinePerformanceTests(unittest.TestCase):
         from processmine.models.factory import create_model
         from processmine.utils.memory import clear_memory
         
-        # Check if PyG is available
+        # Check if DGL is available
         try:
-            from torch_geometric.loader import DataLoader
-            pyg_available = True
+            from dgl.dataloading import GraphDataLoader
+            dgl_available = True
         except ImportError:
-            pyg_available = False
-            self.skipTest("PyTorch Geometric not available")
+            dgl_available = False
+            self.skipTest("DGL not available")
         
         # Initialize memory tracker
         tracker = MemoryTracker()
@@ -423,7 +423,7 @@ class ProcessMinePerformanceTests(unittest.TestCase):
         
         # Create data loaders
         import torch
-        from torch_geometric.loader import DataLoader
+        from dgl.dataloading import GraphDataLoader
         
         indices = np.arange(len(graphs))
         np.random.shuffle(indices)
@@ -436,8 +436,8 @@ class ProcessMinePerformanceTests(unittest.TestCase):
         test_idx = indices[train_size + val_size:]
         
         # Create data loaders
-        train_loader = DataLoader([graphs[i] for i in train_idx], batch_size=16, shuffle=True)
-        val_loader = DataLoader([graphs[i] for i in val_idx], batch_size=16)
+        train_loader = GraphDataLoader([graphs[i] for i in train_idx], batch_size=16, shuffle=True)
+        val_loader = GraphDataLoader([graphs[i] for i in val_idx], batch_size=16)
         tracker.snapshot("After creating data loaders")
         
         # Create different model types
@@ -504,13 +504,13 @@ class ProcessMinePerformanceTests(unittest.TestCase):
         from processmine.utils.memory import clear_memory
         from processmine.core.training import train_model, compute_class_weights
         
-        # Check if PyG is available
+        # Check if DGL is available
         try:
-            from torch_geometric.loader import DataLoader
-            pyg_available = True
+            from dgl.dataloading import GraphDataLoader
+            dgl_available = True
         except ImportError:
-            pyg_available = False
-            self.skipTest("PyTorch Geometric not available")
+            dgl_available = False
+            self.skipTest("DGL not available")
         
         # Initialize memory tracker
         tracker = MemoryTracker()
@@ -532,7 +532,7 @@ class ProcessMinePerformanceTests(unittest.TestCase):
         
         # Create data loaders
         import torch
-        from torch_geometric.loader import DataLoader
+        from dgl.dataloading import GraphDataLoader
         
         indices = np.arange(len(graphs))
         np.random.shuffle(indices)
@@ -544,8 +544,8 @@ class ProcessMinePerformanceTests(unittest.TestCase):
         val_idx = indices[train_size:train_size + val_size]
         
         # Create data loaders
-        train_loader = DataLoader([graphs[i] for i in train_idx], batch_size=16, shuffle=True)
-        val_loader = DataLoader([graphs[i] for i in val_idx], batch_size=16)
+        train_loader = GraphDataLoader([graphs[i] for i in train_idx], batch_size=16, shuffle=True)
+        val_loader = GraphDataLoader([graphs[i] for i in val_idx], batch_size=16)
         
         # Compare memory-efficient vs regular mode
         model_configs = [

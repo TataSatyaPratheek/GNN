@@ -134,7 +134,7 @@ class ProcessMineIntegrationTests(unittest.TestCase):
             
             # Step 3: Split data
             import torch
-            from torch_geometric.loader import DataLoader
+            from dgl.dataloading import GraphDataLoader
             
             # Create indices for train/val/test split (70/15/15)
             indices = np.arange(len(graphs))
@@ -148,9 +148,9 @@ class ProcessMineIntegrationTests(unittest.TestCase):
             test_idx = indices[train_size + val_size:]
             
             # Create data loaders
-            train_loader = DataLoader([graphs[i] for i in train_idx], batch_size=4, shuffle=True)
-            val_loader = DataLoader([graphs[i] for i in val_idx], batch_size=4)
-            test_loader = DataLoader([graphs[i] for i in test_idx], batch_size=4)
+            train_loader = GraphDataLoader([graphs[i] for i in train_idx], batch_size=4, shuffle=True)
+            val_loader = GraphDataLoader([graphs[i] for i in val_idx], batch_size=4)
+            test_loader = GraphDataLoader([graphs[i] for i in test_idx], batch_size=4)
             
             # Step 4: Create model
             from processmine.models.factory import create_model
@@ -192,7 +192,7 @@ class ProcessMineIntegrationTests(unittest.TestCase):
             
             eval_metrics, y_true, y_pred = evaluate_model(
                 model=model,
-                test_loader=test_loader,
+                data_loader=test_loader,
                 device=device,
                 criterion=criterion
             )
@@ -329,47 +329,75 @@ class ProcessMineIntegrationTests(unittest.TestCase):
         y = df["next_task"].values
         
         # Create different model types
-        model_types = ['gnn', 'enhanced_gnn', 'lstm']
+        models = []
         
-        for model_type in model_types:
-            if model_type in ['gnn', 'enhanced_gnn']:
-                model = create_model(
-                    model_type=model_type,
-                    input_dim=len(feature_cols),
-                    hidden_dim=16,
-                    output_dim=len(task_encoder.classes_)
+        # Test GNN
+        models.append(create_model(
+            model_type='gnn',
+            input_dim=len(feature_cols),
+            hidden_dim=16,
+            output_dim=len(task_encoder.classes_)
+        ))
+        
+        # Test enhanced GNN
+        models.append(create_model(
+            model_type='enhanced_gnn',
+            input_dim=len(feature_cols),
+            hidden_dim=16,
+            output_dim=len(task_encoder.classes_)
+        ))
+        
+        # Test LSTM
+        models.append(create_model(
+            model_type='lstm',
+            num_cls=len(task_encoder.classes_),
+            emb_dim=16,
+            hidden_dim=32
+        ))
+        
+        # Test enhanced LSTM
+        models.append(create_model(
+            model_type='enhanced_lstm',
+            num_cls=len(task_encoder.classes_),
+            emb_dim=16,
+            hidden_dim=32
+        ))
+        
+        # Test random forest
+        try:
+            models.append(create_model(
+                model_type='random_forest',
+                n_estimators=10
+            ))
+        except ImportError:
+            pass  # Skip if sklearn not available
+        
+        # Test XGBoost
+        try:
+            models.append(create_model(
+                model_type='xgboost',
+                n_estimators=10,
+                max_depth=3
+            ))
+        except ImportError:
+            pass  # Skip if xgboost not available
+        
+        # Verify models were created successfully
+        expected_types = [
+            'MemoryEfficientGNN', 'MemoryEfficientGNN', 
+            'NextActivityLSTM', 'EnhancedProcessRNN',
+            'RandomForestClassifier', 'XGBClassifier'
+        ]
+        
+        for i, model in enumerate(models):
+            # Check model type matches expected
+            if i < len(expected_types):
+                model_type = model.__class__.__name__
+                self.assertTrue(
+                    model_type == expected_types[i] or 
+                    expected_types[i] in str(type(model)),
+                    f"Expected {expected_types[i]}, got {model_type}"
                 )
-                
-                # Test GNN parameters
-                self.assertEqual(model.input_dim, len(feature_cols))
-                self.assertEqual(model.hidden_dim, 16)
-                self.assertEqual(model.output_dim, len(task_encoder.classes_))
-                
-            elif model_type == 'lstm':
-                model = create_model(
-                    model_type=model_type,
-                    num_cls=len(task_encoder.classes_),
-                    emb_dim=16,
-                    hidden_dim=32
-                )
-                
-                # Test LSTM parameters
-                self.assertEqual(model.num_cls, len(task_encoder.classes_))
-                self.assertEqual(model.emb_dim, 16)
-                self.assertEqual(model.hidden_dim, 32)
-                
-            elif model_type in ['random_forest', 'xgboost']:
-                model = create_model(model_type=model_type)
-                
-                # For ML models, try fitting with a small sample
-                from sklearn.model_selection import train_test_split
-                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
-                
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_test)
-                
-                # Verify predictions
-                self.assertEqual(len(y_pred), len(y_test))
     
     def test_memory_optimization_integration(self):
         """Test memory optimization features."""

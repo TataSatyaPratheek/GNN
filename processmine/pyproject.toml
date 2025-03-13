@@ -26,6 +26,7 @@ dependencies = [
     "tqdm>=4.60.0",
     "colorama>=0.4.4",
     "psutil>=5.8.0",
+    "dgl>=2.4.0",  # Core DGL dependency
 ]
 
 [project.optional-dependencies]
@@ -34,7 +35,7 @@ gnn = [
     "networkx>=2.6.0",
 ]
 gpu = [
-    "dgl-cu124>=2.4.0",
+    "dgl-cu124>=2.4.0",  # CUDA 12.4 version
 ]
 viz = [
     "matplotlib>=3.4.0",
