@@ -23,3 +23,11 @@ from processmine.core.runner import (
     run_optimization,
     run_full_pipeline
 )
+
+from processmine.core.ablation_runner import (
+    run_ablation_study
+)
+
+from processmine.core.advanced_workflow import (
+    run_advanced_workflow
+)
