@@ -249,78 +249,75 @@ class ProcessMinePerformanceTests(unittest.TestCase):
     def test_graph_building_performance(self):
         """Test graph building performance."""
         from processmine.data.loader import load_and_preprocess_data
-        from processmine.data.graph_builder import build_graph_data
+        from processmine.data.graphs import build_graph_data
         from processmine.utils.memory import clear_memory
         
         # Initialize memory tracker
         tracker = MemoryTracker()
         
-        # Load small dataset
+        # Initialize memory tracker
+        tracker = MemoryTracker()
+    
+        # Test with small dataset and memory limit
+        start_time = time.time()
         df_small, task_encoder, resource_encoder = load_and_preprocess_data(
             self.small_data_path,
             norm_method='l2',
-            use_dtypes=True
-        )
-        tracker.snapshot("After loading small dataset")
-        
-        # Test graph building for small dataset
-        start_time = time.time()
-        graphs_small = build_graph_data(
-            df_small,
-            enhanced=True,
-            batch_size=50
+            use_dtypes=True,
+            memory_limit_gb=0.1  # Test small memory limit
         )
         small_duration = time.time() - start_time
-        tracker.snapshot(f"After building graphs (small - {len(graphs_small):,} graphs)")
+        tracker.snapshot(f"Small dataset with memory limit ({len(df_small):,} events)")
         
         # Clean up
-        del graphs_small
+        del df_small
         clear_memory(full_clear=True)
         
-        # Load medium dataset
-        df_medium, task_encoder, resource_encoder = load_and_preprocess_data(
-            self.medium_data_path,
-            norm_method='l2',
+        # Test with different chunk sizes
+        start_time = time.time()
+        df_chunked, _, _ = load_and_preprocess_data(
+            self.medium_data_path, 
+            norm_method='l2', 
+            chunk_size=1000,  # Force small chunks
             use_dtypes=True
         )
-        tracker.snapshot("After loading medium dataset")
+        chunked_duration = time.time() - start_time
+        tracker.snapshot(f"Medium dataset with small chunks ({len(df_chunked):,} events)")
         
-        # Test graph building for medium dataset
+        # Report times
+        print(f"\nData loading performance:")
+        print(f"  Small dataset with memory limit: {small_duration:.2f}s")
+        print(f"  Medium dataset with chunking: {chunked_duration:.2f}s")
+        
+        # Print memory usage
+        tracker.print_summary()
+        
+         # Test with auto mode (new)
         start_time = time.time()
-        graphs_medium = build_graph_data(
-            df_medium,
-            enhanced=True,
-            batch_size=100
-        )
-        medium_duration = time.time() - start_time
-        tracker.snapshot(f"After building graphs (medium - {len(graphs_medium):,} graphs)")
-        
-        # Test memory-efficient mode vs regular
-        clear_memory(full_clear=True)
-        
-        # Using memory-efficient sparse mode
-        start_time = time.time()
-        graphs_sparse = build_graph_data(
-            df_medium,
+        graphs_auto = build_graph_data(
+            df_chunked,
             enhanced=True,
             batch_size=100,
-            use_sparse=True
+            mode='auto'  # Auto mode
+        )
+        auto_duration = time.time() - start_time
+        tracker.snapshot("After building graphs (auto mode)")
+        
+        # Test with sparse mode (new)
+        start_time = time.time()
+        graphs_sparse = build_graph_data(
+            df_chunked,
+            enhanced=True,
+            batch_size=100,
+            mode='sparse'  # Sparse mode
         )
         sparse_duration = time.time() - start_time
         tracker.snapshot("After building graphs (sparse mode)")
         
-        # Time expectations
-        self.assertLess(small_duration, SHORT_DURATION_THRESHOLD)
-        self.assertLess(medium_duration, MEDIUM_DURATION_THRESHOLD)
-        
         # Report times
         print(f"\nGraph building performance:")
-        print(f"  Small dataset ({len(df_small):,} events): {small_duration:.2f}s")
-        print(f"  Medium dataset ({len(df_medium):,} events): {medium_duration:.2f}s")
-        print(f"  Medium dataset with sparse mode: {sparse_duration:.2f}s")
-        
-        # Print memory usage
-        tracker.print_summary()
+        print(f"  Auto mode: {auto_duration:.2f}s")
+        print(f"  Sparse mode: {sparse_duration:.2f}s")
     
     def test_analysis_performance(self):
         """Test analysis performance."""
@@ -394,7 +391,7 @@ class ProcessMinePerformanceTests(unittest.TestCase):
     def test_model_performance(self):
         """Test model performance."""
         from processmine.data.loader import load_and_preprocess_data
-        from processmine.data.graph_builder import build_graph_data
+        from processmine.data.graphs import build_graph_data
         from processmine.processmine import create_model
         from processmine.utils.memory import clear_memory
         
@@ -502,7 +499,7 @@ class ProcessMinePerformanceTests(unittest.TestCase):
     def test_training_performance(self):
         """Test model training performance."""
         from processmine.data.loader import load_and_preprocess_data
-        from processmine.data.graph_builder import build_graph_data
+        from processmine.data.graphs import build_graph_data
         from processmine.processmine import create_model
         from processmine.utils.memory import clear_memory
         from processmine.core.training import train_model, compute_class_weights

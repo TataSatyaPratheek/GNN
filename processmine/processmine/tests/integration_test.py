@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import tempfile
 import shutil
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 import io
 import sys
 import logging
@@ -47,6 +47,12 @@ def generate_synthetic_data(filepath, n_cases=50, n_activities=10, n_resources=5
         'resource': resource_names,
         'timestamp': timestamps
     })
+    
+    # Add more features for advanced testing
+    df['next_timestamp'] = df.groupby('case_id')['timestamp'].shift(-1)
+    
+    # Add a custom attribute for testing
+    df['priority'] = np.random.randint(1, 4, n_events)
     
     # Save to CSV
     df.to_csv(filepath, index=False)
@@ -90,7 +96,7 @@ class ProcessMineIntegrationTests(unittest.TestCase):
         # Import necessary modules
         from processmine.processmine import create_model, run_analysis
         from processmine.data.loader import load_and_preprocess_data
-        from processmine.data.graph_builder import build_graph_data
+        from processmine.data.graphs import build_graph_data
         from processmine.core.training import train_model, evaluate_model
         from processmine.process_mining.analysis import analyze_bottlenecks
         from processmine.visualization.viz import ProcessVisualizer
@@ -114,7 +120,7 @@ class ProcessMineIntegrationTests(unittest.TestCase):
             self.assertTrue('next_task' in df.columns)
             
             # Step 2: Build graph data
-            from processmine.data.graph_builder import build_graph_data
+            from processmine.data.graphs import build_graph_data
             
             graphs = build_graph_data(
                 df,
@@ -390,7 +396,7 @@ class ProcessMineIntegrationTests(unittest.TestCase):
         cleared_stats = get_memory_stats()
         
         # Build graph data with memory optimization
-        from processmine.data.graph_builder import build_graph_data
+        from processmine.data.graphs import build_graph_data
         
         graphs = build_graph_data(
             df,
